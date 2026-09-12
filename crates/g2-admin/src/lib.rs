@@ -25,7 +25,7 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use g2_core::{ApiDefinition, Error, Policy};
 use g2_storage::SharedStorage;
@@ -81,7 +81,7 @@ pub fn router(admin_secret: &str, storage: SharedStorage) -> Result<Router, Erro
     // only distinguishable from known ones by authenticated callers.
     let authed = Router::new()
         .route("/g2/version", get(version))
-        .route("/g2/keys", post(keys::create_key))
+        .route("/g2/keys", get(keys::list_keys).post(keys::create_key))
         .route(
             "/g2/keys/{key}",
             get(keys::get_key)
@@ -660,6 +660,42 @@ mod tests {
             )
             .await;
             assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn list_returns_sorted_hashes_for_the_org() {
+            let storage = MemoryStorage::new();
+            for raw in ["key-one", "key-two"] {
+                send(
+                    test_router(storage.clone()),
+                    json_request("PUT", &format!("/g2/keys/{raw}"), &session_json()),
+                )
+                .await;
+            }
+            // A key in another org must not be listed.
+            storage
+                .set("g2:other-org:apikey:deadbeef", "{}", None)
+                .await
+                .expect("seed");
+
+            let (status, body) = send(
+                test_router(storage.clone()),
+                request("/g2/keys", Some(SECRET)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let listed: serde_json::Value = serde_json::from_str(&body).expect("json");
+            let mut expected = vec![hash_key("key-one"), hash_key("key-two")];
+            expected.sort_unstable();
+            assert_eq!(listed["keys"], serde_json::json!(expected), "body: {body}");
+
+            let (status, body) = send(
+                test_router(storage),
+                request("/g2/keys?org_id=empty-org", Some(SECRET)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("\"keys\":[]"), "body: {body}");
         }
 
         #[tokio::test]

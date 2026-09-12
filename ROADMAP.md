@@ -55,7 +55,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] API definitions stored in Redis; file loader becomes one of two sources (ADR-0002; policy records follow with the policy model below)
 - [x] Policies: reusable rate/quota/ACL bundles referenced by keys
 - [x] Admin CRUD for API definitions and policies (`/g2/apis`, `/g2/policies`)
-- [ ] `GET /g2/keys` listing (needs a `Storage::scan`/SCAN operation — deferred from M2 key CRUD)
+- [x] `GET /g2/keys` listing (needs a `Storage::scan`/SCAN operation — deferred from M2 key CRUD)
 - [ ] `POST /g2/reload` + Redis pub/sub broadcast → every pod rebuilds its route table
 - [ ] Dashboard-support API: node info, loaded APIs, health, version, per-API stats snapshot
 - [ ] OpenAPI spec for the admin API (utoipa) served at `/g2/openapi.json`
@@ -342,3 +342,11 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   write time — the reload task should surface that error to the caller.
   Next: M4 `GET /g2/keys` listing (trivial now with scan_prefix), then
   `POST /g2/reload` + pub/sub.
+- **2026-08-30 (19)** — M4 `GET /g2/keys` listing landed (the M2 deferral):
+  returns `{"keys": [<hash>, …]}` sorted, per-org via `?org_id=`, hashes
+  only (raw keys unrecoverable by design). New
+  `session_key_prefix` helper in g2-core. Next: M4 `POST /g2/reload` +
+  Redis pub/sub broadcast so admin def/policy writes go live without a
+  restart (the biggest remaining M4 piece — needs an in-process rebuild
+  path from `SharedStorage` + file defs to a new `RouteTable`, an ArcSwap
+  store the binary already has, and a subscriber task per pod).

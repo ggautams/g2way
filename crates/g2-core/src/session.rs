@@ -261,7 +261,16 @@ pub fn hash_key(raw_key: &str) -> String {
 /// `key_hash` is the output of [`hash_key`], not the raw credential.
 #[must_use]
 pub fn session_storage_key(org_id: &str, key_hash: &str) -> String {
-    format!("g2:{org_id}:apikey:{key_hash}")
+    format!("{}{key_hash}", session_key_prefix(org_id))
+}
+
+/// Prefix shared by every session key in `org_id`: `g2:{org_id}:apikey:`.
+///
+/// Scanning it enumerates the organization's stored key hashes (the admin
+/// listing endpoint); the raw keys are unrecoverable by design.
+#[must_use]
+pub fn session_key_prefix(org_id: &str) -> String {
+    format!("g2:{org_id}:apikey:")
 }
 
 /// Builds the storage key for a key's sliding-window rate counter:

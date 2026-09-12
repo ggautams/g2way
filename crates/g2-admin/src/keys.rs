@@ -12,14 +12,14 @@
 //!
 //! `GET`/`DELETE` take an optional `?org_id=` (defaulting to the single-org
 //! default); `POST`/`PUT` take the organization from the session body.
-//! Listing keys needs a storage scan operation and arrives with the M4
-//! control plane.
+//! `GET /g2/keys` lists the organization's stored **key hashes** — raw
+//! keys are unrecoverable by design.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use g2_core::session::{hash_key, session_storage_key};
+use g2_core::session::{hash_key, session_key_prefix, session_storage_key};
 use g2_core::KeySession;
 use serde::Deserialize;
 
@@ -97,6 +97,29 @@ pub(crate) async fn create_key(
         })),
     )
         .into_response()
+}
+
+/// `GET /g2/keys` — list the organization's stored key hashes, sorted.
+///
+/// Returns `{"keys": ["<hash>", …]}`. Hashes are the only listable handle:
+/// raw keys are never stored. Takes an optional `?org_id=`.
+pub(crate) async fn list_keys(
+    State(state): State<AdminState>,
+    Query(addr): Query<KeyAddress>,
+) -> Response {
+    let prefix = session_key_prefix(addr.org());
+    match state.storage.scan_prefix(&prefix).await {
+        // scan_prefix returns full storage keys; the hash is the suffix.
+        Ok(keys) => {
+            let mut hashes: Vec<String> = keys
+                .into_iter()
+                .filter_map(|k| k.strip_prefix(&prefix).map(str::to_owned))
+                .collect();
+            hashes.sort_unstable();
+            Json(serde_json::json!({ "keys": hashes })).into_response()
+        }
+        Err(e) => storage_unavailable(&e),
+    }
 }
 
 /// `PUT /g2/keys/{key}` — create or update the session stored for `key`.
