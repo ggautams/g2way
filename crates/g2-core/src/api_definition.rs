@@ -30,6 +30,23 @@ fn default_auth_header() -> String {
     DEFAULT_AUTH_HEADER.to_owned()
 }
 
+/// Claim the JWT mode uses as the caller identity when none is configured.
+pub const DEFAULT_IDENTITY_CLAIM: &str = "sub";
+
+fn default_identity_claim() -> String {
+    DEFAULT_IDENTITY_CLAIM.to_owned()
+}
+
+/// JWT signature algorithms supported by [`AuthConfig::Jwt`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum JwtSigningMethod {
+    /// HMAC-SHA256 with a shared secret.
+    Hs256,
+    /// RSA-SHA256 with a public key.
+    Rs256,
+}
+
 /// How clients authenticate to one API.
 ///
 /// The default is [`AuthConfig::AuthToken`] reading the `Authorization`
@@ -60,6 +77,31 @@ pub enum AuthConfig {
         /// Optional cookie name also accepted as a token carrier.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cookie: Option<String>,
+    },
+
+    /// JWT bearer auth: the token in `header` is verified against a static
+    /// key and its claims are turned into an ephemeral session (no storage
+    /// lookup). `jwks_url` fetching arrives in a later task.
+    Jwt {
+        /// Signature algorithm the tokens must use.
+        signing_method: JwtSigningMethod,
+
+        /// Shared secret for [`JwtSigningMethod::Hs256`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret: Option<String>,
+
+        /// PEM-encoded RSA public key for [`JwtSigningMethod::Rs256`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        public_key_pem: Option<String>,
+
+        /// Request header carrying the JWT (a `Bearer ` prefix is stripped).
+        #[serde(default = "default_auth_header")]
+        header: String,
+
+        /// Claim used as the caller identity (session alias and rate-limit
+        /// key). Defaults to `sub`.
+        #[serde(default = "default_identity_claim")]
+        identity_claim: String,
     },
 }
 
@@ -98,6 +140,52 @@ impl AuthConfig {
                 }
                 if cookie.as_deref().is_some_and(|c| c.trim().is_empty()) {
                     return Err(fail("`auth.cookie` must not be empty".into()));
+                }
+                Ok(())
+            }
+            Self::Jwt {
+                signing_method,
+                secret,
+                public_key_pem,
+                header,
+                identity_claim,
+            } => {
+                if http::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
+                    return Err(fail(format!(
+                        "`auth.header` is not a valid header name: `{header}`"
+                    )));
+                }
+                if identity_claim.trim().is_empty() {
+                    return Err(fail("`auth.identity_claim` must not be empty".into()));
+                }
+                // Exactly the key material matching the algorithm must be
+                // present; a mismatched field is a config typo worth failing.
+                match signing_method {
+                    JwtSigningMethod::Hs256 => {
+                        if secret.as_deref().is_none_or(|s| s.trim().is_empty()) {
+                            return Err(fail("hs256 requires a non-empty `auth.secret`".into()));
+                        }
+                        if public_key_pem.is_some() {
+                            return Err(fail(
+                                "`auth.public_key_pem` is not used with hs256; remove it".into(),
+                            ));
+                        }
+                    }
+                    JwtSigningMethod::Rs256 => {
+                        if public_key_pem
+                            .as_deref()
+                            .is_none_or(|s| s.trim().is_empty())
+                        {
+                            return Err(fail(
+                                "rs256 requires a non-empty `auth.public_key_pem`".into(),
+                            ));
+                        }
+                        if secret.is_some() {
+                            return Err(fail(
+                                "`auth.secret` is not used with rs256; remove it".into(),
+                            ));
+                        }
+                    }
                 }
                 Ok(())
             }
@@ -313,7 +401,7 @@ mod tests {
                 assert_eq!(header, DEFAULT_AUTH_HEADER);
                 assert!(query_param.is_none() && cookie.is_none());
             }
-            AuthConfig::Keyless => panic!("default must not be keyless"),
+            other => panic!("default must be auth_token, got {other:?}"),
         }
     }
 
@@ -368,6 +456,81 @@ mod tests {
             cookie: None,
         };
         assert!(def.validate().is_err());
+    }
+
+    #[test]
+    fn jwt_auth_validates_key_material_per_algorithm() {
+        let mut def = parse(minimal_json());
+
+        // hs256 with a secret: valid.
+        def.auth = AuthConfig::Jwt {
+            signing_method: JwtSigningMethod::Hs256,
+            secret: Some("shhh".into()),
+            public_key_pem: None,
+            header: DEFAULT_AUTH_HEADER.into(),
+            identity_claim: "sub".into(),
+        };
+        def.validate().expect("hs256 with secret is valid");
+
+        // hs256 without a secret / with a stray PEM: invalid.
+        def.auth = AuthConfig::Jwt {
+            signing_method: JwtSigningMethod::Hs256,
+            secret: None,
+            public_key_pem: None,
+            header: DEFAULT_AUTH_HEADER.into(),
+            identity_claim: "sub".into(),
+        };
+        assert!(def.validate().is_err());
+        def.auth = AuthConfig::Jwt {
+            signing_method: JwtSigningMethod::Hs256,
+            secret: Some("shhh".into()),
+            public_key_pem: Some("-----BEGIN PUBLIC KEY-----".into()),
+            header: DEFAULT_AUTH_HEADER.into(),
+            identity_claim: "sub".into(),
+        };
+        assert!(def.validate().is_err());
+
+        // rs256 requires a PEM and no secret.
+        def.auth = AuthConfig::Jwt {
+            signing_method: JwtSigningMethod::Rs256,
+            secret: None,
+            public_key_pem: Some("-----BEGIN PUBLIC KEY-----".into()),
+            header: DEFAULT_AUTH_HEADER.into(),
+            identity_claim: "sub".into(),
+        };
+        def.validate().expect("rs256 with pem is valid");
+        def.auth = AuthConfig::Jwt {
+            signing_method: JwtSigningMethod::Rs256,
+            secret: Some("shhh".into()),
+            public_key_pem: Some("-----BEGIN PUBLIC KEY-----".into()),
+            header: DEFAULT_AUTH_HEADER.into(),
+            identity_claim: "sub".into(),
+        };
+        assert!(def.validate().is_err());
+    }
+
+    #[test]
+    fn jwt_json_defaults_header_and_identity_claim() {
+        let json = r#"{
+            "api_id": "j",
+            "name": "j",
+            "listen_path": "/j/",
+            "target_url": "http://j.internal",
+            "auth": { "mode": "jwt", "signing_method": "hs256", "secret": "shhh" }
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        match def.auth {
+            AuthConfig::Jwt {
+                header,
+                identity_claim,
+                ..
+            } => {
+                assert_eq!(header, DEFAULT_AUTH_HEADER);
+                assert_eq!(identity_claim, DEFAULT_IDENTITY_CLAIM);
+            }
+            other => panic!("expected jwt auth, got {other:?}"),
+        }
     }
 
     #[test]

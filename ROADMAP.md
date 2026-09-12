@@ -36,7 +36,8 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] `KeySession` model (rate, quota, expiry, org_id, per-API access; SHA-256 key hashing)
 - [x] Redis-backed `Storage` implementation (connection pool, `g2:{org}:...` schema) + `make redis-up` integration tests
 - [x] Auth: keyless mode (explicit) and auth-token mode (header/query param/cookie lookup → `KeySession`)
-- [ ] Auth: JWT (HS256/RS256, `jwks_url` fetch + cache, claims → session)
+- [x] Auth: JWT with static keys (HS256 secret / RS256 public-key PEM; claims → ephemeral session)
+- [ ] Auth: JWT `jwks_url` fetch + cache (needs an HTTPS fetch client — decide alongside the M7 TLS work)
 - [ ] Auth: basic auth
 - [ ] Admin API skeleton (axum on separate port, `X-G2-Authorization` admin secret)
 - [ ] Admin key CRUD: `POST/GET/PUT/DELETE /g2/keys[/{key}]`
@@ -161,3 +162,16 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   `--redis-url`/`G2_REDIS_URL`/config `redis_url` → RedisStorage, else
   MemoryStorage with a loud warning. `ChainBuilder.auth(Option<AuthLayer>)`
   uses tower's `option_layer`. Next: JWT auth (HS256/RS256 + jwks).
+- **2026-08-30 (7)** — M2 JWT auth (static keys) landed; the roadmap's JWT
+  task was **split**: `jwks_url` fetch+cache deferred to its own checkbox
+  because it needs an HTTPS fetch client (TLS decision otherwise scheduled
+  for M7). `AuthConfig::Jwt {signing_method: hs256|rs256, secret |
+  public_key_pem, header, identity_claim (default "sub")}`; validation
+  rejects mismatched key material. Verification synthesizes an ephemeral
+  `KeySession` (alias = identity claim, `expires_at` = `exp` — required,
+  access = this API only), no storage lookup; virtual rate-limit identity is
+  `hash_key("jwt:{identity}")` to avoid colliding with stored-token hashes.
+  Alg-confusion (HS256 token on RS256 API) tested-rejected. **Gotcha:**
+  `jsonwebtoken` 10 panics at runtime without a crypto-provider feature —
+  workspace dep pins `features = ["rust_crypto"]` (pure Rust, distroless-
+  friendly). Next: basic auth, then admin API skeleton.

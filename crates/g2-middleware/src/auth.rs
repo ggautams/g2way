@@ -1,11 +1,20 @@
-//! Token authentication: resolve a client credential to a [`KeySession`].
+//! Credential authentication: resolve a client credential to a
+//! [`KeySession`].
 //!
-//! [`AuthLayer`] implements the `auth_token` mode of
-//! [`AuthConfig`]: the token is extracted from the
-//! configured carrier (header, then query parameter, then cookie), hashed
-//! with SHA-256, and looked up in [`Storage`](g2_storage::Storage) under
-//! `g2:{org_id}:apikey:{hash}`. A live session is stamped onto the request
-//! as a [`SessionContext`] extension for downstream layers; anything else is
+//! [`AuthLayer`] implements the credentialed modes of [`AuthConfig`]:
+//!
+//! - **`auth_token`** — the token is extracted from the configured carrier
+//!   (header, then query parameter, then cookie), hashed with SHA-256, and
+//!   looked up in [`Storage`](g2_storage::Storage) under
+//!   `g2:{org_id}:apikey:{hash}`.
+//! - **`jwt`** — the bearer token in the configured header is verified
+//!   against a static key (HS256 secret or RS256 public key) and its claims
+//!   are turned into an ephemeral session: no storage lookup, `expires_at`
+//!   from `exp`, alias from the identity claim, access restricted to this
+//!   API.
+//!
+//! Either way a live session is stamped onto the request as a
+//! [`SessionContext`] extension for downstream layers; anything else is
 //! rejected before the request reaches the upstream.
 //!
 //! Keyless APIs simply do not get this layer (see
@@ -14,9 +23,9 @@
 //! # Responses
 //!
 //! - `401` — no token found in any configured carrier.
-//! - `403` — token unknown, session inactive/expired, or the session does
-//!   not grant this API. One message for all three: which one it was must
-//!   not leak to the caller.
+//! - `403` — token unknown or fails verification, session inactive/expired,
+//!   or the session does not grant this API. One message for all of these:
+//!   which one it was must not leak to the caller (details are logged).
 //! - `503` — the storage backend errored; the request may be retried.
 //! - `500` — the stored session record is not valid JSON (an operational
 //!   bug, logged loudly).
@@ -29,10 +38,11 @@ use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use g2_core::session::{hash_key, session_storage_key};
-use g2_core::{AuthConfig, Error, KeySession};
+use g2_core::{AuthConfig, Error, JwtSigningMethod, KeySession};
 use g2_storage::SharedStorage;
 use http::header::HeaderName;
 use http::{header, Request, Response, StatusCode};
+use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use tower::{Layer, Service};
 
 use crate::context::SessionContext;
@@ -43,28 +53,47 @@ use crate::ProxyBody;
 /// distinguish unknown key / inactive / expired / wrong API.
 const FORBIDDEN_MSG: &str = "access to this API has been disallowed";
 
-/// Where the auth token is read from, precomputed at route-build time.
+/// Everything one API's auth needs, precomputed at route-build time.
 struct AuthState {
-    /// Header carrying the token (an optional `Bearer ` prefix is stripped).
-    header: HeaderName,
-    /// Optional query parameter also accepted as a carrier.
-    query_param: Option<String>,
-    /// Optional cookie name also accepted as a carrier.
-    cookie: Option<String>,
-    storage: SharedStorage,
     api_id: Arc<str>,
     org_id: Arc<str>,
+    mode: Mode,
+}
+
+/// The credentialed auth modes (keyless builds no layer at all).
+enum Mode {
+    /// `auth_token`: hash the presented token and look it up in storage.
+    Token {
+        /// Header carrying the token (an optional `Bearer ` prefix is stripped).
+        header: HeaderName,
+        /// Optional query parameter also accepted as a carrier.
+        query_param: Option<String>,
+        /// Optional cookie name also accepted as a carrier.
+        cookie: Option<String>,
+        storage: SharedStorage,
+    },
+    /// `jwt`: verify the bearer token against a static key.
+    Jwt {
+        /// Header carrying the JWT.
+        header: HeaderName,
+        decoding_key: Box<DecodingKey>,
+        validation: Box<Validation>,
+        /// Claim used as the caller identity.
+        identity_claim: String,
+    },
 }
 
 impl std::fmt::Debug for AuthState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mode = match &self.mode {
+            Mode::Token { .. } => "token",
+            Mode::Jwt { .. } => "jwt",
+        };
         f.debug_struct("AuthState")
-            .field("header", &self.header)
-            .field("query_param", &self.query_param)
-            .field("cookie", &self.cookie)
             .field("api_id", &self.api_id)
             .field("org_id", &self.org_id)
-            .finish_non_exhaustive() // storage is a trait object
+            .field("mode", &mode)
+            .finish_non_exhaustive() // key material and storage stay unprintable
     }
 }
 
@@ -87,31 +116,75 @@ impl AuthLayer {
         api_id: &str,
         org_id: &str,
     ) -> Result<Option<Self>, Error> {
-        match cfg {
-            AuthConfig::Keyless => Ok(None),
+        let invalid = |reason: String| Error::InvalidApiDefinition {
+            api: api_id.to_owned(),
+            reason,
+        };
+        let parse_header = |header: &str| {
+            HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
+                invalid(format!(
+                    "`auth.header` is not a valid header name: `{header}`"
+                ))
+            })
+        };
+
+        let mode = match cfg {
+            AuthConfig::Keyless => return Ok(None),
             AuthConfig::AuthToken {
                 header,
                 query_param,
                 cookie,
+            } => Mode::Token {
+                header: parse_header(header)?,
+                query_param: query_param.clone(),
+                cookie: cookie.clone(),
+                storage,
+            },
+            AuthConfig::Jwt {
+                signing_method,
+                secret,
+                public_key_pem,
+                header,
+                identity_claim,
             } => {
-                let header = HeaderName::from_bytes(header.as_bytes()).map_err(|_| {
-                    Error::InvalidApiDefinition {
-                        api: api_id.to_owned(),
-                        reason: format!("`auth.header` is not a valid header name: `{header}`"),
+                let (algorithm, decoding_key) = match signing_method {
+                    JwtSigningMethod::Hs256 => {
+                        let secret = secret
+                            .as_deref()
+                            .ok_or_else(|| invalid("hs256 requires `auth.secret`".into()))?;
+                        (
+                            Algorithm::HS256,
+                            DecodingKey::from_secret(secret.as_bytes()),
+                        )
                     }
-                })?;
-                Ok(Some(Self {
-                    state: Arc::new(AuthState {
-                        header,
-                        query_param: query_param.clone(),
-                        cookie: cookie.clone(),
-                        storage,
-                        api_id: api_id.into(),
-                        org_id: org_id.into(),
-                    }),
-                }))
+                    JwtSigningMethod::Rs256 => {
+                        let pem = public_key_pem.as_deref().ok_or_else(|| {
+                            invalid("rs256 requires `auth.public_key_pem`".into())
+                        })?;
+                        let key = DecodingKey::from_rsa_pem(pem.as_bytes()).map_err(|e| {
+                            invalid(format!("`auth.public_key_pem` is not a valid RSA PEM: {e}"))
+                        })?;
+                        (Algorithm::RS256, key)
+                    }
+                };
+                // `exp` is required and validated (with the library's default
+                // leeway); tokens without an expiry are rejected.
+                let validation = Validation::new(algorithm);
+                Mode::Jwt {
+                    header: parse_header(header)?,
+                    decoding_key: Box::new(decoding_key),
+                    validation: Box::new(validation),
+                    identity_claim: identity_claim.clone(),
+                }
             }
-        }
+        };
+        Ok(Some(Self {
+            state: Arc::new(AuthState {
+                api_id: api_id.into(),
+                org_id: org_id.into(),
+                mode,
+            }),
+        }))
     }
 }
 
@@ -158,56 +231,125 @@ where
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
         Box::pin(async move {
-            let Some(token) = extract_token(&state, &req) else {
-                return Ok(json_error(
-                    StatusCode::UNAUTHORIZED,
-                    "authorization field missing",
-                ));
-            };
-
-            let key_hash = hash_key(&token);
-            let storage_key = session_storage_key(&state.org_id, &key_hash);
-            let record = match state.storage.get(&storage_key).await {
-                Ok(record) => record,
-                Err(e) => {
-                    tracing::error!(api_id = %state.api_id, error = %e, "auth storage lookup failed");
-                    return Ok(json_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "key storage unavailable",
-                    ));
+            match authenticate(&state, &req).await {
+                Ok(session_ctx) => {
+                    req.extensions_mut().insert(session_ctx);
+                    inner.call(req).await
                 }
-            };
-            let Some(record) = record else {
-                return Ok(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
-            };
-            let session: KeySession = match serde_json::from_str(&record) {
-                Ok(session) => session,
-                Err(e) => {
-                    tracing::error!(
-                        api_id = %state.api_id,
-                        key_hash = %key_hash,
-                        error = %e,
-                        "stored key session is not valid JSON"
-                    );
-                    return Ok(json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "malformed key session record",
-                    ));
-                }
-            };
-
-            if !session.active
-                || session.is_expired(unix_now_secs())
-                || !session.allows_api(&state.api_id)
-            {
-                return Ok(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+                Err(resp) => Ok(resp),
             }
-
-            req.extensions_mut()
-                .insert(SessionContext::new(session, key_hash));
-            inner.call(req).await
         })
     }
+}
+
+/// Runs the configured auth mode; `Err` is the ready-to-send rejection.
+async fn authenticate(
+    state: &AuthState,
+    req: &Request<ProxyBody>,
+) -> Result<SessionContext, Response<ProxyBody>> {
+    match &state.mode {
+        Mode::Token {
+            header,
+            query_param,
+            cookie,
+            storage,
+        } => {
+            let token = extract_token(header, query_param.as_deref(), cookie.as_deref(), req)
+                .ok_or_else(|| {
+                    json_error(StatusCode::UNAUTHORIZED, "authorization field missing")
+                })?;
+            authenticate_stored_token(state, storage, &token).await
+        }
+        Mode::Jwt {
+            header,
+            decoding_key,
+            validation,
+            identity_claim,
+        } => {
+            let token = extract_token(header, None, None, req).ok_or_else(|| {
+                json_error(StatusCode::UNAUTHORIZED, "authorization field missing")
+            })?;
+            authenticate_jwt(state, decoding_key, validation, identity_claim, &token)
+        }
+    }
+}
+
+/// `auth_token` mode: hash the token and resolve the stored [`KeySession`].
+async fn authenticate_stored_token(
+    state: &AuthState,
+    storage: &SharedStorage,
+    token: &str,
+) -> Result<SessionContext, Response<ProxyBody>> {
+    let key_hash = hash_key(token);
+    let storage_key = session_storage_key(&state.org_id, &key_hash);
+    let record = storage.get(&storage_key).await.map_err(|e| {
+        tracing::error!(api_id = %state.api_id, error = %e, "auth storage lookup failed");
+        json_error(StatusCode::SERVICE_UNAVAILABLE, "key storage unavailable")
+    })?;
+    let Some(record) = record else {
+        return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+    };
+    let session: KeySession = serde_json::from_str(&record).map_err(|e| {
+        tracing::error!(
+            api_id = %state.api_id,
+            key_hash = %key_hash,
+            error = %e,
+            "stored key session is not valid JSON"
+        );
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "malformed key session record",
+        )
+    })?;
+
+    if !session.active || session.is_expired(unix_now_secs()) || !session.allows_api(&state.api_id)
+    {
+        return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+    }
+    Ok(SessionContext::new(session, key_hash))
+}
+
+/// `jwt` mode: verify the token and synthesize an ephemeral session from
+/// its claims. No storage involved.
+// The large Err is a rejection Response built once on the cold path; boxing
+// it would just move the allocation.
+#[allow(clippy::result_large_err)]
+fn authenticate_jwt(
+    state: &AuthState,
+    decoding_key: &DecodingKey,
+    validation: &Validation,
+    identity_claim: &str,
+    token: &str,
+) -> Result<SessionContext, Response<ProxyBody>> {
+    let claims = jsonwebtoken::decode::<serde_json::Value>(token, decoding_key, validation)
+        .map_err(|e| {
+            tracing::debug!(api_id = %state.api_id, error = %e, "JWT rejected");
+            json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG)
+        })?
+        .claims;
+
+    let Some(identity) = claims.get(identity_claim).and_then(|v| v.as_str()) else {
+        tracing::debug!(
+            api_id = %state.api_id,
+            identity_claim,
+            "JWT valid but identity claim missing or not a string"
+        );
+        return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+    };
+    // `exp` presence and freshness were enforced by `validation`.
+    let expires_at = claims.get("exp").and_then(serde_json::Value::as_u64);
+
+    let session = KeySession {
+        org_id: state.org_id.to_string(),
+        alias: Some(identity.to_owned()),
+        expires_at,
+        access: std::iter::once((state.api_id.to_string(), Default::default())).collect(),
+        ..KeySession::default()
+    };
+    // The `jwt:` prefix keeps JWT identities from ever colliding with the
+    // hash of a real stored token in later rate-limit/quota counters.
+    let key_hash = hash_key(&format!("jwt:{identity}"));
+    Ok(SessionContext::new(session, key_hash))
 }
 
 /// Seconds since the Unix epoch (0 if the clock is set before 1970).
@@ -224,8 +366,13 @@ fn unix_now_secs() -> u64 {
 /// Query and cookie values are matched verbatim (no percent-decoding):
 /// tokens are opaque strings the gateway itself hands out, and they never
 /// contain characters that need escaping.
-fn extract_token(state: &AuthState, req: &Request<ProxyBody>) -> Option<String> {
-    if let Some(value) = req.headers().get(&state.header) {
+fn extract_token(
+    header: &HeaderName,
+    query_param: Option<&str>,
+    cookie: Option<&str>,
+    req: &Request<ProxyBody>,
+) -> Option<String> {
+    if let Some(value) = req.headers().get(header) {
         if let Ok(value) = value.to_str() {
             let token = strip_bearer(value.trim());
             if !token.is_empty() {
@@ -234,7 +381,7 @@ fn extract_token(state: &AuthState, req: &Request<ProxyBody>) -> Option<String> 
         }
     }
 
-    if let Some(param) = &state.query_param {
+    if let Some(param) = query_param {
         if let Some(query) = req.uri().query() {
             for pair in query.split('&') {
                 if let Some((k, v)) = pair.split_once('=') {
@@ -246,7 +393,7 @@ fn extract_token(state: &AuthState, req: &Request<ProxyBody>) -> Option<String> 
         }
     }
 
-    if let Some(name) = &state.cookie {
+    if let Some(name) = cookie {
         for value in req.headers().get_all(header::COOKIE) {
             let Ok(value) = value.to_str() else { continue };
             for part in value.split(';') {
@@ -466,6 +613,187 @@ mod tests {
             .await
             .expect("infallible");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    mod jwt {
+        use jsonwebtoken::{encode, EncodingKey, Header};
+
+        use super::*;
+
+        /// Throwaway RSA keypair generated for these tests only.
+        const TEST_RSA_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC9vQS0xUUdaCmm
+2MuakxbnoUGSCzeKns0F3C3x7I/CSuPV1ckdPIGfOoveNs+mSHI6Z5MwR4SvJcxu
+wJZz8dmd9UXHLhr/R2MpOA5cLMdS7ZyVfKrUC0blvWuJ9Un8M2ONmtx97L6c9k07
+1HD9MX9NVJlsKKOhF7hvuL+C5Wc8dUsE8TjnHkZ4pCQcHB5eY1BEzHXA0uZqTgsy
+4+YfqQ9cT4O+XPVlnPPGuyNe94F/NGqDH0ogfQjc9AEqPVsrOoyejY/oBHmwhSrf
+7d8lDzTN6M2KR9L6mZUKUafCKdxw9cfyI/RQRpQq0SK6aeN4/LOiCpvliI+U6Lfd
+2MsWr7T/AgMBAAECggEAB5UVKhA0Gd++wl8pi8zS/oCwOSDfoFeGQ/SvlVppyE7r
+2fDIL7XqTC2vxzqTg8ajYfgfpq9E+ybci5SArrN8idZyampKQ+dbbBtEX6Sedo7u
+Uf8AaKbmt2mhcYru4PhAwzjsFNAwMd+Z6Ikt1sByoOl/lBXvrBFhmn1ckeOPA5hu
+j6n2AZyG/nePtFU0y9gi1FTDECM8B2dliQyCzU7LvjpCCbRD0EiKYP7ZpUzIHC65
+9WR6RRC3onLe28CueTD3QvAvYsP4QeeiI5wDpvYmLQvowGovRbiAVOHDRqG08gtY
+cZSpyVuKmyi6kkRL19wbsTxdyH+elP6Chg1SUowP2QKBgQD/V/SCRSeGV8RrC2AR
+rTtujEu73sTOY4kMaDz6LqVk9O3SbqL0ZG1fHP+bah+rA/4LjHbPozbH8d1DXrNc
+cVOHoYnVsWp4NWvv7n5OnVUVxr7arbvsX+dDPlcdMQTRyaAV0zL0SmHQN3jqPzb4
+BuEqlH6eCzYCngHRi7la3G0X5QKBgQC+OeM7zmL+yPHjG2XS6yBjF6adDrJK/PQE
+g+DmfD7lPtEAMnh2cXZ7ADdpcdHu0uha2LRvyCZq1e0SMBFzWd8ny7TQTxn0ZR24
+6mIMxO+sWfKLtN4J/37/Qrt6mHo4hXxbIg8SAaiOgxkaLhbbAkobWM51NySaAKru
+Fez21p5DEwKBgG1No1cYb0Ds1SHVbrxiYWyDFfBH/gszRHlRLbkSuq4qwpsvzQW8
+76ylZy2KEiBMxzT+XeWoQkz41fR+11ydDlqi5bPaDG+Evr2oY90XMFLwDsbhU+5t
+Zzu7teLDFwMOwj5VeBxmstREyrfLc6Zcm4p0onbY6bfZF4Ixw5iHfxOZAoGAEwGN
+pqgUVAiXwm02W0CK19vBFegmAEAN0XWrvtujHRyNnUttpcfoYpm+75Yjt4zzEkCc
+pp6E2B/PtAWBeNj95uf/hOCiYzzHH3arnUL//2RtS3AizzTr520vdixN6d/McP6S
+KuZnhPWsSGVaez9bUCgrWKLN0WVHrsoaBv+iiGkCgYEA+y+XusCUErqu/bqzzEYj
+Oih8/7hU7lA0CEIx65jqY15F5Q2QDXv/s6j0JKdcWtSkdqq6w/yEbp/AHE8uamLo
+OXYCPHHq5blRvGxnz1qnmVPHyVEYVjdboJiavY1gbwtK+wCBPS85htaRuFxFb9LD
+NO+F4qDaW22QCAuvcoMJMDE=
+-----END PRIVATE KEY-----";
+
+        const TEST_RSA_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvb0EtMVFHWgpptjLmpMW
+56FBkgs3ip7NBdwt8eyPwkrj1dXJHTyBnzqL3jbPpkhyOmeTMEeEryXMbsCWc/HZ
+nfVFxy4a/0djKTgOXCzHUu2clXyq1AtG5b1rifVJ/DNjjZrcfey+nPZNO9Rw/TF/
+TVSZbCijoRe4b7i/guVnPHVLBPE45x5GeKQkHBweXmNQRMx1wNLmak4LMuPmH6kP
+XE+Dvlz1ZZzzxrsjXveBfzRqgx9KIH0I3PQBKj1bKzqMno2P6AR5sIUq3+3fJQ80
+zejNikfS+pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq+0
+/wIDAQAB
+-----END PUBLIC KEY-----";
+
+        const SECRET: &str = "test-hs256-secret";
+
+        fn hs256_cfg() -> AuthConfig {
+            AuthConfig::Jwt {
+                signing_method: g2_core::JwtSigningMethod::Hs256,
+                secret: Some(SECRET.into()),
+                public_key_pem: None,
+                header: "Authorization".into(),
+                identity_claim: "sub".into(),
+            }
+        }
+
+        fn hs256_token(claims: &serde_json::Value) -> String {
+            encode(
+                &Header::default(),
+                claims,
+                &EncodingKey::from_secret(SECRET.as_bytes()),
+            )
+            .expect("encode hs256")
+        }
+
+        fn future_exp() -> u64 {
+            unix_now_secs() + 3600
+        }
+
+        async fn call(cfg: &AuthConfig, token: &str) -> Response<ProxyBody> {
+            let mut req = request("/x");
+            req.headers_mut().insert(
+                "authorization",
+                format!("Bearer {token}").parse().expect("value"),
+            );
+            service(cfg, MemoryStorage::new())
+                .oneshot(req)
+                .await
+                .expect("infallible")
+        }
+
+        #[tokio::test]
+        async fn valid_hs256_token_builds_session_from_claims() {
+            let token = hs256_token(&serde_json::json!({
+                "sub": "alice",
+                "exp": future_exp(),
+            }));
+            let resp = call(&hs256_cfg(), &token).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            // `require_session` echoes the alias, which comes from `sub`.
+            assert_eq!(
+                resp.headers()
+                    .get("x-echo-alias")
+                    .expect("alias")
+                    .as_bytes(),
+                b"alice"
+            );
+        }
+
+        #[tokio::test]
+        async fn wrong_secret_expired_and_missing_identity_are_403() {
+            let wrong_secret = encode(
+                &Header::default(),
+                &serde_json::json!({"sub": "alice", "exp": future_exp()}),
+                &EncodingKey::from_secret(b"other-secret"),
+            )
+            .expect("encode");
+            // Far enough in the past to clear the default validation leeway.
+            let expired = hs256_token(&serde_json::json!({
+                "sub": "alice",
+                "exp": unix_now_secs() - 600,
+            }));
+            let no_identity = hs256_token(&serde_json::json!({"exp": future_exp()}));
+
+            for (name, token) in [
+                ("wrong secret", wrong_secret),
+                ("expired", expired),
+                ("no identity claim", no_identity),
+            ] {
+                let resp = call(&hs256_cfg(), &token).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "case: {name}");
+            }
+        }
+
+        #[tokio::test]
+        async fn token_without_exp_is_rejected() {
+            let token = hs256_token(&serde_json::json!({"sub": "alice"}));
+            let resp = call(&hs256_cfg(), &token).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn missing_token_is_401() {
+            let resp = service(&hs256_cfg(), MemoryStorage::new())
+                .oneshot(request("/x"))
+                .await
+                .expect("infallible");
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn rs256_round_trip_and_alg_confusion_rejected() {
+            let cfg = AuthConfig::Jwt {
+                signing_method: g2_core::JwtSigningMethod::Rs256,
+                secret: None,
+                public_key_pem: Some(TEST_RSA_PUBLIC_PEM.into()),
+                header: "Authorization".into(),
+                identity_claim: "sub".into(),
+            };
+            let claims = serde_json::json!({"sub": "bob", "exp": future_exp()});
+
+            let rs256 = encode(
+                &Header::new(jsonwebtoken::Algorithm::RS256),
+                &claims,
+                &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes()).expect("private key"),
+            )
+            .expect("encode rs256");
+            let resp = call(&cfg, &rs256).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            // An HS256 token must not pass an RS256 API (alg confusion).
+            let hs256 = hs256_token(&claims);
+            let resp = call(&cfg, &hs256).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[test]
+        fn invalid_pem_fails_layer_construction() {
+            let cfg = AuthConfig::Jwt {
+                signing_method: g2_core::JwtSigningMethod::Rs256,
+                secret: None,
+                public_key_pem: Some("not a pem".into()),
+                header: "Authorization".into(),
+                identity_claim: "sub".into(),
+            };
+            let err = AuthLayer::from_config(&cfg, Arc::new(MemoryStorage::new()), API, ORG);
+            assert!(err.is_err());
+        }
     }
 
     #[test]
