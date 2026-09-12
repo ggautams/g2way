@@ -56,6 +56,13 @@ fn unavailable() -> Response {
 }
 
 /// `GET /g2/node` — node identity plus the APIs currently being routed.
+#[utoipa::path(get, path = "/g2/node", tag = "dashboard",
+    security(("admin_secret" = [])),
+    responses(
+        (status = 200, description = "Node identity, version, uptime, and the currently routed APIs"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 503, description = "Router built without dashboard wiring"),
+    ))]
 pub(crate) async fn node(State(state): State<AdminState>) -> Response {
     let Some(d) = &state.dashboard else {
         return unavailable();
@@ -87,6 +94,13 @@ pub(crate) async fn node(State(state): State<AdminState>) -> Response {
 }
 
 /// `GET /g2/stats` — per-API request counters since process start.
+#[utoipa::path(get, path = "/g2/stats", tag = "dashboard",
+    security(("admin_secret" = [])),
+    responses(
+        (status = 200, description = "Per-API request and status-class counters (process-local, reset on restart)"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 503, description = "Router built without dashboard wiring"),
+    ))]
 pub(crate) async fn stats(State(state): State<AdminState>) -> Response {
     let Some(d) = &state.dashboard else {
         return unavailable();

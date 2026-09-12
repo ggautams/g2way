@@ -26,7 +26,8 @@ use serde::Deserialize;
 use crate::{error_response, AdminState};
 
 /// How `GET`/`PUT`/`DELETE /g2/keys/{key}` interpret the path parameter.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct KeyAddress {
     /// When `true`, the path parameter is the stored key hash itself
     /// instead of a raw key.
@@ -74,6 +75,15 @@ fn storage_unavailable(err: &g2_storage::StorageError) -> Response {
 ///
 /// The raw key is returned **only here**; it is stored hashed and cannot be
 /// recovered later.
+#[utoipa::path(post, path = "/g2/keys", tag = "keys",
+    security(("admin_secret" = [])),
+    request_body = KeySession,
+    responses(
+        (status = 201, description = "Created; `key` (raw, shown once) and `key_hash`"),
+        (status = 400, description = "Session failed validation"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
 pub(crate) async fn create_key(
     State(state): State<AdminState>,
     Json(session): Json<KeySession>,
@@ -103,6 +113,14 @@ pub(crate) async fn create_key(
 ///
 /// Returns `{"keys": ["<hash>", …]}`. Hashes are the only listable handle:
 /// raw keys are never stored. Takes an optional `?org_id=`.
+#[utoipa::path(get, path = "/g2/keys", tag = "keys",
+    security(("admin_secret" = [])),
+    params(KeyAddress),
+    responses(
+        (status = 200, description = "Sorted stored key hashes: `{\"keys\": […]}`"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
 pub(crate) async fn list_keys(
     State(state): State<AdminState>,
     Query(addr): Query<KeyAddress>,
@@ -123,6 +141,16 @@ pub(crate) async fn list_keys(
 }
 
 /// `PUT /g2/keys/{key}` — create or update the session stored for `key`.
+#[utoipa::path(put, path = "/g2/keys/{key}", tag = "keys",
+    security(("admin_secret" = [])),
+    params(("key" = String, Path, description = "Raw key (or stored hash with `hashed=true`)"), KeyAddress),
+    request_body = KeySession,
+    responses(
+        (status = 200, description = "Stored; `action` is `added` or `modified`"),
+        (status = 400, description = "Session failed validation"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
 pub(crate) async fn put_key(
     State(state): State<AdminState>,
     Path(key): Path<String>,
@@ -147,6 +175,16 @@ pub(crate) async fn put_key(
 }
 
 /// `GET /g2/keys/{key}` — fetch the session stored for `key`.
+#[utoipa::path(get, path = "/g2/keys/{key}", tag = "keys",
+    security(("admin_secret" = [])),
+    params(("key" = String, Path, description = "Raw key (or stored hash with `hashed=true`)"), KeyAddress),
+    responses(
+        (status = 200, description = "The stored session", body = KeySession),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 404, description = "No session under this key"),
+        (status = 500, description = "Stored record is corrupt"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
 pub(crate) async fn get_key(
     State(state): State<AdminState>,
     Path(key): Path<String>,
@@ -172,6 +210,15 @@ pub(crate) async fn get_key(
 }
 
 /// `DELETE /g2/keys/{key}` — remove the session stored for `key`.
+#[utoipa::path(delete, path = "/g2/keys/{key}", tag = "keys",
+    security(("admin_secret" = [])),
+    params(("key" = String, Path, description = "Raw key (or stored hash with `hashed=true`)"), KeyAddress),
+    responses(
+        (status = 200, description = "Deleted"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 404, description = "No session under this key"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
 pub(crate) async fn delete_key(
     State(state): State<AdminState>,
     Path(key): Path<String>,

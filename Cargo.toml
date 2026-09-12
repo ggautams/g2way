@@ -53,6 +53,9 @@ jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 bcrypt = "0.17"
 base64 = "0.22"
 
+# OpenAPI
+utoipa = "5"
+
 # Errors, logging, CLI
 thiserror = "2"
 async-trait = "0.1"

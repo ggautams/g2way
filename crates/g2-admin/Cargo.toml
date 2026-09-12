@@ -8,7 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-g2-core.workspace = true
+g2-core = { workspace = true, features = ["openapi"] }
 g2-middleware.workspace = true
 g2-proxy.workspace = true
 g2-storage.workspace = true
@@ -20,6 +20,7 @@ serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+utoipa.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true

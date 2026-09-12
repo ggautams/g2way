@@ -58,7 +58,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] `GET /g2/keys` listing (needs a `Storage::scan`/SCAN operation — deferred from M2 key CRUD)
 - [x] `POST /g2/reload` + Redis pub/sub broadcast → every pod rebuilds its route table
 - [x] Dashboard-support API: node info, loaded APIs, health, version, per-API stats snapshot
-- [ ] OpenAPI spec for the admin API (utoipa) served at `/g2/openapi.json`
+- [x] OpenAPI spec for the admin API (utoipa) served at `/g2/openapi.json`
 
 ## M5 — Observability
 
@@ -384,3 +384,18 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   g2-middleware). Health/version halves of the checkbox existed since the
   M2 skeleton. Verified live: 3×2xx+1×5xx counted, node lists the API.
   Next: M4's last box — OpenAPI spec (utoipa) at `/g2/openapi.json`.
+- **2026-08-30 (22)** — **M4 complete.** OpenAPI spec landed: utoipa 5,
+  `GET /g2/openapi.json` (authenticated like the rest). g2-core grew an
+  `openapi` feature gating `ToSchema` derives on the 9 JSON models (keeps
+  utoipa out of the proxy path's dependency tree; g2-admin enables it).
+  `#[utoipa::path]` annotations are colocated with every handler; the
+  generic resource CRUD gets concrete annotated bindings (`list_apis` …
+  `delete_policy` in resources.rs) because the macro describes exactly one
+  path. `admin_secret` security scheme = `X-G2-Authorization` API-key
+  header. A unit test asserts every mounted route and core schema appears
+  in the document, so an undocumented new route fails `make check`.
+  Verified live: 3.1.0 doc, 11 paths, 9 schemas. **All of M4 done in one
+  session (entries 16–22).** Not done anywhere yet: k8s smoke has no
+  reload/dashboard assertions (deploy/k8s unchanged since M3 — still
+  applies cleanly). Next milestone: M5 observability (OTLP traces first);
+  the deferred M2 `jwks_url` box still waits on the M7 TLS decision.

@@ -7,8 +7,8 @@
 //! per-type key schema and validation.
 //!
 //! **Mutations do not touch the running route table.** A create/
-//! update/delete becomes live only when the gateway reloads (startup today;
-//! `POST /g2/reload` is the next M4 task).
+//! update/delete becomes live only when the gateway reloads (`POST
+//! /g2/reload`, or startup).
 //!
 //! Responses: `GET` returns the stored record (list on the collection
 //! route), mutations return `{"id": …, "action": "added"|"modified"|
@@ -89,7 +89,8 @@ impl StoredResource for Policy {
 
 /// Optional `?org_id=` on `GET`/`DELETE` routes (mutating routes read the
 /// organization from the resource body). Defaults to the single-org default.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 pub(crate) struct OrgQuery {
     org_id: Option<String>,
 }
@@ -256,4 +257,160 @@ pub(crate) async fn delete<R: StoredResource>(
 
 fn not_found(kind: &str) -> Response {
     error_response(StatusCode::NOT_FOUND, &format!("{kind} not found"))
+}
+
+// Concrete, OpenAPI-documented bindings of the generic handlers — one per
+// route the router mounts. utoipa's `#[utoipa::path]` describes exactly one
+// path, so generic handlers cannot carry the annotation themselves.
+
+#[utoipa::path(get, path = "/g2/apis", tag = "apis",
+    security(("admin_secret" = [])), params(OrgQuery),
+    responses(
+        (status = 200, description = "Every stored API definition, sorted by id", body = Vec<ApiDefinition>),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
+pub(crate) async fn list_apis(state: State<AdminState>, query: Query<OrgQuery>) -> Response {
+    list::<ApiDefinition>(state, query).await
+}
+
+#[utoipa::path(post, path = "/g2/apis", tag = "apis",
+    security(("admin_secret" = [])), request_body = ApiDefinition,
+    responses(
+        (status = 201, description = "Created (live after the next reload)"),
+        (status = 400, description = "Definition failed validation"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 409, description = "api_id already exists; use PUT to update"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
+pub(crate) async fn create_api(state: State<AdminState>, body: Json<ApiDefinition>) -> Response {
+    create::<ApiDefinition>(state, body).await
+}
+
+#[utoipa::path(get, path = "/g2/apis/{id}", tag = "apis",
+    security(("admin_secret" = [])),
+    params(("id" = String, Path, description = "The api_id"), OrgQuery),
+    responses(
+        (status = 200, description = "The stored definition", body = ApiDefinition),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 404, description = "No definition under this id"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
+pub(crate) async fn get_api(
+    state: State<AdminState>,
+    id: Path<String>,
+    query: Query<OrgQuery>,
+) -> Response {
+    get::<ApiDefinition>(state, id, query).await
+}
+
+#[utoipa::path(put, path = "/g2/apis/{id}", tag = "apis",
+    security(("admin_secret" = [])),
+    params(("id" = String, Path, description = "The api_id; must equal the body's api_id")),
+    request_body = ApiDefinition,
+    responses(
+        (status = 200, description = "Stored; `action` is `added` or `modified` (live after the next reload)"),
+        (status = 400, description = "Validation failed or body id disagrees with path id"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
+pub(crate) async fn put_api(
+    state: State<AdminState>,
+    id: Path<String>,
+    body: Json<ApiDefinition>,
+) -> Response {
+    put::<ApiDefinition>(state, id, body).await
+}
+
+#[utoipa::path(delete, path = "/g2/apis/{id}", tag = "apis",
+    security(("admin_secret" = [])),
+    params(("id" = String, Path, description = "The api_id"), OrgQuery),
+    responses(
+        (status = 200, description = "Deleted (unrouted after the next reload)"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 404, description = "No definition under this id"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
+pub(crate) async fn delete_api(
+    state: State<AdminState>,
+    id: Path<String>,
+    query: Query<OrgQuery>,
+) -> Response {
+    delete::<ApiDefinition>(state, id, query).await
+}
+
+#[utoipa::path(get, path = "/g2/policies", tag = "policies",
+    security(("admin_secret" = [])), params(OrgQuery),
+    responses(
+        (status = 200, description = "Every stored policy, sorted by id", body = Vec<Policy>),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
+pub(crate) async fn list_policies(state: State<AdminState>, query: Query<OrgQuery>) -> Response {
+    list::<Policy>(state, query).await
+}
+
+#[utoipa::path(post, path = "/g2/policies", tag = "policies",
+    security(("admin_secret" = [])), request_body = Policy,
+    responses(
+        (status = 201, description = "Created"),
+        (status = 400, description = "Policy failed validation"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 409, description = "policy_id already exists; use PUT to update"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
+pub(crate) async fn create_policy(state: State<AdminState>, body: Json<Policy>) -> Response {
+    create::<Policy>(state, body).await
+}
+
+#[utoipa::path(get, path = "/g2/policies/{id}", tag = "policies",
+    security(("admin_secret" = [])),
+    params(("id" = String, Path, description = "The policy_id"), OrgQuery),
+    responses(
+        (status = 200, description = "The stored policy", body = Policy),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 404, description = "No policy under this id"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
+pub(crate) async fn get_policy(
+    state: State<AdminState>,
+    id: Path<String>,
+    query: Query<OrgQuery>,
+) -> Response {
+    get::<Policy>(state, id, query).await
+}
+
+#[utoipa::path(put, path = "/g2/policies/{id}", tag = "policies",
+    security(("admin_secret" = [])),
+    params(("id" = String, Path, description = "The policy_id; must equal the body's policy_id")),
+    request_body = Policy,
+    responses(
+        (status = 200, description = "Stored; `action` is `added` or `modified`"),
+        (status = 400, description = "Validation failed or body id disagrees with path id"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
+pub(crate) async fn put_policy(
+    state: State<AdminState>,
+    id: Path<String>,
+    body: Json<Policy>,
+) -> Response {
+    put::<Policy>(state, id, body).await
+}
+
+#[utoipa::path(delete, path = "/g2/policies/{id}", tag = "policies",
+    security(("admin_secret" = [])),
+    params(("id" = String, Path, description = "The policy_id"), OrgQuery),
+    responses(
+        (status = 200, description = "Deleted"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 404, description = "No policy under this id"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
+pub(crate) async fn delete_policy(
+    state: State<AdminState>,
+    id: Path<String>,
+    query: Query<OrgQuery>,
+) -> Response {
+    delete::<Policy>(state, id, query).await
 }

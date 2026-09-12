@@ -29,6 +29,7 @@ fn default_true() -> bool {
 }
 
 /// A request-rate allowance: at most `requests` per `per_seconds` window.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RateLimit {
     /// Maximum number of requests allowed inside one window.
@@ -43,6 +44,7 @@ pub struct RateLimit {
 /// Unlike [`RateLimit`] (a smoothing limit over seconds or minutes), a quota
 /// is a billing-style allowance over hours or days. The live counter and its
 /// reset timestamp are kept in storage (milestone M3), not on the session.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Quota {
     /// Maximum number of requests allowed inside one renewal period.
@@ -57,6 +59,7 @@ pub struct Quota {
 ///
 /// Present only on sessions addressed by a username (basic-auth mode); the
 /// presented password is verified against `password_hash` on every request.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BasicAuthData {
     /// bcrypt hash of the user's password (a full `$2b$…` hash string).
@@ -69,6 +72,7 @@ pub struct BasicAuthData {
 /// Today an entry's presence in [`KeySession::access`] is the whole grant;
 /// per-API rate/quota overrides arrive with policies (milestone M4), which is
 /// why this is a struct rather than a bare set membership.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiAccess {}
 
@@ -89,6 +93,7 @@ pub struct ApiAccess {}
 ///   "access": { "httpbin": {} }
 /// }
 /// ```
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KeySession {
     /// Owning organization. Always [`DEFAULT_ORG_ID`] in single-org mode.

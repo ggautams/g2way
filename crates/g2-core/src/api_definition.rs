@@ -46,6 +46,7 @@ fn default_basic_auth_realm() -> String {
 }
 
 /// JWT signature algorithms supported by [`AuthConfig::Jwt`].
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum JwtSigningMethod {
@@ -61,6 +62,7 @@ pub enum JwtSigningMethod {
 /// header: an API is protected unless its definition **explicitly** opts out
 /// with `{"auth": {"mode": "keyless"}}`. Forgetting to configure auth must
 /// never silently expose an upstream.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
 pub enum AuthConfig {
@@ -265,6 +267,7 @@ impl AuthConfig {
 ///   "target_url": "http://httpbin.default.svc.cluster.local"
 /// }
 /// ```
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ApiDefinition {
     /// Unique, stable identifier for this API.

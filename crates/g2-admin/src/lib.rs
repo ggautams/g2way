@@ -23,6 +23,7 @@
 
 mod dashboard;
 mod keys;
+mod openapi;
 mod resources;
 
 pub use dashboard::Dashboard;
@@ -33,7 +34,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use g2_core::{ApiDefinition, Error, Policy};
+use g2_core::Error;
 use g2_storage::SharedStorage;
 use sha2::{Digest, Sha256};
 
@@ -108,24 +109,25 @@ pub fn router(
         )
         .route(
             "/g2/apis",
-            get(resources::list::<ApiDefinition>).post(resources::create::<ApiDefinition>),
+            get(resources::list_apis).post(resources::create_api),
         )
         .route(
             "/g2/apis/{id}",
-            get(resources::get::<ApiDefinition>)
-                .put(resources::put::<ApiDefinition>)
-                .delete(resources::delete::<ApiDefinition>),
+            get(resources::get_api)
+                .put(resources::put_api)
+                .delete(resources::delete_api),
         )
         .route(
             "/g2/policies",
-            get(resources::list::<Policy>).post(resources::create::<Policy>),
+            get(resources::list_policies).post(resources::create_policy),
         )
         .route(
             "/g2/policies/{id}",
-            get(resources::get::<Policy>)
-                .put(resources::put::<Policy>)
-                .delete(resources::delete::<Policy>),
+            get(resources::get_policy)
+                .put(resources::put_policy)
+                .delete(resources::delete_policy),
         )
+        .route("/g2/openapi.json", get(openapi::spec))
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -172,12 +174,20 @@ async fn require_admin_secret(
 }
 
 /// `GET /g2/health` — unauthenticated liveness for probes on the admin port.
+#[utoipa::path(get, path = "/g2/health", tag = "system",
+    responses((status = 200, description = "Node is alive: `{\"status\":\"pass\"}`")))]
 async fn health() -> Response {
     Json(serde_json::json!({ "status": "pass" })).into_response()
 }
 
 /// `GET /g2/version` — the gateway's version (workspace-wide, so the crate
 /// version equals the binary's).
+#[utoipa::path(get, path = "/g2/version", tag = "system",
+    security(("admin_secret" = [])),
+    responses(
+        (status = 200, description = "Gateway version: `{\"version\":…}`"),
+        (status = 403, description = "Admin secret missing or wrong"),
+    ))]
 async fn version() -> Response {
     Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") })).into_response()
 }
@@ -189,6 +199,13 @@ async fn version() -> Response {
 /// asynchronously on each pod, which re-reads definitions from files and
 /// storage, rebuilds its route table, and keeps the old table if the new
 /// config fails to load (logged per pod).
+#[utoipa::path(post, path = "/g2/reload", tag = "system",
+    security(("admin_secret" = [])),
+    responses(
+        (status = 200, description = "Nudge broadcast; pods reload asynchronously"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
 async fn reload(State(state): State<AdminState>) -> Response {
     let channel = g2_core::config::reload_channel(g2_core::DEFAULT_ORG_ID);
     match state.storage.publish(&channel, "reload").await {

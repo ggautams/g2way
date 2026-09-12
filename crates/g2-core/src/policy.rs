@@ -46,6 +46,7 @@ fn default_true() -> bool {
 ///   "access": { "httpbin": {} }
 /// }
 /// ```
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Policy {
     /// Unique, stable identifier keys reference in `apply_policies`.
