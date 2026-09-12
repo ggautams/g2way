@@ -1,0 +1,25 @@
+[package]
+name = "g2-proxy"
+description = "The g2way proxy engine: listen-path router, request rewriting, and upstream forwarding on hyper 1.x."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+g2-core.workspace = true
+arc-swap.workspace = true
+bytes.workspace = true
+http.workspace = true
+http-body-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+
+[lints]
+workspace = true

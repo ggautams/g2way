@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/g2-core",
+    "crates/g2-storage",
+    "crates/g2-proxy",
+    "crates/g2-middleware",
+    "crates/g2-admin",
+    "crates/g2-telemetry",
+    "crates/g2way",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+repository = "https://github.com/g2way/g2way"
+rust-version = "1.85"
+
+[workspace.dependencies]
+# Intra-workspace crates
+g2-core = { path = "crates/g2-core" }
+g2-storage = { path = "crates/g2-storage" }
+g2-proxy = { path = "crates/g2-proxy" }
+g2-middleware = { path = "crates/g2-middleware" }
+g2-admin = { path = "crates/g2-admin" }
+g2-telemetry = { path = "crates/g2-telemetry" }
+
+# Async runtime & HTTP
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "fs"] }
+hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
+hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "client-legacy", "http1", "http2", "tokio"] }
+http = "1"
+http-body-util = "0.1"
+bytes = "1"
+tower = { version = "0.5", features = ["util"] }
+
+# Data / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+arc-swap = "1"
+
+# Errors, logging, CLI
+thiserror = "2"
+async-trait = "0.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+clap = { version = "4", features = ["derive", "env"] }
+
+# Dev-dependencies
+tempfile = "3"
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

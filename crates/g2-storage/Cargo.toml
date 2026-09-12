@@ -1,0 +1,19 @@
+[package]
+name = "g2-storage"
+description = "Storage abstraction for g2way: shared trait plus in-memory (dev/test) implementation; Redis backend arrives in M2."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

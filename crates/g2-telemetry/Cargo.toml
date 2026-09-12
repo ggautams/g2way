@@ -1,0 +1,17 @@
+[package]
+name = "g2-telemetry"
+description = "Telemetry for g2way: tracing/log initialization now; OTLP traces, metrics, and analytics records in milestone M5."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

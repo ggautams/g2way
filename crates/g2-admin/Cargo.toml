@@ -1,0 +1,13 @@
+[package]
+name = "g2-admin"
+description = "Admin/control-plane API for g2way: key and API-definition CRUD, reload, node status (populated from milestone M2 onward)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+
+[lints]
+workspace = true

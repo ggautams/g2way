@@ -1,0 +1,27 @@
+[package]
+name = "g2way"
+description = "The g2way API gateway binary: config loading, server assembly, graceful shutdown."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+g2-core.workspace = true
+g2-proxy.workspace = true
+g2-telemetry.workspace = true
+clap.workspace = true
+http.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+http-body-util.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
