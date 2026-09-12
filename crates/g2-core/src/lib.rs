@@ -6,6 +6,9 @@
 //!   exposed on a listen path.
 //! - [`GatewayConfig`] — process-level gateway settings (listen address,
 //!   where API definitions are loaded from, and so on).
+//! - [`KeySession`] — the state attached to one API key: org, per-API
+//!   access, rate/quota allowances, expiry (keys are stored hashed; see
+//!   [`session::hash_key`]).
 //! - [`Error`] — the shared error type for configuration and validation
 //!   failures.
 //!
@@ -19,7 +22,9 @@ pub mod api_definition;
 pub mod config;
 mod error;
 pub mod loader;
+pub mod session;
 
 pub use api_definition::{ApiDefinition, DEFAULT_ORG_ID};
 pub use config::GatewayConfig;
 pub use error::Error;
+pub use session::KeySession;

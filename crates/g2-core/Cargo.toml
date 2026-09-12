@@ -8,7 +8,9 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+hex.workspace = true
 http.workspace = true
+sha2.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_yaml.workspace = true

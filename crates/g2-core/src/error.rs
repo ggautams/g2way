@@ -12,6 +12,16 @@ pub enum Error {
         reason: String,
     },
 
+    /// A key session failed semantic validation.
+    ///
+    /// Sessions carry no natural identifier of their own (they are addressed
+    /// by key hash), so the error carries only the reason.
+    #[error("invalid key session: {reason}")]
+    InvalidKeySession {
+        /// Human-readable description of what is wrong.
+        reason: String,
+    },
+
     /// Two API definitions collide (same `api_id` or same `listen_path`).
     #[error("conflicting API definitions: {reason}")]
     ConflictingApiDefinitions {

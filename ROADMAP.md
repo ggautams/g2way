@@ -33,7 +33,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 ## M2 — Auth & key management
 
 - [x] Middleware chain scaffolding: per-API tower stack composed at route-build time (g2-middleware)
-- [ ] `KeySession` model (rate, quota, expiry, org_id, per-API access; SHA-256 key hashing)
+- [x] `KeySession` model (rate, quota, expiry, org_id, per-API access; SHA-256 key hashing)
 - [ ] Redis-backed `Storage` implementation (connection pool, `g2:{org}:...` schema) + `make redis-up` integration tests
 - [ ] Auth: keyless mode (explicit) and auth-token mode (header/query param/cookie lookup → `KeySession`)
 - [ ] Auth: JWT (HS256/RS256, `jwks_url` fetch + cache, claims → session)
@@ -126,3 +126,14 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   `tower::Service` is not general enough" (rust-lang/rust#102211) when the
   chain is driven inside a `Send` future; keep body/service type params
   lifetime-free in future layers. Next: M2 `KeySession` model.
+- **2026-08-30 (4)** — M2 `KeySession` model landed in `g2-core::session`:
+  idiomatic shapes (`Option<RateLimit>`/`Option<Quota>` instead of
+  zero-sentinels; empty `access` map = all APIs in org), with
+  `is_expired(now_unix_secs)` (clock passed in, inclusive boundary),
+  `allows_api`, SHA-256 `hash_key` (lowercase hex; raw keys never persisted)
+  and `session_storage_key` → `g2:{org}:apikey:{hash}`. `ApiAccess` is an
+  empty struct on purpose — per-API overrides land with policies (M4) without
+  a schema break. Quota counters/reset timestamps deliberately NOT on the
+  session — they're live state and belong in storage (M3). Added `sha2`+`hex`
+  workspace deps; new `Error::InvalidKeySession`. Next: M2 Redis-backed
+  `Storage` (`make redis-up` + integration tests).
