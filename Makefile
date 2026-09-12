@@ -33,7 +33,7 @@ run:
 
 ## Local upstream for examples/apis/httpbin.json.
 httpbin-up:
-	docker run -d --name g2way-httpbin -p 8000:8080 ghcr.io/mccutchen/go-httpbin:v2
+	docker run -d --name g2way-httpbin -p 8000:8080 ghcr.io/mccutchen/go-httpbin:v2.15.0
 
 httpbin-down:
 	docker rm -f g2way-httpbin

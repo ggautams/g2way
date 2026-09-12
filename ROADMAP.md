@@ -24,7 +24,7 @@ decisions: `docs/adr/`.
 - [x] End-to-end tests (real TCP client → gateway → upstream)
 - [x] Dockerfile (multi-stage, distroless)
 - [x] k8s manifests: gateway ×2 replicas + go-httpbin upstream + smoke script
-- [ ] User-verified: `make minikube-load k8s-deploy smoke` green on local minikube
+- [x] User-verified: `make minikube-load k8s-deploy smoke` green on local minikube
 
 **Known M1 limitations** (fixed in later milestones): upstream `https://`
 targets are accepted by validation but fail at request time — the client has
@@ -103,3 +103,12 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   minikube deploy are still **unverified** — first thing to check next session
   if the user hasn't run `make minikube-load k8s-deploy smoke` yet. The binary
   itself was verified live (health, proxy 200, 404, SIGTERM drain).
+- **2026-08-30 (2)** — M1 fully verified: Docker image built, minikube deploy +
+  smoke green (2 gateway replicas proxying to go-httpbin). Two deploy fixes:
+  `go-httpbin:v2` tag doesn't exist on ghcr → pinned `v2.15.0` (httpbin.yaml +
+  Makefile); smoke.sh asserted the scalar query-args shape → now matches the
+  echoed URL (v2.15 returns args as arrays). Note: `minikube image load
+  g2way:dev` fails with "blob not found" on this Docker Desktop (containerd
+  store) — workaround is `docker save` to a tar and `minikube image load
+  <tar>`; consider baking that into the Makefile if it recurs. Next: M2
+  middleware chain scaffolding (in progress this session).

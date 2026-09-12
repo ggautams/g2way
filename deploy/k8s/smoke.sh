@@ -29,7 +29,9 @@ curl -sf "http://localhost:$LOCAL_PORT/hello" | grep -q '"status":"pass"' \
 
 say "proxying through the gateway to httpbin"
 BODY=$(curl -sf "http://localhost:$LOCAL_PORT/httpbin/get?smoke=1")
-echo "$BODY" | grep -q '"smoke": *"1"' || fail "query param did not reach upstream"
+# go-httpbin echoes the upstream URL it saw; query args render as scalars or
+# arrays depending on version, so assert on the URL instead.
+echo "$BODY" | grep -q 'get?smoke=1' || fail "query param did not reach upstream"
 echo "$BODY" | grep -q '"X-Forwarded-For"' || fail "X-Forwarded-For missing upstream"
 
 say "checking 404 for unrouted path"
