@@ -8,18 +8,23 @@
 //!    immutable; [`Gateway`] holds it in an `ArcSwap` so a config reload is a
 //!    single atomic pointer swap and in-flight requests keep the table they
 //!    started with.
-//! 2. **Rewriting** — the private `rewrite` module strips the listen path,
-//!    joins the upstream base path, removes hop-by-hop headers, and adds
-//!    `X-Forwarded-*` headers.
-//! 3. **Forwarding** — a shared pooled hyper client streams the request to
-//!    the upstream and the response back, enforcing the per-API upstream
-//!    timeout.
+//! 2. **Middleware chain** — each route carries a per-API tower stack from
+//!    `g2-middleware`, composed once at table-build time (never per request);
+//!    the gateway clones the boxed chain and drives it with `oneshot`.
+//! 3. **Forwarding** — the chain's innermost service (the `forward` module)
+//!    strips the listen path, joins the upstream base path, removes
+//!    hop-by-hop headers, adds `X-Forwarded-*`, and streams the request to
+//!    the upstream through a shared pooled hyper client ([`Forwarder`]),
+//!    enforcing the per-API upstream timeout.
 //!
 //! [`Gateway::handle`] is the single entry point the binary calls per request.
 
+pub mod forward;
 pub mod gateway;
+mod response;
 mod rewrite;
 pub mod router;
 
+pub use forward::{Forwarder, UpstreamTarget};
 pub use gateway::{Gateway, ProxyBody};
 pub use router::{Route, RouteTable};

@@ -1,40 +1,50 @@
-//! Listen-path routing: mapping a request path to an API definition.
+//! Listen-path routing: mapping a request path to an API definition and its
+//! prebuilt middleware chain.
 
 use std::sync::Arc;
 
 use g2_core::{ApiDefinition, Error};
-use http::uri::{Authority, Scheme};
+use g2_middleware::{ChainBuilder, ChainService, RequestContext};
+
+use crate::forward::{Forward, Forwarder, UpstreamTarget};
 
 /// One routable API: a validated [`ApiDefinition`] plus everything
-/// precomputed at build time so per-request matching does no parsing.
-#[derive(Debug, Clone)]
+/// precomputed at build time — upstream target parts and the composed
+/// middleware chain — so the per-request hot path does no parsing and no
+/// composition (ADR-0001).
+#[derive(Clone)]
 pub struct Route {
     /// The API definition this route was built from.
     pub def: ApiDefinition,
     /// `listen_path` with any trailing `/` removed (`"/users"`; empty for `"/"`).
     pub listen_prefix: String,
-    /// Upstream scheme parsed from `target_url`.
-    pub target_scheme: Scheme,
-    /// Upstream `host[:port]` parsed from `target_url`.
-    pub target_authority: Authority,
-    /// Upstream base path from `target_url` (`""` when the URL has no path).
-    pub target_base_path: String,
+    /// Precomputed upstream target parts.
+    pub target: Arc<UpstreamTarget>,
+    /// The API's middleware chain, ending in the upstream forwarder. Cloned
+    /// per request by the gateway.
+    pub(crate) chain: ChainService,
+}
+
+impl std::fmt::Debug for Route {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Route")
+            .field("def", &self.def)
+            .field("listen_prefix", &self.listen_prefix)
+            .field("target", &self.target)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Route {
-    fn build(def: ApiDefinition) -> Result<Self, Error> {
-        def.validate()?;
-        let target = def.target_uri();
-        let scheme = target.scheme().expect("validated scheme").clone();
-        let authority = target.authority().expect("validated authority").clone();
-        let base_path = target.path().trim_end_matches('/').to_owned();
-        let listen_prefix = def.listen_path.trim_end_matches('/').to_owned();
+    fn build(def: ApiDefinition, forwarder: &Forwarder) -> Result<Self, Error> {
+        let target = Arc::new(UpstreamTarget::build(&def)?);
+        let ctx = RequestContext::new(def.api_id.clone(), def.org_id.clone());
+        let chain = ChainBuilder::new(ctx).build(Forward::new(forwarder, Arc::clone(&target)));
         Ok(Self {
+            listen_prefix: target.listen_prefix.clone(),
             def,
-            listen_prefix,
-            target_scheme: scheme,
-            target_authority: authority,
-            target_base_path: base_path,
+            target,
+            chain,
         })
     }
 
@@ -66,18 +76,20 @@ pub struct RouteTable {
 }
 
 impl RouteTable {
-    /// Builds a table from definitions, skipping inactive ones.
+    /// Builds a table from definitions, skipping inactive ones. Each route's
+    /// middleware chain is composed here, around a forwarding service using
+    /// `forwarder`'s shared client.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidApiDefinition`] if any definition (active or
     /// not) fails validation — a broken definition should fail loudly at load
     /// time, not silently at request time.
-    pub fn build(defs: Vec<ApiDefinition>) -> Result<Self, Error> {
+    pub fn build(defs: Vec<ApiDefinition>, forwarder: &Forwarder) -> Result<Self, Error> {
         let mut routes = Vec::with_capacity(defs.len());
         for def in defs {
             let active = def.active;
-            let route = Route::build(def)?;
+            let route = Route::build(def, forwarder)?;
             if active {
                 routes.push(Arc::new(route));
             } else {
@@ -117,9 +129,13 @@ mod tests {
         .expect("valid definition")
     }
 
+    fn table(defs: Vec<ApiDefinition>) -> Result<RouteTable, Error> {
+        RouteTable::build(defs, &Forwarder::new())
+    }
+
     #[test]
     fn longest_prefix_wins() {
-        let table = RouteTable::build(vec![
+        let table = table(vec![
             def("all", "/", "http://all.internal"),
             def("users", "/users/", "http://users.internal"),
             def("user-admin", "/users/admin/", "http://admin.internal"),
@@ -136,8 +152,7 @@ mod tests {
 
     #[test]
     fn prefix_matches_whole_segments_only() {
-        let table =
-            RouteTable::build(vec![def("users", "/users", "http://u.internal")]).expect("build");
+        let table = table(vec![def("users", "/users", "http://u.internal")]).expect("build");
         assert!(table.match_path("/users").is_some());
         assert!(table.match_path("/users/").is_some());
         assert!(table.match_path("/users/42").is_some());
@@ -147,9 +162,8 @@ mod tests {
 
     #[test]
     fn trailing_slash_in_listen_path_is_ignored_for_matching() {
-        let with = RouteTable::build(vec![def("a", "/svc/", "http://u.internal")]).expect("build");
-        let without =
-            RouteTable::build(vec![def("a", "/svc", "http://u.internal")]).expect("build");
+        let with = table(vec![def("a", "/svc/", "http://u.internal")]).expect("build");
+        let without = table(vec![def("a", "/svc", "http://u.internal")]).expect("build");
         for t in [&with, &without] {
             assert!(t.match_path("/svc").is_some());
             assert!(t.match_path("/svc/x").is_some());
@@ -160,7 +174,7 @@ mod tests {
     fn inactive_apis_are_not_routed() {
         let mut d = def("off", "/off/", "http://u.internal");
         d.active = false;
-        let table = RouteTable::build(vec![d]).expect("build");
+        let table = table(vec![d]).expect("build");
         assert!(table.match_path("/off/x").is_none());
         assert!(table.routes().is_empty());
     }
@@ -168,22 +182,21 @@ mod tests {
     #[test]
     fn invalid_definition_fails_the_whole_build() {
         let bad = def("bad", "/ok/", "not-a-url");
-        assert!(RouteTable::build(vec![bad]).is_err());
+        assert!(table(vec![bad]).is_err());
     }
 
     #[test]
     fn route_precomputes_target_parts() {
-        let table = RouteTable::build(vec![def("a", "/a/", "https://api.internal:8443/base/")])
-            .expect("build");
+        let table = table(vec![def("a", "/a/", "https://api.internal:8443/base/")]).expect("build");
         let route = table.match_path("/a/x").expect("route");
-        assert_eq!(route.target_scheme.as_str(), "https");
-        assert_eq!(route.target_authority.as_str(), "api.internal:8443");
-        assert_eq!(route.target_base_path, "/base");
+        assert_eq!(route.target.scheme.as_str(), "https");
+        assert_eq!(route.target.authority.as_str(), "api.internal:8443");
+        assert_eq!(route.target.base_path, "/base");
     }
 
     #[test]
     fn empty_table_matches_nothing() {
-        let table = RouteTable::build(vec![]).expect("build");
+        let table = table(vec![]).expect("build");
         assert!(table.match_path("/anything").is_none());
     }
 }

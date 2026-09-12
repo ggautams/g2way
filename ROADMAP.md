@@ -32,7 +32,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 
 ## M2 — Auth & key management
 
-- [ ] Middleware chain scaffolding: per-API tower stack composed at route-build time (g2-middleware)
+- [x] Middleware chain scaffolding: per-API tower stack composed at route-build time (g2-middleware)
 - [ ] `KeySession` model (rate, quota, expiry, org_id, per-API access; SHA-256 key hashing)
 - [ ] Redis-backed `Storage` implementation (connection pool, `g2:{org}:...` schema) + `make redis-up` integration tests
 - [ ] Auth: keyless mode (explicit) and auth-token mode (header/query param/cookie lookup → `KeySession`)
@@ -112,3 +112,17 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   store) — workaround is `docker save` to a tar and `minikube image load
   <tar>`; consider baking that into the Makefile if it recurs. Next: M2
   middleware chain scaffolding (in progress this session).
+- **2026-08-30 (3)** — M2 middleware chain scaffolding landed. Each `Route`
+  now stores a prebuilt `ChainService` (tower `BoxCloneSyncService`) composed
+  at `RouteTable::build(defs, &Forwarder)` time; the forward tail moved out of
+  `Gateway::handle` into a `Forward` service (innermost in the chain), the
+  hyper client moved into a cheap-clone `Forwarder` handle so pools survive
+  reloads, and `Gateway` is de-generified (method-generic `handle<B>` boxes
+  bodies at the chain boundary). Proof layers: `SetContextLayer`
+  (`RequestContext` extension) + `ApiIdHeaderLayer` (anti-spoof `x-g2-api-id`
+  upstream header). **Surprise:** `ProxyBody` had to become a concrete struct
+  (axum-style) instead of a `BoxBody` alias — naked `dyn + '_` lifetimes in a
+  tower service's request/response types trip rustc's "implementation of
+  `tower::Service` is not general enough" (rust-lang/rust#102211) when the
+  chain is driven inside a `Send` future; keep body/service type params
+  lifetime-free in future layers. Next: M2 `KeySession` model.

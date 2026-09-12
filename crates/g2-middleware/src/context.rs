@@ -1,0 +1,65 @@
+//! Per-request context types carried in request extensions.
+
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+/// Identity of the API (and owning organization) a request was routed to.
+///
+/// Built once per route at config-load time and stamped onto every request by
+/// [`SetContextLayer`](crate::SetContextLayer); downstream layers read it from
+/// request extensions. `Arc<str>` fields make cloning per request cheap.
+#[derive(Debug, Clone)]
+pub struct RequestContext {
+    api_id: Arc<str>,
+    org_id: Arc<str>,
+}
+
+impl RequestContext {
+    /// Creates a context for the given API and organization ids.
+    #[must_use]
+    pub fn new(api_id: impl Into<Arc<str>>, org_id: impl Into<Arc<str>>) -> Self {
+        Self {
+            api_id: api_id.into(),
+            org_id: org_id.into(),
+        }
+    }
+
+    /// The `api_id` of the matched API definition.
+    #[must_use]
+    pub fn api_id(&self) -> &str {
+        &self.api_id
+    }
+
+    /// The id of the organization owning the matched API.
+    #[must_use]
+    pub fn org_id(&self) -> &str {
+        &self.org_id
+    }
+}
+
+/// The remote (client) socket address of a request.
+///
+/// Inserted into request extensions by the gateway before the chain runs,
+/// because only the accept loop knows the peer address; the forwarding
+/// service reads it to extend `X-Forwarded-For`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClientAddr(pub SocketAddr);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_exposes_ids() {
+        let ctx = RequestContext::new("users-api", "acme");
+        assert_eq!(ctx.api_id(), "users-api");
+        assert_eq!(ctx.org_id(), "acme");
+    }
+
+    #[test]
+    fn context_clones_share_backing_storage() {
+        let ctx = RequestContext::new("a", "o");
+        let clone = ctx.clone();
+        assert!(std::ptr::eq(ctx.api_id(), clone.api_id()));
+    }
+}

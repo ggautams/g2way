@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use g2_core::ApiDefinition;
-use g2_proxy::{Gateway, RouteTable};
+use g2_proxy::{Forwarder, Gateway, RouteTable};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
@@ -30,10 +30,15 @@ async fn spawn_echo_upstream() -> SocketAddr {
             };
             tokio::spawn(async move {
                 let service = service_fn(|req: Request<Incoming>| async move {
+                    let api_id = req.headers().get("x-g2-api-id").cloned();
                     let head = format!("{} {}", req.method(), req.uri());
                     let body = req.collect().await.expect("body").to_bytes();
                     let reply = format!("{head} len={}", body.len());
-                    Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(reply))))
+                    let mut resp = Response::new(Full::new(Bytes::from(reply)));
+                    if let Some(api_id) = api_id {
+                        resp.headers_mut().insert("x-echo-api-id", api_id);
+                    }
+                    Ok::<_, std::convert::Infallible>(resp)
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(TokioIo::new(stream), service)
@@ -47,7 +52,7 @@ async fn spawn_echo_upstream() -> SocketAddr {
 /// Starts a full g2way server for `defs`; returns its address and a shutdown
 /// trigger.
 async fn spawn_gateway(defs: Vec<ApiDefinition>) -> (SocketAddr, oneshot::Sender<()>) {
-    let table = RouteTable::build(defs).expect("route table");
+    let table = RouteTable::build(defs, &Forwarder::new()).expect("route table");
     let gateway = Arc::new(Gateway::new(table));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -92,9 +97,26 @@ async fn proxies_get_requests_end_to_end() {
     let upstream = spawn_echo_upstream().await;
     let (gw, _stop) = spawn_gateway(vec![api("/svc/", &format!("http://{upstream}"))]).await;
 
-    let (status, body) = http_get(&format!("http://{gw}/svc/widgets?limit=5")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, "GET /widgets?limit=5 len=0");
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(
+            format!("http://{gw}/svc/widgets?limit=5")
+                .parse()
+                .expect("url"),
+        )
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), StatusCode::OK);
+    // The middleware chain stamped the API id onto the upstream request.
+    assert_eq!(
+        resp.headers()
+            .get("x-echo-api-id")
+            .expect("api id header")
+            .as_bytes(),
+        b"e2e"
+    );
+    let body = resp.collect().await.expect("body").to_bytes();
+    assert_eq!(&body[..], b"GET /widgets?limit=5 len=0");
 }
 
 #[tokio::test]

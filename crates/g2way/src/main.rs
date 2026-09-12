@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use clap::Parser;
 use g2_core::GatewayConfig;
-use g2_proxy::{Gateway, RouteTable};
+use g2_proxy::{Forwarder, Gateway, RouteTable};
 use g2_telemetry::LogFormat;
 use g2way::server;
 
@@ -68,7 +68,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         apps_dir = %config.apps_dir.display(),
         "loaded API definitions"
     );
-    let table = RouteTable::build(defs)?;
+    let forwarder = Forwarder::new();
+    let table = RouteTable::build(defs, &forwarder)?;
     let gateway = Arc::new(Gateway::new(table));
     let grace = Duration::from_secs(config.shutdown_grace_period_secs);
 

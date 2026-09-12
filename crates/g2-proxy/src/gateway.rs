@@ -1,57 +1,36 @@
-//! The [`Gateway`]: per-request entry point tying routing, rewriting, and
-//! upstream forwarding together.
+//! The [`Gateway`]: per-request entry point tying routing and each route's
+//! prebuilt middleware chain together.
 
 use std::net::SocketAddr;
-use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use bytes::Bytes;
-use http::uri::Uri;
-use http::{header, HeaderValue, Request, Response, StatusCode, Version};
-use http_body_util::combinators::BoxBody;
-use http_body_util::{BodyExt, Full};
-use hyper::body::{Body, Incoming};
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use http::{Request, Response, StatusCode};
+use hyper::body::Body;
+use tower::ServiceExt;
 
-use crate::rewrite;
+use crate::response::{error_response, health_response};
 use crate::router::RouteTable;
 
-/// Boxed error type used for proxied body streams.
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-/// The response body type produced by the gateway: either a locally
-/// generated body (errors, health checks) or the streamed upstream body.
-pub type ProxyBody = BoxBody<Bytes, BoxError>;
-
-/// Gateway version reported by `/hello` (the workspace version).
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub use g2_middleware::{BoxError, ProxyBody};
 
 /// The proxy engine shared by all connections of a gateway process.
 ///
-/// Generic over the request body `B` so production code uses hyper's
-/// streaming [`Incoming`] while tests inject synthetic bodies. The route
-/// table lives in an [`ArcSwap`]: requests load it wait-free, and
-/// [`Gateway::reload`] swaps in a new table atomically.
-pub struct Gateway<B = Incoming> {
+/// The route table lives in an [`ArcSwap`]: requests load it wait-free, and
+/// [`Gateway::reload`] swaps in a new table atomically. Each route carries a
+/// fully composed middleware chain (ending in the upstream forwarder) built
+/// at table-build time; per request the gateway only clones that boxed chain
+/// and drives it — no locks, no composition on the hot path.
+pub struct Gateway {
     table: ArcSwap<RouteTable>,
-    client: Client<HttpConnector, B>,
 }
 
-impl<B> Gateway<B>
-where
-    B: Body + Send + Unpin + 'static,
-    B::Data: Send,
-    B::Error: Into<BoxError>,
-{
-    /// Creates a gateway serving `table` with a default pooled HTTP client.
+impl Gateway {
+    /// Creates a gateway serving `table`.
     #[must_use]
     pub fn new(table: RouteTable) -> Self {
-        let client = Client::builder(TokioExecutor::new()).build_http();
         Self {
             table: ArcSwap::from_pointee(table),
-            client,
         }
     }
 
@@ -68,10 +47,18 @@ where
 
     /// Handles one client request end to end.
     ///
+    /// Generic over the request body `B` so production code passes hyper's
+    /// streaming `Incoming` while tests inject synthetic bodies; the body is
+    /// boxed into [`ProxyBody`] at the chain boundary.
+    ///
     /// Never returns an error: every failure is mapped to an HTTP error
-    /// response (`404` no matching API, `502` upstream unreachable, `504`
-    /// upstream timeout).
-    pub async fn handle(&self, req: Request<B>, remote_addr: SocketAddr) -> Response<ProxyBody> {
+    /// response (`404` no matching API; `502`/`504` and later `401`/`429`
+    /// come from inside the chain).
+    pub async fn handle<B>(&self, req: Request<B>, remote_addr: SocketAddr) -> Response<ProxyBody>
+    where
+        B: Body<Data = Bytes> + Send + Sync + 'static,
+        B::Error: Into<BoxError>,
+    {
         let path = req.uri().path();
 
         // Health endpoints are served before routing so an API mounted on `/`
@@ -85,93 +72,33 @@ where
             tracing::debug!(path, "no API matched");
             return error_response(StatusCode::NOT_FOUND, "no API found for path");
         };
-        let route = route.clone();
+        let chain = route.chain.clone();
         drop(table);
 
-        let api_id = route.def.api_id.clone();
-        let timeout = Duration::from_millis(route.def.upstream_timeout_ms);
-
-        // Rewrite the request for the upstream.
-        let (mut parts, body) = req.into_parts();
-        let path_and_query =
-            rewrite::upstream_path_and_query(&route, parts.uri.path(), parts.uri.query());
-        let upstream_uri = Uri::builder()
-            .scheme(route.target_scheme.clone())
-            .authority(route.target_authority.clone())
-            .path_and_query(path_and_query)
-            .build();
-        let upstream_uri = match upstream_uri {
-            Ok(uri) => uri,
-            Err(err) => {
-                tracing::error!(%api_id, error = %err, "failed to build upstream URI");
-                return error_response(StatusCode::BAD_GATEWAY, "invalid upstream request");
-            }
-        };
-        parts.uri = upstream_uri;
-        // The upstream connection is negotiated by the client independently
-        // of the client-facing protocol version.
-        parts.version = Version::HTTP_11;
-        rewrite::prepare_upstream_headers(&mut parts.headers, &route, remote_addr.ip());
-        let upstream_req = Request::from_parts(parts, body);
-
-        tracing::debug!(%api_id, uri = %upstream_req.uri(), "forwarding upstream");
-        match tokio::time::timeout(timeout, self.client.request(upstream_req)).await {
-            Ok(Ok(mut resp)) => {
-                rewrite::strip_hop_by_hop_headers(resp.headers_mut());
-                resp.map(|b| b.map_err(BoxError::from).boxed())
-            }
-            Ok(Err(err)) => {
-                tracing::warn!(%api_id, error = %err, "upstream request failed");
-                error_response(StatusCode::BAD_GATEWAY, "upstream request failed")
-            }
-            Err(_elapsed) => {
-                tracing::warn!(%api_id, timeout_ms = timeout.as_millis(), "upstream timed out");
-                error_response(StatusCode::GATEWAY_TIMEOUT, "upstream request timed out")
-            }
+        let mut req = req.map(ProxyBody::new);
+        req.extensions_mut()
+            .insert(g2_middleware::ClientAddr(remote_addr));
+        match chain.oneshot(req).await {
+            Ok(resp) => resp,
+            Err(never) => match never {},
         }
     }
-}
-
-/// Builds a JSON error response: `{"error": "<message>"}`.
-fn error_response(status: StatusCode, message: &str) -> Response<ProxyBody> {
-    let body = serde_json::json!({ "error": message }).to_string();
-    json_response(status, body)
-}
-
-/// Builds the `/hello` / `/ready` liveness body.
-fn health_response() -> Response<ProxyBody> {
-    let body = serde_json::json!({
-        "status": "pass",
-        "version": VERSION,
-        "description": "g2way API gateway",
-    })
-    .to_string();
-    json_response(StatusCode::OK, body)
-}
-
-fn json_response(status: StatusCode, body: String) -> Response<ProxyBody> {
-    let mut resp = Response::new(
-        Full::new(Bytes::from(body))
-            .map_err(|infallible| match infallible {})
-            .boxed(),
-    );
-    *resp.status_mut() = status;
-    resp.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/json"),
-    );
-    resp
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::forward::Forwarder;
     use crate::router::RouteTable;
     use g2_core::ApiDefinition;
-    use http_body_util::Empty;
+    use g2_middleware::API_ID_HEADER;
+    use http::{header, HeaderValue};
+    use http_body_util::{BodyExt, Empty, Full};
+    use hyper::body::Incoming;
     use hyper::service::service_fn;
     use hyper_util::rt::TokioIo;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr};
+    use std::time::Duration;
     use tokio::net::TcpListener;
 
     type TestBody = Full<Bytes>;
@@ -179,7 +106,8 @@ mod tests {
     const CLIENT: SocketAddr = SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 55555);
 
     /// Spawns an echo upstream returning `"<METHOD> <path?query>"` in the
-    /// body and the received `host` header in `x-echo-host`.
+    /// body and the received `host` / `x-forwarded-for` / `x-g2-api-id`
+    /// headers in `x-echo-*` response headers.
     async fn spawn_echo_upstream() -> SocketAddr {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
             .await
@@ -202,10 +130,16 @@ mod tests {
                             .get("x-forwarded-for")
                             .cloned()
                             .unwrap_or(HeaderValue::from_static("<none>"));
+                        let api_id = req
+                            .headers()
+                            .get(API_ID_HEADER)
+                            .cloned()
+                            .unwrap_or(HeaderValue::from_static("<none>"));
                         let body = format!("{} {}", req.method(), req.uri());
                         let mut resp = Response::new(Full::new(Bytes::from(body)));
                         resp.headers_mut().insert("x-echo-host", host);
                         resp.headers_mut().insert("x-echo-xff", xff);
+                        resp.headers_mut().insert("x-echo-api-id", api_id);
                         Ok::<_, std::convert::Infallible>(resp)
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
@@ -217,8 +151,8 @@ mod tests {
         addr
     }
 
-    fn gateway_for(defs: Vec<ApiDefinition>) -> Gateway<TestBody> {
-        Gateway::new(RouteTable::build(defs).expect("table"))
+    fn gateway_for(defs: Vec<ApiDefinition>) -> Gateway {
+        Gateway::new(RouteTable::build(defs, &Forwarder::new()).expect("table"))
     }
 
     fn def_to(api_id: &str, listen_path: &str, target: &str) -> ApiDefinition {
@@ -259,6 +193,30 @@ mod tests {
         assert_eq!(host.to_str().expect("host str"), upstream.to_string());
         // …and the client IP was recorded.
         assert_eq!(xff.to_str().expect("xff str"), "127.0.0.1");
+    }
+
+    #[tokio::test]
+    async fn chain_stamps_api_id_header_upstream() {
+        let upstream = spawn_echo_upstream().await;
+        let gw = gateway_for(vec![def_to(
+            "echo",
+            "/echo/",
+            &format!("http://{upstream}"),
+        )]);
+
+        // A client-supplied value must be overwritten by the chain.
+        let mut req = get("/echo/x");
+        req.headers_mut()
+            .insert(API_ID_HEADER, HeaderValue::from_static("spoofed"));
+        let resp = gw.handle(req, CLIENT).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-echo-api-id")
+                .expect("api id")
+                .as_bytes(),
+            b"echo"
+        );
     }
 
     #[tokio::test]
@@ -355,11 +313,10 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
-        let table = RouteTable::build(vec![def_to(
-            "echo",
-            "/echo/",
-            &format!("http://{upstream}"),
-        )])
+        let table = RouteTable::build(
+            vec![def_to("echo", "/echo/", &format!("http://{upstream}"))],
+            &Forwarder::new(),
+        )
         .expect("table");
         gw.reload(table);
         assert_eq!(gw.route_count(), 1);

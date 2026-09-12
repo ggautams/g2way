@@ -5,7 +5,7 @@ use std::net::IpAddr;
 
 use http::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST};
 
-use crate::router::Route;
+use crate::forward::UpstreamTarget;
 
 /// Headers that are connection-local per RFC 9110 §7.6.1 and must not be
 /// forwarded by an intermediary.
@@ -20,27 +20,27 @@ const HOP_BY_HOP: [&str; 8] = [
     "upgrade",
 ];
 
-/// Computes the upstream `path?query` for a request matched to `route`.
+/// Computes the upstream `path?query` for a request matched to `target`.
 ///
 /// With `strip_listen_path` (the default) the listen-path prefix is removed
 /// and the remainder is appended to the upstream base path; otherwise the
 /// full original path is appended. The query string is always forwarded
 /// untouched.
 pub(crate) fn upstream_path_and_query(
-    route: &Route,
+    target: &UpstreamTarget,
     req_path: &str,
     query: Option<&str>,
 ) -> String {
-    let tail = if route.def.strip_listen_path {
-        // `matches()` guaranteed the prefix is present.
+    let tail = if target.strip_listen_path {
+        // `Route::matches()` guaranteed the prefix is present.
         req_path
-            .strip_prefix(route.listen_prefix.as_str())
+            .strip_prefix(target.listen_prefix.as_str())
             .unwrap_or(req_path)
     } else {
         req_path
     };
 
-    let mut path = join_paths(&route.target_base_path, tail);
+    let mut path = join_paths(&target.base_path, tail);
     if let Some(q) = query {
         path.push('?');
         path.push_str(q);
@@ -116,15 +116,19 @@ pub(crate) fn apply_forwarded_headers(
     }
 }
 
-/// Prepares request headers for forwarding to the upstream of `route`.
+/// Prepares request headers for forwarding to the upstream of `target`.
 ///
 /// Removes hop-by-hop headers, applies the `preserve_host_header` policy
 /// (dropping `Host` lets the client fill in the upstream authority), and adds
 /// the `X-Forwarded-*` set.
-pub(crate) fn prepare_upstream_headers(headers: &mut HeaderMap, route: &Route, client_ip: IpAddr) {
+pub(crate) fn prepare_upstream_headers(
+    headers: &mut HeaderMap,
+    target: &UpstreamTarget,
+    client_ip: IpAddr,
+) {
     let original_host = headers.get(HOST).cloned();
     strip_hop_by_hop_headers(headers);
-    if !route.def.preserve_host_header {
+    if !target.preserve_host_header {
         headers.remove(HOST);
     }
     apply_forwarded_headers(headers, client_ip, original_host.as_ref());
@@ -133,18 +137,21 @@ pub(crate) fn prepare_upstream_headers(headers: &mut HeaderMap, route: &Route, c
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::router::RouteTable;
     use g2_core::ApiDefinition;
 
-    fn route(listen_path: &str, target_url: &str, strip: bool, preserve_host: bool) -> Route {
+    fn route(
+        listen_path: &str,
+        target_url: &str,
+        strip: bool,
+        preserve_host: bool,
+    ) -> UpstreamTarget {
         let mut def: ApiDefinition = serde_json::from_str(&format!(
             r#"{{"api_id":"t","name":"t","listen_path":"{listen_path}","target_url":"{target_url}"}}"#
         ))
         .expect("def");
         def.strip_listen_path = strip;
         def.preserve_host_header = preserve_host;
-        let table = RouteTable::build(vec![def]).expect("table");
-        table.routes()[0].as_ref().clone()
+        UpstreamTarget::build(&def).expect("target")
     }
 
     #[test]
