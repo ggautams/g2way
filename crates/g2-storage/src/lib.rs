@@ -13,11 +13,13 @@
 //! `g2:default:apikey:ab34…`). The `org_id` segment keeps the schema ready
 //! for multi-organization support without a future data migration.
 
+mod defs;
 mod memory;
 mod redis;
 
 use std::time::Duration;
 
+pub use defs::{load_api_definitions, DefinitionLoadError};
 pub use memory::MemoryStorage;
 pub use redis::RedisStorage;
 
@@ -64,6 +66,15 @@ pub trait Storage: Send + Sync + 'static {
 
     /// Deletes `key`, returning `true` if a live value was present.
     async fn delete(&self, key: &str) -> Result<bool, StorageError>;
+
+    /// Lists every live key starting with `prefix`, in unspecified order.
+    ///
+    /// `prefix` is matched literally — characters that are glob syntax in a
+    /// backend's pattern language must not act as wildcards. This is an
+    /// enumeration primitive for infrequent control-plane work (loading API
+    /// definitions, admin listings), not for the request path: backends may
+    /// take time proportional to the whole keyspace.
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError>;
 
     /// Atomically checks (and, when allowed, records) one request against a
     /// sliding window of at most `limit` requests per `window` at `key`.

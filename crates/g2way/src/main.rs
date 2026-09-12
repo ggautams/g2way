@@ -89,11 +89,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     config.validate()?;
 
-    let defs = g2_core::loader::load_dir(&config.apps_dir)?;
+    let file_defs = g2_core::loader::load_dir(&config.apps_dir)?;
     tracing::info!(
-        count = defs.len(),
+        count = file_defs.len(),
         apps_dir = %config.apps_dir.display(),
-        "loaded API definitions"
+        "loaded API definitions from files"
     );
     let grace = Duration::from_secs(config.shutdown_grace_period_secs);
 
@@ -115,6 +115,16 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Arc::new(MemoryStorage::new())
             }
         };
+        // The storage-backed definition source (ADR-0002): definitions
+        // created through the admin API, merged with the file-loaded set.
+        let storage_defs =
+            g2_storage::load_api_definitions(storage.as_ref(), g2_core::DEFAULT_ORG_ID).await?;
+        tracing::info!(
+            count = storage_defs.len(),
+            "loaded API definitions from storage"
+        );
+        let defs = g2_core::loader::merge_sources(file_defs, storage_defs)?;
+
         let forwarder = Forwarder::new();
         let spike_guard = config.spike_guard.as_ref().map(|cfg| {
             tracing::info!(

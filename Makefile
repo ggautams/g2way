@@ -40,7 +40,8 @@ httpbin-down:
 
 ## Redis for storage-backed features and their integration tests (from M2).
 redis-up:
-	docker run -d --name g2way-redis -p 6379:6379 redis:7-alpine
+	@docker start g2way-redis 2>/dev/null \
+		|| docker run -d --name g2way-redis -p 6379:6379 redis:7-alpine
 
 redis-down:
 	docker rm -f g2way-redis

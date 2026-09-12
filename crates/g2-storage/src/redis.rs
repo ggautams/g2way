@@ -13,6 +13,19 @@ fn backend_err(e: ::redis::RedisError) -> StorageError {
     StorageError::Backend(e.to_string())
 }
 
+/// Escapes Redis glob-pattern metacharacters (`* ? [ ] \`) so a
+/// [`Storage::scan_prefix`] prefix always matches literally.
+fn escape_glob(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out
+}
+
 /// Sliding-window-log rate check, executed atomically inside Redis.
 ///
 /// Uses the **Redis server's clock** (`TIME`), so every gateway pod sees
@@ -157,6 +170,37 @@ impl Storage for RedisStorage {
         Ok(removed > 0)
     }
 
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let pattern = format!("{}*", escape_glob(prefix));
+        let mut conn = self.conn.clone();
+        let mut keys = Vec::new();
+        let mut cursor: u64 = 0;
+        // Cursor-based SCAN never blocks the server the way KEYS would; the
+        // cursor lives in the command itself, so a shared multiplexed
+        // connection is fine.
+        loop {
+            let (next, batch): (u64, Vec<String>) = redis::cmd("SCAN")
+                .arg(cursor)
+                .arg("MATCH")
+                .arg(&pattern)
+                .arg("COUNT")
+                .arg(100)
+                .query_async(&mut conn)
+                .await
+                .map_err(backend_err)?;
+            keys.extend(batch);
+            cursor = next;
+            if cursor == 0 {
+                break;
+            }
+        }
+        // A full SCAN iteration guarantees every key at least once, not
+        // exactly once.
+        keys.sort_unstable();
+        keys.dedup();
+        Ok(keys)
+    }
+
     async fn check_rate(
         &self,
         key: &str,
@@ -282,6 +326,48 @@ mod tests {
         a.set(&key, "v", None).await.expect("set via a");
         assert_eq!(b.get(&key).await.expect("get via b"), Some("v".into()));
         b.delete(&key).await.expect("cleanup");
+    }
+
+    #[test]
+    fn escape_glob_escapes_metacharacters() {
+        assert_eq!(escape_glob("g2:default:apidef:"), "g2:default:apidef:");
+        assert_eq!(escape_glob(r"a*b?c[d]e\f"), r"a\*b\?c\[d\]e\\f");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real Redis: `make redis-up`"]
+    async fn scan_prefix_lists_only_matching_keys() {
+        let store = store().await;
+        let prefix = test_key("scan:");
+        let sibling = test_key("scan-sibling");
+        store.set(&format!("{prefix}b"), "v", None).await.unwrap();
+        store.set(&format!("{prefix}a"), "v", None).await.unwrap();
+        store.set(&sibling, "v", None).await.unwrap();
+
+        let keys = store.scan_prefix(&prefix).await.expect("scan");
+        assert_eq!(keys, [format!("{prefix}a"), format!("{prefix}b")]);
+
+        for k in keys.iter().chain(std::iter::once(&sibling)) {
+            store.delete(k).await.expect("cleanup");
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real Redis: `make redis-up`"]
+    async fn scan_prefix_treats_glob_characters_literally() {
+        let store = store().await;
+        // Unescaped, `[an]` is a character class that would match the decoy
+        // key `…sca:x`; the literal `…sc[an]:x` is the only valid hit.
+        let literal = test_key("sc[an]:x");
+        let decoy = test_key("sca:x");
+        store.set(&literal, "v", None).await.unwrap();
+        store.set(&decoy, "v", None).await.unwrap();
+
+        let keys = store.scan_prefix(&test_key("sc[an]:")).await.expect("scan");
+        assert_eq!(keys, std::slice::from_ref(&literal));
+
+        store.delete(&literal).await.expect("cleanup");
+        store.delete(&decoy).await.expect("cleanup");
     }
 
     #[tokio::test]

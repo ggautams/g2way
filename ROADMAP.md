@@ -52,7 +52,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 
 ## M4 — Control plane & hot reload
 
-- [ ] API definitions and policies stored in Redis; file loader becomes one of two sources
+- [x] API definitions stored in Redis; file loader becomes one of two sources (ADR-0002; policy records follow with the policy model below)
 - [ ] Policies: reusable rate/quota/ACL bundles referenced by keys
 - [ ] Admin CRUD for API definitions and policies
 - [ ] `GET /g2/keys` listing (needs a `Storage::scan`/SCAN operation — deferred from M2 key CRUD)
@@ -292,3 +292,20 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   found" issue recurred → Makefile `minikube-load` now goes through `docker
   save` to a tar as that log suggested. Next: M4 (API definitions/policies
   in Redis; file loader becomes one of two sources).
+- **2026-08-30 (16)** — M4 storage-backed definition source landed, with
+  **ADR-0002** (read it before the remaining M4 tasks — it fixes the key
+  schema, merge semantics, and reload consequences). JSON `ApiDefinition`
+  records live at `g2:{org}:apidef:{api_id}` (helpers in
+  `g2_core::api_definition`), enumerated via new trait op
+  `Storage::scan_prefix` (Redis SCAN+MATCH with glob-escaped prefix, deduped;
+  this also unblocks the deferred `GET /g2/keys` listing checkbox).
+  `g2_storage::load_api_definitions` scans/parses/validates (corrupt record
+  = load fails loudly; record must round-trip its own storage key);
+  `g2_core::loader::merge_sources` combines file+storage sets — duplicate
+  api_id/listen_path across or within sources errors naming both sources, no
+  precedence. Verified live: seeded def in Redis routed next to the file
+  def, and a cross-source duplicate refused startup. The checkbox's
+  "policies" half deliberately waits for the policy model (next task).
+  `make redis-up` is now idempotent (`docker start ||` fallback — the
+  session-11 nit). Note: nothing writes defs to Redis yet; admin CRUD is
+  two checkboxes away. Next: M4 policies (rate/quota/ACL bundles).

@@ -239,8 +239,9 @@ impl AuthConfig {
 /// This is the unit of configuration: requests whose path falls under
 /// `listen_path` are forwarded to `target_url`.
 ///
-/// Definitions are currently loaded from files (see [`crate::loader`]); later
-/// milestones add Redis-backed storage managed through the admin API.
+/// Definitions come from two sources merged at load time (ADR-0002): files
+/// (see [`crate::loader`]) and storage records under
+/// [`api_definition_storage_key`], managed through the admin API.
 ///
 /// # Example (JSON)
 ///
@@ -294,6 +295,22 @@ pub struct ApiDefinition {
     /// `Authorization` header; keyless must be requested explicitly.
     #[serde(default)]
     pub auth: AuthConfig,
+}
+
+/// Storage key holding one API definition: `g2:{org_id}:apidef:{api_id}`.
+///
+/// Definitions are persisted as JSON-encoded [`ApiDefinition`] records under
+/// this key (see ADR-0002); the set of definitions in an organization is
+/// enumerated by scanning [`api_definition_key_prefix`].
+#[must_use]
+pub fn api_definition_storage_key(org_id: &str, api_id: &str) -> String {
+    format!("{}{api_id}", api_definition_key_prefix(org_id))
+}
+
+/// Prefix shared by every API definition key in `org_id`: `g2:{org_id}:apidef:`.
+#[must_use]
+pub fn api_definition_key_prefix(org_id: &str) -> String {
+    format!("g2:{org_id}:apidef:")
 }
 
 impl ApiDefinition {
@@ -612,6 +629,15 @@ mod tests {
             def.auth = AuthConfig::BasicAuth { realm: bad.into() };
             assert!(def.validate().is_err(), "expected realm `{bad:?}` rejected");
         }
+    }
+
+    #[test]
+    fn storage_key_follows_schema() {
+        assert_eq!(
+            api_definition_storage_key("default", "httpbin"),
+            "g2:default:apidef:httpbin"
+        );
+        assert_eq!(api_definition_key_prefix("default"), "g2:default:apidef:");
     }
 
     #[test]

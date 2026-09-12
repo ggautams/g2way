@@ -427,6 +427,9 @@ mod tests {
             async fn delete(&self, key: &str) -> Result<bool, StorageError> {
                 self.0.delete(key).await
             }
+            async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+                self.0.scan_prefix(prefix).await
+            }
             async fn check_rate(
                 &self,
                 _key: &str,
@@ -490,6 +493,9 @@ mod tests {
             }
             async fn delete(&self, _key: &str) -> Result<bool, StorageError> {
                 Ok(false)
+            }
+            async fn scan_prefix(&self, _prefix: &str) -> Result<Vec<String>, StorageError> {
+                Ok(Vec::new())
             }
             async fn check_rate(
                 &self,

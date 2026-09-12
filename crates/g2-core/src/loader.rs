@@ -1,11 +1,12 @@
-//! File-based API definition loading.
+//! File-based API definition loading, and merging of definition sources.
 //!
-//! The file-based source: the gateway scans a directory for
-//! `*.json`, `*.yaml`, and `*.yml` files, each containing exactly one
-//! [`ApiDefinition`]. Later milestones add a Redis-backed source managed via
-//! the admin API; both feed the same router.
+//! [`load_dir`] is the file-based source: the gateway scans a
+//! directory for `*.json`, `*.yaml`, and `*.yml` files, each containing
+//! exactly one [`ApiDefinition`]. A second, storage-backed source lives in
+//! `g2-storage` (`load_api_definitions`); [`merge_sources`] combines the two
+//! into the one conflict-free set the router is built from (ADR-0002).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use crate::{ApiDefinition, Error};
@@ -56,6 +57,55 @@ pub fn load_dir(dir: &Path) -> Result<Vec<ApiDefinition>, Error> {
     }
 
     check_conflicts(&defs)?;
+    defs.sort_by(|a, b| a.api_id.cmp(&b.api_id));
+    Ok(defs)
+}
+
+/// Merges the file-loaded and storage-loaded API definition sets.
+///
+/// Both inputs are expected to be individually valid (each source validates
+/// what it loads); this checks the invariants that only hold *across*
+/// sources and returns the combined set sorted by `api_id`. There is no
+/// precedence between sources: a duplicate `api_id` or `listen_path` —
+/// whether across sources or within one — is an error naming the sources
+/// involved, never a silent shadow (ADR-0002).
+///
+/// # Errors
+///
+/// Returns [`Error::ConflictingApiDefinitions`] on any duplicate `api_id` or
+/// `listen_path` (listen paths compare modulo one trailing slash).
+pub fn merge_sources(
+    file_defs: Vec<ApiDefinition>,
+    storage_defs: Vec<ApiDefinition>,
+) -> Result<Vec<ApiDefinition>, Error> {
+    let mut ids: HashMap<String, &'static str> = HashMap::new();
+    let mut paths: HashMap<String, &'static str> = HashMap::new();
+    let labeled = file_defs
+        .iter()
+        .map(|d| (d, "file"))
+        .chain(storage_defs.iter().map(|d| (d, "storage")));
+    for (def, source) in labeled {
+        if let Some(prev) = ids.insert(def.api_id.clone(), source) {
+            return Err(Error::ConflictingApiDefinitions {
+                reason: format!(
+                    "duplicate api_id `{}` ({prev} source and {source} source)",
+                    def.api_id
+                ),
+            });
+        }
+        let normalized = def.listen_path.trim_end_matches('/').to_owned();
+        if let Some(prev) = paths.insert(normalized, source) {
+            return Err(Error::ConflictingApiDefinitions {
+                reason: format!(
+                    "duplicate listen_path `{}` ({prev} source and {source} source)",
+                    def.listen_path
+                ),
+            });
+        }
+    }
+
+    let mut defs = file_defs;
+    defs.extend(storage_defs);
     defs.sort_by(|a, b| a.api_id.cmp(&b.api_id));
     Ok(defs)
 }
@@ -152,5 +202,74 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         write_def(dir.path(), "bad.json", "bad", "no-leading-slash");
         assert!(load_dir(dir.path()).is_err());
+    }
+
+    mod merge_sources {
+        use super::*;
+
+        fn def(api_id: &str, listen_path: &str) -> ApiDefinition {
+            serde_json::from_str(&format!(
+                r#"{{"api_id":"{api_id}","name":"{api_id}","listen_path":"{listen_path}","target_url":"http://up.internal"}}"#
+            ))
+            .expect("valid definition JSON")
+        }
+
+        #[test]
+        fn combines_and_sorts_by_api_id() {
+            let merged = merge_sources(
+                vec![def("delta", "/d/"), def("alpha", "/a/")],
+                vec![def("charlie", "/c/")],
+            )
+            .expect("merge");
+            let ids: Vec<_> = merged.iter().map(|d| d.api_id.as_str()).collect();
+            assert_eq!(ids, ["alpha", "charlie", "delta"]);
+        }
+
+        #[test]
+        fn either_side_may_be_empty() {
+            assert_eq!(merge_sources(vec![], vec![]).expect("merge").len(), 0);
+            assert_eq!(
+                merge_sources(vec![def("a", "/a/")], vec![])
+                    .expect("merge")
+                    .len(),
+                1
+            );
+            assert_eq!(
+                merge_sources(vec![], vec![def("a", "/a/")])
+                    .expect("merge")
+                    .len(),
+                1
+            );
+        }
+
+        #[test]
+        fn cross_source_duplicate_api_id_names_both_sources() {
+            let err = merge_sources(vec![def("same", "/one/")], vec![def("same", "/two/")])
+                .expect_err("conflict");
+            let msg = err.to_string();
+            assert!(msg.contains("api_id `same`"), "got: {msg}");
+            assert!(
+                msg.contains("file source") && msg.contains("storage source"),
+                "got: {msg}"
+            );
+        }
+
+        #[test]
+        fn cross_source_duplicate_listen_path_is_rejected_modulo_trailing_slash() {
+            let err = merge_sources(vec![def("one", "/users/")], vec![def("two", "/users")])
+                .expect_err("conflict");
+            assert!(err.to_string().contains("listen_path"), "got: {err}");
+        }
+
+        #[test]
+        fn duplicates_within_one_source_are_still_rejected() {
+            let err = merge_sources(vec![], vec![def("same", "/one/"), def("same", "/two/")])
+                .expect_err("conflict");
+            assert!(
+                err.to_string()
+                    .contains("storage source and storage source"),
+                "got: {err}"
+            );
+        }
     }
 }

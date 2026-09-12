@@ -93,6 +93,16 @@ impl Storage for MemoryStorage {
         }
     }
 
+    async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
+        let now = Instant::now();
+        let map = self.map.read().await;
+        Ok(map
+            .iter()
+            .filter(|(k, e)| k.starts_with(prefix) && !e.is_expired(now))
+            .map(|(k, _)| k.clone())
+            .collect())
+    }
+
     async fn check_rate(
         &self,
         key: &str,
@@ -215,6 +225,29 @@ mod tests {
             .expect("set");
         tokio::time::advance(Duration::from_secs(2)).await;
         assert!(!store.delete("k2").await.expect("delete"));
+    }
+
+    #[tokio::test]
+    async fn scan_prefix_filters_by_prefix_and_liveness() {
+        tokio::time::pause();
+        let store = MemoryStorage::new();
+        store.set("g2:default:apidef:a", "{}", None).await.unwrap();
+        store.set("g2:default:apidef:b", "{}", None).await.unwrap();
+        store.set("g2:other:apidef:c", "{}", None).await.unwrap();
+        store
+            .set("g2:default:apidef:gone", "{}", Some(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        tokio::time::advance(Duration::from_secs(2)).await;
+
+        let mut keys = store.scan_prefix("g2:default:apidef:").await.expect("scan");
+        keys.sort();
+        assert_eq!(keys, ["g2:default:apidef:a", "g2:default:apidef:b"]);
+        assert!(store
+            .scan_prefix("g2:missing:")
+            .await
+            .expect("scan")
+            .is_empty());
     }
 
     #[tokio::test]
