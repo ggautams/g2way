@@ -195,6 +195,60 @@ async fn token_auth_end_to_end() {
 }
 
 #[tokio::test]
+async fn basic_auth_end_to_end() {
+    use base64::Engine as _;
+    use g2_core::session::{hash_key, session_storage_key};
+
+    let upstream = spawn_echo_upstream().await;
+    let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+    let session = g2_core::KeySession {
+        basic_auth: Some(g2_core::BasicAuthData {
+            // Minimum bcrypt cost keeps the test fast.
+            password_hash: bcrypt::hash("hunter2", 4).expect("hash"),
+        }),
+        ..g2_core::KeySession::default()
+    };
+    storage
+        .set(
+            &session_storage_key("default", &hash_key("basic:alice")),
+            &serde_json::to_string(&session).expect("json"),
+            None,
+        )
+        .await
+        .expect("seed user");
+
+    let def = serde_json::from_str::<ApiDefinition>(&format!(
+        r#"{{"api_id":"ba","name":"ba","listen_path":"/ba/","target_url":"http://{upstream}","auth":{{"mode":"basic_auth"}}}}"#
+    ))
+    .expect("definition");
+    let (gw, _stop) = spawn_gateway_with_storage(vec![def], storage).await;
+
+    // No credential → 401 with the Basic challenge.
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(format!("http://{gw}/ba/x").parse().expect("url"))
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.headers()
+            .get("www-authenticate")
+            .expect("challenge")
+            .as_bytes(),
+        b"Basic realm=\"g2way\""
+    );
+
+    // Valid credentials → proxied.
+    let encoded = base64::engine::general_purpose::STANDARD.encode("alice:hunter2");
+    let req = Request::get(format!("http://{gw}/ba/x"))
+        .header("authorization", format!("Basic {encoded}"))
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let resp = client.request(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn shuts_down_on_signal_and_refuses_new_connections() {
     let (gw, stop) = spawn_gateway(vec![]).await;
     let (status, _) = http_get(&format!("http://{gw}/hello")).await;

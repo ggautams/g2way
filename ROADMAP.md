@@ -38,7 +38,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] Auth: keyless mode (explicit) and auth-token mode (header/query param/cookie lookup → `KeySession`)
 - [x] Auth: JWT with static keys (HS256 secret / RS256 public-key PEM; claims → ephemeral session)
 - [ ] Auth: JWT `jwks_url` fetch + cache (needs an HTTPS fetch client — decide alongside the M7 TLS work)
-- [ ] Auth: basic auth
+- [x] Auth: basic auth
 - [ ] Admin API skeleton (axum on separate port, `X-G2-Authorization` admin secret)
 - [ ] Admin key CRUD: `POST/GET/PUT/DELETE /g2/keys[/{key}]`
 
@@ -175,3 +175,18 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   `jsonwebtoken` 10 panics at runtime without a crypto-provider feature —
   workspace dep pins `features = ["rust_crypto"]` (pure Rust, distroless-
   friendly). Next: basic auth, then admin API skeleton.
+- **2026-08-30 (8)** — M2 basic auth landed. `{"mode":"basic_auth", realm?}`
+  (default realm `g2way`); credentials only from `Authorization: Basic …`
+  (RFC 7617 — no query/cookie carriers, they'd leak passwords into logs).
+  `KeySession` gained `basic_auth: Option<BasicAuthData{password_hash}>`
+  (bcrypt string; old records deserialize unchanged); session stored under
+  `hash_key("basic:{username}")` — same `apikey` Redis kind, namespaced like
+  `jwt:`. Deliberate hardening choices: 401 (+`WWW-Authenticate` challenge)
+  **only** for unparseable credentials; wrong password is 403 with the shared
+  no-oracle message like every other rejection. Unknown users still cost one
+  bcrypt verify against an embedded dummy hash (no user-enumeration timing
+  oracle). Verify runs in `spawn_blocking` (bcrypt ~100–250ms at cost 12
+  would stall a worker); per-user verify caching deliberately deferred —
+  revisit if basic-auth traffic matters. New workspace deps: `bcrypt` 0.17,
+  `base64` 0.22 (both pure Rust); g2-middleware's `tokio` moved dev→real dep.
+  Next: admin API skeleton (axum, separate port, `X-G2-Authorization`).

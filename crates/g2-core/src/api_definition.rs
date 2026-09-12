@@ -37,6 +37,14 @@ fn default_identity_claim() -> String {
     DEFAULT_IDENTITY_CLAIM.to_owned()
 }
 
+/// Realm the basic-auth mode advertises in `WWW-Authenticate` challenges
+/// when a definition does not name one.
+pub const DEFAULT_BASIC_AUTH_REALM: &str = "g2way";
+
+fn default_basic_auth_realm() -> String {
+    DEFAULT_BASIC_AUTH_REALM.to_owned()
+}
+
 /// JWT signature algorithms supported by [`AuthConfig::Jwt`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -102,6 +110,22 @@ pub enum AuthConfig {
         /// key). Defaults to `sub`.
         #[serde(default = "default_identity_claim")]
         identity_claim: String,
+    },
+
+    /// HTTP Basic auth (RFC 7617): `Authorization: Basic base64(user:pass)`.
+    ///
+    /// The username resolves (hashed, under a `basic:` namespace) to a
+    /// stored [`KeySession`](crate::KeySession) whose
+    /// [`basic_auth`](crate::session::BasicAuthData) data carries the
+    /// bcrypt hash the presented password is verified against. Credentials
+    /// are read from the `Authorization` header only — never query or
+    /// cookie carriers, which would leak passwords into logs.
+    BasicAuth {
+        /// Realm advertised in the `WWW-Authenticate: Basic realm="…"`
+        /// challenge on 401 responses. Defaults to
+        /// [`DEFAULT_BASIC_AUTH_REALM`].
+        #[serde(default = "default_basic_auth_realm")]
+        realm: String,
     },
 }
 
@@ -186,6 +210,23 @@ impl AuthConfig {
                             ));
                         }
                     }
+                }
+                Ok(())
+            }
+            Self::BasicAuth { realm } => {
+                if realm.trim().is_empty() {
+                    return Err(fail("`auth.realm` must not be empty".into()));
+                }
+                // The realm is embedded verbatim in a quoted-string header
+                // value; restrict it to visible ASCII (plus space) without
+                // `"` or `\` so the challenge is always a valid header.
+                if !realm
+                    .chars()
+                    .all(|c| matches!(c, ' '..='~') && c != '"' && c != '\\')
+                {
+                    return Err(fail(
+                        "`auth.realm` must be printable ASCII without `\"` or `\\`".into(),
+                    ));
                 }
                 Ok(())
             }
@@ -530,6 +571,46 @@ mod tests {
                 assert_eq!(identity_claim, DEFAULT_IDENTITY_CLAIM);
             }
             other => panic!("expected jwt auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn basic_auth_json_defaults_realm() {
+        let json = r#"{
+            "api_id": "b",
+            "name": "b",
+            "listen_path": "/b/",
+            "target_url": "http://b.internal",
+            "auth": { "mode": "basic_auth" }
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        assert_eq!(
+            def.auth,
+            AuthConfig::BasicAuth {
+                realm: DEFAULT_BASIC_AUTH_REALM.into()
+            }
+        );
+    }
+
+    #[test]
+    fn basic_auth_explicit_realm_round_trips() {
+        let mut def = parse(minimal_json());
+        def.auth = AuthConfig::BasicAuth {
+            realm: "internal apis".into(),
+        };
+        def.validate().expect("valid");
+        let json = serde_json::to_string(&def).expect("serializes");
+        let back: ApiDefinition = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back.auth, def.auth);
+    }
+
+    #[test]
+    fn basic_auth_invalid_realms_are_rejected() {
+        let mut def = parse(minimal_json());
+        for bad in ["", "  ", "with \"quotes\"", "back\\slash", "ctrl\nchar"] {
+            def.auth = AuthConfig::BasicAuth { realm: bad.into() };
+            assert!(def.validate().is_err(), "expected realm `{bad:?}` rejected");
         }
     }
 

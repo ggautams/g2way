@@ -47,6 +47,8 @@ redis = { version = "1.6", features = ["tokio-comp", "connection-manager"] }
 sha2 = "0.10"
 hex = "0.4"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+bcrypt = "0.17"
+base64 = "0.22"
 
 # Errors, logging, CLI
 thiserror = "2"

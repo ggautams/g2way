@@ -12,6 +12,12 @@
 //!   are turned into an ephemeral session: no storage lookup, `expires_at`
 //!   from `exp`, alias from the identity claim, access restricted to this
 //!   API.
+//! - **`basic_auth`** — RFC 7617 `Authorization: Basic base64(user:pass)`.
+//!   The username (hashed under a `basic:` namespace) resolves to a stored
+//!   session whose `basic_auth.password_hash` the presented password is
+//!   bcrypt-verified against. Verification runs on the blocking pool
+//!   (bcrypt costs ~100ms by design); per-user verification caching is a
+//!   possible later optimization, deliberately not built yet.
 //!
 //! Either way a live session is stamped onto the request as a
 //! [`SessionContext`] extension for downstream layers; anything else is
@@ -22,13 +28,19 @@
 //!
 //! # Responses
 //!
-//! - `401` — no token found in any configured carrier.
-//! - `403` — token unknown or fails verification, session inactive/expired,
-//!   or the session does not grant this API. One message for all of these:
-//!   which one it was must not leak to the caller (details are logged).
+//! - `401` — no token found in any configured carrier. For basic auth this
+//!   covers every "no parseable credential" case (missing header, wrong
+//!   scheme, bad base64/UTF-8, no `:`, empty username) and carries a
+//!   `WWW-Authenticate: Basic realm="…"` challenge.
+//! - `403` — token unknown or fails verification, wrong password, session
+//!   inactive/expired, or the session does not grant this API. One message
+//!   for all of these: which one it was must not leak to the caller
+//!   (details are logged). Unknown basic-auth users still cost one bcrypt
+//!   verify (against a dummy hash) so response timing does not reveal
+//!   whether a username exists.
 //! - `503` — the storage backend errored; the request may be retried.
-//! - `500` — the stored session record is not valid JSON (an operational
-//!   bug, logged loudly).
+//! - `500` — the stored session record is not valid JSON or its stored
+//!   bcrypt hash is malformed (operational bugs, logged loudly).
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -37,10 +49,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use g2_core::session::{hash_key, session_storage_key};
 use g2_core::{AuthConfig, Error, JwtSigningMethod, KeySession};
 use g2_storage::SharedStorage;
-use http::header::HeaderName;
+use http::header::{HeaderName, HeaderValue};
 use http::{header, Request, Response, StatusCode};
 use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use tower::{Layer, Service};
@@ -52,6 +65,16 @@ use crate::ProxyBody;
 /// Message for every "you may not pass" rejection; deliberately does not
 /// distinguish unknown key / inactive / expired / wrong API.
 const FORBIDDEN_MSG: &str = "access to this API has been disallowed";
+
+/// Message for every basic-auth 401: the request carried no parseable
+/// `Basic` credential (missing header, wrong scheme, bad encoding, …).
+const BASIC_CHALLENGE_MSG: &str = "invalid basic auth credentials";
+
+/// A well-formed cost-12 bcrypt hash matching no real password. Unknown
+/// basic-auth users are "verified" against it so a wrong-username request
+/// costs the same as a wrong-password one (no user-enumeration timing
+/// oracle). Guarded well-formed by a unit test.
+const DUMMY_BCRYPT_HASH: &str = "$2b$12$3neaCJyNondMOTlK7AuGBOMBGI0j/gZ3YsMVx1VJl.1cBJI5DVA32";
 
 /// Everything one API's auth needs, precomputed at route-build time.
 struct AuthState {
@@ -81,6 +104,13 @@ enum Mode {
         /// Claim used as the caller identity.
         identity_claim: String,
     },
+    /// `basic_auth`: resolve the username in storage, bcrypt-verify the
+    /// password.
+    Basic {
+        /// Precomputed `Basic realm="…"` challenge sent on every 401.
+        challenge: HeaderValue,
+        storage: SharedStorage,
+    },
 }
 
 impl std::fmt::Debug for AuthState {
@@ -88,6 +118,7 @@ impl std::fmt::Debug for AuthState {
         let mode = match &self.mode {
             Mode::Token { .. } => "token",
             Mode::Jwt { .. } => "jwt",
+            Mode::Basic { .. } => "basic",
         };
         f.debug_struct("AuthState")
             .field("api_id", &self.api_id)
@@ -176,6 +207,15 @@ impl AuthLayer {
                     validation: Box::new(validation),
                     identity_claim: identity_claim.clone(),
                 }
+            }
+            AuthConfig::BasicAuth { realm } => {
+                let challenge = HeaderValue::from_str(&format!("Basic realm=\"{realm}\""))
+                    .map_err(|_| {
+                        invalid(format!(
+                            "`auth.realm` cannot be used in a header value: `{realm}`"
+                        ))
+                    })?;
+                Mode::Basic { challenge, storage }
             }
         };
         Ok(Some(Self {
@@ -271,6 +311,90 @@ async fn authenticate(
             })?;
             authenticate_jwt(state, decoding_key, validation, identity_claim, &token)
         }
+        Mode::Basic { challenge, storage } => {
+            authenticate_basic(state, storage, challenge, req).await
+        }
+    }
+}
+
+/// `basic_auth` mode: resolve the username to a stored [`KeySession`] and
+/// bcrypt-verify the password against its `basic_auth.password_hash`.
+async fn authenticate_basic(
+    state: &AuthState,
+    storage: &SharedStorage,
+    challenge: &HeaderValue,
+    req: &Request<ProxyBody>,
+) -> Result<SessionContext, Response<ProxyBody>> {
+    let Some((username, password)) = extract_basic_credentials(req) else {
+        return Err(basic_challenge_error(challenge));
+    };
+
+    // The `basic:` prefix keeps usernames in their own hash namespace, so a
+    // username can never collide with the SHA-256 of a stored raw token
+    // (same idea as the `jwt:` prefix for JWT identities).
+    let key_hash = hash_key(&format!("basic:{username}"));
+    let storage_key = session_storage_key(&state.org_id, &key_hash);
+    let record = storage.get(&storage_key).await.map_err(|e| {
+        tracing::error!(api_id = %state.api_id, error = %e, "auth storage lookup failed");
+        json_error(StatusCode::SERVICE_UNAVAILABLE, "key storage unavailable")
+    })?;
+    let session: Option<KeySession> = match record {
+        None => None,
+        Some(record) => Some(serde_json::from_str(&record).map_err(|e| {
+            tracing::error!(
+                api_id = %state.api_id,
+                key_hash = %key_hash,
+                error = %e,
+                "stored key session is not valid JSON"
+            );
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "malformed key session record",
+            )
+        })?),
+    };
+
+    // Unknown user or a session without basic-auth data still costs one
+    // bcrypt verify (against the dummy hash), so timing does not reveal
+    // whether the username exists.
+    let stored_hash = session
+        .as_ref()
+        .and_then(|s| s.basic_auth.as_ref())
+        .map_or(DUMMY_BCRYPT_HASH, |b| b.password_hash.as_str())
+        .to_owned();
+    let verify = tokio::task::spawn_blocking(move || bcrypt::verify(password, &stored_hash))
+        .await
+        .map_err(|e| {
+            tracing::error!(api_id = %state.api_id, error = %e, "bcrypt verify task failed");
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "auth verification failed",
+            )
+        })?;
+    let password_matches = verify.map_err(|e| {
+        tracing::error!(
+            api_id = %state.api_id,
+            key_hash = %key_hash,
+            error = %e,
+            "stored basic-auth password hash is not a valid bcrypt hash"
+        );
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "auth verification failed",
+        )
+    })?;
+
+    match session {
+        Some(session)
+            if password_matches
+                && session.basic_auth.is_some()
+                && session.active
+                && !session.is_expired(unix_now_secs())
+                && session.allows_api(&state.api_id) =>
+        {
+            Ok(SessionContext::new(session, key_hash))
+        }
+        _ => Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG)),
     }
 }
 
@@ -415,6 +539,43 @@ fn strip_bearer(value: &str) -> &str {
         Some((scheme, rest)) if scheme.eq_ignore_ascii_case("bearer ") => rest.trim_start(),
         _ => value,
     }
+}
+
+/// Strips a leading case-insensitive `Basic ` scheme, or `None` when the
+/// value does not use the Basic scheme (unlike bearer tokens, a bare value
+/// without the scheme is not accepted).
+fn strip_basic(value: &str) -> Option<&str> {
+    match value.split_at_checked(6) {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("basic ") => Some(rest.trim()),
+        _ => None,
+    }
+}
+
+/// Parses RFC 7617 credentials from the `Authorization` header:
+/// `Basic base64(username ":" password)`. Returns `None` for anything not
+/// parseable (missing header, wrong scheme, bad base64/UTF-8, no `:`, empty
+/// username); the password may be empty and may itself contain `:`.
+fn extract_basic_credentials(req: &Request<ProxyBody>) -> Option<(String, String)> {
+    let value = req.headers().get(header::AUTHORIZATION)?.to_str().ok()?;
+    let encoded = strip_basic(value.trim())?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (username, password) = decoded.split_once(':')?;
+    if username.is_empty() {
+        return None;
+    }
+    Some((username.to_owned(), password.to_owned()))
+}
+
+/// The basic-auth 401: a JSON error carrying the API's `WWW-Authenticate`
+/// challenge so plain HTTP clients know how to authenticate.
+fn basic_challenge_error(challenge: &HeaderValue) -> Response<ProxyBody> {
+    let mut resp = json_error(StatusCode::UNAUTHORIZED, BASIC_CHALLENGE_MSG);
+    resp.headers_mut()
+        .insert(header::WWW_AUTHENTICATE, challenge.clone());
+    resp
 }
 
 #[cfg(test)]
@@ -793,6 +954,225 @@ zejNikfS+pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq+0
             };
             let err = AuthLayer::from_config(&cfg, Arc::new(MemoryStorage::new()), API, ORG);
             assert!(err.is_err());
+        }
+    }
+
+    mod basic {
+        use g2_core::BasicAuthData;
+
+        use super::*;
+
+        /// bcrypt cost for test hashes: the minimum, to keep tests fast.
+        const TEST_COST: u32 = 4;
+
+        fn basic_cfg() -> AuthConfig {
+            AuthConfig::BasicAuth {
+                realm: "g2way".into(),
+            }
+        }
+
+        fn creds(user: &str, pass: &str) -> HeaderValue {
+            let encoded =
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+            format!("Basic {encoded}").parse().expect("header value")
+        }
+
+        async fn seed_user(storage: &MemoryStorage, user: &str, pass: &str, session: KeySession) {
+            let session = KeySession {
+                basic_auth: Some(BasicAuthData {
+                    password_hash: bcrypt::hash(pass, TEST_COST).expect("hash"),
+                }),
+                ..session
+            };
+            let key = session_storage_key(ORG, &hash_key(&format!("basic:{user}")));
+            storage
+                .set(&key, &serde_json::to_string(&session).expect("json"), None)
+                .await
+                .expect("seed");
+        }
+
+        async fn call(storage: MemoryStorage, auth: Option<HeaderValue>) -> Response<ProxyBody> {
+            let mut req = request("/x");
+            if let Some(value) = auth {
+                req.headers_mut().insert("authorization", value);
+            }
+            service(&basic_cfg(), storage)
+                .oneshot(req)
+                .await
+                .expect("infallible")
+        }
+
+        #[tokio::test]
+        async fn valid_credentials_pass_with_session_context() {
+            let storage = MemoryStorage::new();
+            let session = KeySession {
+                alias: Some("alice".into()),
+                ..KeySession::default()
+            };
+            seed_user(&storage, "alice", "s3cret", session).await;
+
+            let resp = call(storage, Some(creds("alice", "s3cret"))).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get("x-echo-alias")
+                    .expect("alias")
+                    .as_bytes(),
+                b"alice"
+            );
+        }
+
+        #[tokio::test]
+        async fn missing_header_is_401_with_challenge() {
+            let resp = call(MemoryStorage::new(), None).await;
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                resp.headers()
+                    .get(header::WWW_AUTHENTICATE)
+                    .expect("challenge")
+                    .as_bytes(),
+                b"Basic realm=\"g2way\""
+            );
+        }
+
+        #[tokio::test]
+        async fn unparseable_credentials_are_401() {
+            let cases: [(&str, HeaderValue); 4] = [
+                ("bearer scheme", "Bearer abc".parse().expect("value")),
+                (
+                    "bad base64",
+                    "Basic !!!not-base64!!!".parse().expect("value"),
+                ),
+                (
+                    "no colon",
+                    format!(
+                        "Basic {}",
+                        base64::engine::general_purpose::STANDARD.encode("no-colon-here")
+                    )
+                    .parse()
+                    .expect("value"),
+                ),
+                ("empty username", creds("", "password")),
+            ];
+            for (name, value) in cases {
+                let resp = call(MemoryStorage::new(), Some(value)).await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "case: {name}");
+                assert!(
+                    resp.headers().contains_key(header::WWW_AUTHENTICATE),
+                    "case {name}: challenge header missing"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn unknown_user_and_wrong_password_are_403() {
+            let storage = MemoryStorage::new();
+            seed_user(&storage, "alice", "s3cret", KeySession::default()).await;
+
+            let resp = call(storage.clone(), Some(creds("mallory", "s3cret"))).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "unknown user");
+
+            let resp = call(storage, Some(creds("alice", "wrong"))).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "wrong password");
+        }
+
+        #[tokio::test]
+        async fn session_without_basic_auth_data_is_403() {
+            let storage = MemoryStorage::new();
+            // Seeded directly (not via seed_user): no basic_auth data.
+            let key = session_storage_key(ORG, &hash_key("basic:alice"));
+            storage
+                .set(
+                    &key,
+                    &serde_json::to_string(&KeySession::default()).expect("json"),
+                    None,
+                )
+                .await
+                .expect("seed");
+
+            let resp = call(storage, Some(creds("alice", "anything"))).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn inactive_expired_and_unauthorized_api_are_403() {
+            let storage = MemoryStorage::new();
+            seed_user(
+                &storage,
+                "inactive",
+                "pw",
+                KeySession {
+                    active: false,
+                    ..KeySession::default()
+                },
+            )
+            .await;
+            seed_user(
+                &storage,
+                "expired",
+                "pw",
+                KeySession {
+                    expires_at: Some(1), // 1970: long past
+                    ..KeySession::default()
+                },
+            )
+            .await;
+            seed_user(
+                &storage,
+                "other-api",
+                "pw",
+                KeySession {
+                    access: [("not-this-api".to_owned(), Default::default())].into(),
+                    ..KeySession::default()
+                },
+            )
+            .await;
+
+            for user in ["inactive", "expired", "other-api"] {
+                let resp = call(storage.clone(), Some(creds(user, "pw"))).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "user `{user}`");
+            }
+        }
+
+        #[tokio::test]
+        async fn password_containing_colon_works() {
+            let storage = MemoryStorage::new();
+            seed_user(&storage, "alice", "pa:ss:word", KeySession::default()).await;
+            let resp = call(storage, Some(creds("alice", "pa:ss:word"))).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn malformed_stored_password_hash_is_500() {
+            let storage = MemoryStorage::new();
+            let session = KeySession {
+                basic_auth: Some(BasicAuthData {
+                    password_hash: "not-a-bcrypt-hash".into(),
+                }),
+                ..KeySession::default()
+            };
+            let key = session_storage_key(ORG, &hash_key("basic:alice"));
+            storage
+                .set(&key, &serde_json::to_string(&session).expect("json"), None)
+                .await
+                .expect("seed");
+
+            let resp = call(storage, Some(creds("alice", "anything"))).await;
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        #[test]
+        fn dummy_hash_is_well_formed_and_matches_nothing() {
+            assert!(!bcrypt::verify("x", DUMMY_BCRYPT_HASH).expect("well-formed hash"));
+        }
+
+        #[test]
+        fn basic_stripping_rules() {
+            assert_eq!(strip_basic("Basic abc"), Some("abc"));
+            assert_eq!(strip_basic("BASIC  abc"), Some("abc"));
+            assert_eq!(strip_basic("basic"), None); // no space: not a scheme
+            assert_eq!(strip_basic("Bearer abc"), None);
+            assert_eq!(strip_basic("Basicabc"), None);
         }
     }
 

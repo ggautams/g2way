@@ -53,6 +53,17 @@ pub struct Quota {
     pub renewal_rate_secs: u64,
 }
 
+/// Basic-auth credential data attached to a session.
+///
+/// Present only on sessions addressed by a username (basic-auth mode); the
+/// presented password is verified against `password_hash` on every request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BasicAuthData {
+    /// bcrypt hash of the user's password (a full `$2b$…` hash string).
+    /// The plaintext password is never persisted.
+    pub password_hash: String,
+}
+
 /// Access granted to a single API.
 ///
 /// Today an entry's presence in [`KeySession::access`] is the whole grant;
@@ -111,6 +122,12 @@ pub struct KeySession {
     /// without access rights).
     #[serde(default)]
     pub access: BTreeMap<String, ApiAccess>,
+
+    /// Basic-auth credentials, set only on sessions used with the
+    /// basic-auth mode. `None` means this session cannot authenticate via
+    /// basic auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub basic_auth: Option<BasicAuthData>,
 }
 
 impl Default for KeySession {
@@ -125,6 +142,7 @@ impl Default for KeySession {
             expires_at: None,
             active: true,
             access: BTreeMap::new(),
+            basic_auth: None,
         }
     }
 }
@@ -163,6 +181,11 @@ impl KeySession {
         for api_id in self.access.keys() {
             if api_id.trim().is_empty() {
                 return Err(fail("`access` keys (api_id) must not be empty"));
+            }
+        }
+        if let Some(basic) = &self.basic_auth {
+            if basic.password_hash.trim().is_empty() {
+                return Err(fail("`basic_auth.password_hash` must not be empty"));
             }
         }
         Ok(())
@@ -244,6 +267,9 @@ mod tests {
             expires_at: Some(1_790_000_000),
             active: true,
             access: BTreeMap::from([("httpbin".to_owned(), ApiAccess::default())]),
+            basic_auth: Some(BasicAuthData {
+                password_hash: "$2b$12$abcdefghijklmnopqrstuv".into(),
+            }),
         };
         session.validate().expect("full session is valid");
         let json = serde_json::to_string(&session).expect("serializes");
@@ -254,7 +280,7 @@ mod tests {
     #[test]
     fn unlimited_fields_are_omitted_from_json() {
         let json = serde_json::to_string(&KeySession::default()).expect("serializes");
-        for absent in ["alias", "rate", "quota", "expires_at"] {
+        for absent in ["alias", "rate", "quota", "expires_at", "basic_auth"] {
             assert!(
                 !json.contains(absent),
                 "`{absent}` should be omitted: {json}"
@@ -325,6 +351,18 @@ mod tests {
             ..KeySession::default()
         };
         assert!(session.validate().is_err());
+    }
+
+    #[test]
+    fn empty_basic_auth_password_hash_is_rejected() {
+        let session = KeySession {
+            basic_auth: Some(BasicAuthData {
+                password_hash: "  ".into(),
+            }),
+            ..KeySession::default()
+        };
+        let err = session.validate().unwrap_err();
+        assert!(err.to_string().contains("password_hash"), "got: {err}");
     }
 
     #[test]

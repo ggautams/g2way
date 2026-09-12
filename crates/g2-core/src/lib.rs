@@ -27,4 +27,4 @@ pub mod session;
 pub use api_definition::{ApiDefinition, AuthConfig, JwtSigningMethod, DEFAULT_ORG_ID};
 pub use config::GatewayConfig;
 pub use error::Error;
-pub use session::KeySession;
+pub use session::{BasicAuthData, KeySession};
