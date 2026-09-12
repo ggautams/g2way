@@ -14,6 +14,14 @@ data:
       "target_url": "http://httpbin.g2way.svc.cluster.local:8080",
       "auth": { "mode": "keyless" }
     }
+  httpbin-limited.json: |
+    {
+      "api_id": "httpbin-limited",
+      "name": "Httpbin behind auth-token (rate-limit smoke target)",
+      "listen_path": "/limited/",
+      "target_url": "http://httpbin.g2way.svc.cluster.local:8080",
+      "auth": { "mode": "auth_token" }
+    }
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -43,9 +51,21 @@ spec:
           env:
             - name: RUST_LOG
               value: info
+            - name: G2_REDIS_URL
+              value: redis://redis.g2way.svc.cluster.local:6379
+            - name: G2_ADMIN_LISTEN
+              # 0.0.0.0 so `kubectl port-forward` can reach it; the port is
+              # not exposed on any Service.
+              value: 0.0.0.0:9696
+            - name: G2_ADMIN_SECRET
+              # Dev/minikube-only secret; use a real Secret object in any
+              # environment that matters.
+              value: g2-smoke-admin-secret
           ports:
             - name: proxy
               containerPort: 8080
+            - name: admin
+              containerPort: 9696
           readinessProbe:
             httpGet:
               path: /ready

@@ -51,8 +51,12 @@ docker-build:
 	docker build -f deploy/docker/Dockerfile -t g2way:dev .
 
 ## Build the image and make it visible inside the minikube cluster.
+## Goes through `docker save`: loading straight from the daemon fails with
+## "blob not found" on Docker Desktop's containerd image store.
 minikube-load: docker-build
-	minikube image load g2way:dev
+	docker save g2way:dev -o /tmp/g2way-dev.tar
+	minikube image load --overwrite /tmp/g2way-dev.tar
+	rm -f /tmp/g2way-dev.tar
 
 k8s-deploy:
 	kubectl apply -f deploy/k8s/

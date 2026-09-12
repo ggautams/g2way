@@ -48,7 +48,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] Quotas: long-period counters with reset timestamps
 - [x] Local token-bucket spike guard in front of Redis (configurable)
 - [x] 429 responses with `X-RateLimit-Limit/-Remaining/-Reset` headers
-- [ ] Multi-pod correctness test documented in smoke script (two replicas share counters)
+- [x] Multi-pod correctness test documented in smoke script (two replicas share counters)
 
 ## M4 — Control plane & hot reload
 
@@ -275,3 +275,20 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   that order). A rate-allowed-but-quota-denied request does occupy a rate
   slot — acceptable. Next: M3 multi-pod smoke (needs Redis in
   deploy/k8s + smoke.sh assertions).
+- **2026-08-30 (15)** — **M3 complete.** Multi-pod rate-limit smoke landed:
+  new `deploy/k8s/redis.yaml` (redis:7-alpine, no persistence), gateway
+  Deployment gained `G2_REDIS_URL`/`G2_ADMIN_LISTEN=0.0.0.0:9696`/
+  `G2_ADMIN_SECRET` (dev-only literal in the manifest) + `admin`
+  containerPort, and the ConfigMap gained a second, auth_token API
+  (`/limited/` → httpbin) because keyless APIs never get a `RateLimitLayer`.
+  smoke.sh now port-forwards **each pod individually** (a Service
+  port-forward pins to one pod), provisions a rate-5/60s key via `PUT
+  /g2/keys/{key}` (chosen raw key per run → no jq; unique per run so stale
+  sliding windows can't skew counts), alternates 6 requests A,B,A,B,A,B and
+  asserts request 6 is 429 with correct `X-RateLimit-*`/`Retry-After` —
+  per-pod counters would have allowed it, and fail-open on storage errors
+  means a broken Redis wiring also fails the 429 assertion. **Verified green
+  on minikube end to end.** The session-2 `minikube image load` "blob not
+  found" issue recurred → Makefile `minikube-load` now goes through `docker
+  save` to a tar as that log suggested. Next: M4 (API definitions/policies
+  in Redis; file loader becomes one of two sources).
