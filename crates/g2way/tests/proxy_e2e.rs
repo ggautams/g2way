@@ -55,7 +55,7 @@ async fn spawn_gateway_with_storage(
     defs: Vec<ApiDefinition>,
     storage: g2_storage::SharedStorage,
 ) -> (SocketAddr, oneshot::Sender<()>) {
-    let table = RouteTable::build(defs, &Forwarder::new(), &storage).expect("route table");
+    let table = RouteTable::build(defs, &Forwarder::new(), &storage, None).expect("route table");
     let gateway = Arc::new(Gateway::new(table));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -192,6 +192,59 @@ async fn token_auth_end_to_end() {
         .expect("request");
     let resp = client.request(req).await.expect("response");
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn rate_limit_end_to_end() {
+    use g2_core::session::{hash_key, session_storage_key, RateLimit};
+
+    let upstream = spawn_echo_upstream().await;
+    let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+    let session = g2_core::KeySession {
+        rate: Some(RateLimit {
+            requests: 2,
+            per_seconds: 60,
+        }),
+        ..g2_core::KeySession::default()
+    };
+    storage
+        .set(
+            &session_storage_key("default", &hash_key("limited-key")),
+            &serde_json::to_string(&session).expect("json"),
+            None,
+        )
+        .await
+        .expect("seed key");
+
+    let def = serde_json::from_str::<ApiDefinition>(&format!(
+        r#"{{"api_id":"rl","name":"rl","listen_path":"/rl/","target_url":"http://{upstream}"}}"#
+    ))
+    .expect("definition");
+    let (gw, _stop) = spawn_gateway_with_storage(vec![def], storage).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let call = || async {
+        let req = Request::get(format!("http://{gw}/rl/x"))
+            .header("authorization", "Bearer limited-key")
+            .body(Empty::<Bytes>::new())
+            .expect("request");
+        client.request(req).await.expect("response")
+    };
+
+    for _ in 0..2 {
+        assert_eq!(call().await.status(), StatusCode::OK);
+    }
+    let resp = call().await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        resp.headers()
+            .get("x-ratelimit-limit")
+            .expect("limit header")
+            .as_bytes(),
+        b"2"
+    );
+    assert!(resp.headers().contains_key("x-ratelimit-reset"));
+    assert!(resp.headers().contains_key("retry-after"));
 }
 
 #[tokio::test]

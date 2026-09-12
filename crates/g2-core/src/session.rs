@@ -231,6 +231,23 @@ pub fn session_storage_key(org_id: &str, key_hash: &str) -> String {
     format!("g2:{org_id}:apikey:{key_hash}")
 }
 
+/// Builds the storage key for a key's sliding-window rate counter:
+/// `g2:{org_id}:ratelimit:{key_hash}`.
+///
+/// One counter per key across all APIs it may call, kept
+/// separate from the session record so counters can expire independently.
+#[must_use]
+pub fn rate_limit_storage_key(org_id: &str, key_hash: &str) -> String {
+    format!("g2:{org_id}:ratelimit:{key_hash}")
+}
+
+/// Builds the storage key for a key's fixed-period quota counter:
+/// `g2:{org_id}:quota:{key_hash}`.
+#[must_use]
+pub fn quota_storage_key(org_id: &str, key_hash: &str) -> String {
+    format!("g2:{org_id}:quota:{key_hash}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,6 +422,14 @@ mod tests {
         assert_eq!(
             session_storage_key("default", &hash),
             format!("g2:default:apikey:{hash}")
+        );
+        assert_eq!(
+            rate_limit_storage_key("default", &hash),
+            format!("g2:default:ratelimit:{hash}")
+        );
+        assert_eq!(
+            quota_storage_key("default", &hash),
+            format!("g2:default:quota:{hash}")
         );
     }
 }

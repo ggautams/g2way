@@ -22,6 +22,7 @@ pub mod auth;
 pub mod body;
 pub mod chain;
 pub mod context;
+pub mod rate_limit;
 pub mod response;
 pub mod set_context;
 pub mod spike;
@@ -31,6 +32,7 @@ pub use auth::{Auth, AuthLayer};
 pub use body::ProxyBody;
 pub use chain::ChainBuilder;
 pub use context::{ClientAddr, RequestContext, SessionContext};
+pub use rate_limit::{RateLimit, RateLimitLayer};
 pub use set_context::{SetContext, SetContextLayer};
 pub use spike::SpikeGuard;
 

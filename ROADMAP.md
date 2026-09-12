@@ -47,7 +47,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] Redis sliding-window rate limiter as an atomic Lua script (`redis::Script`), per-key and per-API
 - [x] Quotas: long-period counters with reset timestamps
 - [x] Local token-bucket spike guard in front of Redis (configurable)
-- [ ] 429 responses with `X-RateLimit-Limit/-Remaining/-Reset` headers
+- [x] 429 responses with `X-RateLimit-Limit/-Remaining/-Reset` headers
 - [ ] Multi-pod correctness test documented in smoke script (two replicas share counters)
 
 ## M4 — Control plane & hot reload
@@ -258,3 +258,20 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   which is the next checkbox (429 + X-RateLimit headers) and will also pick
   the guarded identity. 8-thread × 50-acquire test proves exactly-capacity
   admissions. Next: 429 middleware wiring rate+quota+spike into the chain.
+- **2026-08-30 (14)** — M3 rate-limit middleware landed
+  (`g2-middleware::rate_limit`): `RateLimitLayer` sits after auth, reads the
+  `SessionContext`, and enforces cheapest-first: spike guard (local 429) →
+  `check_rate` (429) → `check_quota` (**403** "quota exceeded";
+  waiting won't help). Headers on every denial: `X-RateLimit-Limit/
+  -Remaining/-Reset` (Reset = absolute Unix secs) + `Retry-After`
+  (ceil, ≥1s). Counters are **per key across APIs** by default:
+  `g2:{org}:ratelimit:{key_hash}` / `g2:{org}:quota:{key_hash}` (helpers in
+  g2-core::session). Storage errors **fail open** (loudly logged): limits
+  protect capacity, and token/basic auth already fail closed upstream in the
+  chain — only JWT traffic is affected by a Redis outage, and it keeps
+  serving. Keyless APIs get no limiter (no session). `RouteTable::build`
+  grew a `spike_guard: Option<&Arc<SpikeGuard>>` param; binary builds the
+  guard from config. Rate-denied requests don't consume quota (checked in
+  that order). A rate-allowed-but-quota-denied request does occupy a rate
+  slot — acceptable. Next: M3 multi-pod smoke (needs Redis in
+  deploy/k8s + smoke.sh assertions).

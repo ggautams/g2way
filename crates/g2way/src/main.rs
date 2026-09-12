@@ -116,7 +116,15 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             }
         };
         let forwarder = Forwarder::new();
-        let table = RouteTable::build(defs, &forwarder, &storage)?;
+        let spike_guard = config.spike_guard.as_ref().map(|cfg| {
+            tracing::info!(
+                capacity = cfg.capacity,
+                refill_per_sec = cfg.refill_per_sec,
+                "spike guard enabled"
+            );
+            Arc::new(g2_middleware::SpikeGuard::new(cfg))
+        });
+        let table = RouteTable::build(defs, &forwarder, &storage, spike_guard.as_ref())?;
         let gateway = Arc::new(Gateway::new(table));
 
         let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;

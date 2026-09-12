@@ -634,6 +634,7 @@ dependencies = [
 name = "g2-middleware"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "base64",
  "bcrypt",
  "bytes",
@@ -699,6 +700,7 @@ dependencies = [
  "clap",
  "g2-admin",
  "g2-core",
+ "g2-middleware",
  "g2-proxy",
  "g2-storage",
  "g2-telemetry",

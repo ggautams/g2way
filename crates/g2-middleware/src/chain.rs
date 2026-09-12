@@ -9,6 +9,7 @@ use tower::{Service, ServiceBuilder};
 use crate::api_id_header::ApiIdHeaderLayer;
 use crate::auth::AuthLayer;
 use crate::context::RequestContext;
+use crate::rate_limit::RateLimitLayer;
 use crate::set_context::SetContextLayer;
 use crate::{ChainService, ProxyBody};
 
@@ -20,21 +21,27 @@ use crate::{ChainService, ProxyBody};
 ///
 /// 1. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
 /// 2. [`AuthLayer`] — token auth (absent for keyless APIs).
-/// 3. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+/// 3. [`RateLimitLayer`] — session rate/quota enforcement (absent for
+///    keyless APIs, which have no session to read limits from).
+/// 4. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
 ///
-/// Rate-limit, quota, and transform layers slot in here as later M2+/M3
-/// tasks land.
+/// Transform layers slot in here as later M6 tasks land.
 #[derive(Debug, Clone)]
 pub struct ChainBuilder {
     ctx: RequestContext,
     auth: Option<AuthLayer>,
+    rate_limit: Option<RateLimitLayer>,
 }
 
 impl ChainBuilder {
     /// Starts a chain for the API identified by `ctx`.
     #[must_use]
     pub fn new(ctx: RequestContext) -> Self {
-        Self { ctx, auth: None }
+        Self {
+            ctx,
+            auth: None,
+            rate_limit: None,
+        }
     }
 
     /// Adds token authentication (`None` — from a keyless config — is a
@@ -42,6 +49,13 @@ impl ChainBuilder {
     #[must_use]
     pub fn auth(mut self, auth: Option<AuthLayer>) -> Self {
         self.auth = auth;
+        self
+    }
+
+    /// Adds rate/quota enforcement (`None` is a no-op).
+    #[must_use]
+    pub fn rate_limit(mut self, rate_limit: Option<RateLimitLayer>) -> Self {
+        self.rate_limit = rate_limit;
         self
     }
 
@@ -60,6 +74,7 @@ impl ChainBuilder {
         let svc = ServiceBuilder::new()
             .layer(SetContextLayer::new(self.ctx))
             .option_layer(self.auth)
+            .option_layer(self.rate_limit)
             .layer(ApiIdHeaderLayer::new())
             .service(forward);
         BoxCloneSyncService::new(svc)

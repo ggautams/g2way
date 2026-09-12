@@ -477,7 +477,7 @@ fn authenticate_jwt(
 }
 
 /// Seconds since the Unix epoch (0 if the clock is set before 1970).
-fn unix_now_secs() -> u64 {
+pub(crate) fn unix_now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())

@@ -159,7 +159,7 @@ mod tests {
         defs: Vec<ApiDefinition>,
         storage: &g2_storage::SharedStorage,
     ) -> Gateway {
-        Gateway::new(RouteTable::build(defs, &Forwarder::new(), storage).expect("table"))
+        Gateway::new(RouteTable::build(defs, &Forwarder::new(), storage, None).expect("table"))
     }
 
     fn gateway_for(defs: Vec<ApiDefinition>) -> Gateway {
@@ -329,6 +329,7 @@ mod tests {
             vec![def_to("echo", "/echo/", &format!("http://{upstream}"))],
             &Forwarder::new(),
             &memory_storage(),
+            None,
         )
         .expect("table");
         gw.reload(table);
