@@ -24,6 +24,7 @@ pub mod chain;
 pub mod context;
 pub mod response;
 pub mod set_context;
+pub mod spike;
 
 pub use api_id_header::{ApiIdHeader, ApiIdHeaderLayer, API_ID_HEADER};
 pub use auth::{Auth, AuthLayer};
@@ -31,6 +32,7 @@ pub use body::ProxyBody;
 pub use chain::ChainBuilder;
 pub use context::{ClientAddr, RequestContext, SessionContext};
 pub use set_context::{SetContext, SetContextLayer};
+pub use spike::SpikeGuard;
 
 /// Boxed error type used for proxied body streams.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;

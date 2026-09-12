@@ -46,7 +46,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 
 - [x] Redis sliding-window rate limiter as an atomic Lua script (`redis::Script`), per-key and per-API
 - [x] Quotas: long-period counters with reset timestamps
-- [ ] Local token-bucket spike guard in front of Redis (configurable)
+- [x] Local token-bucket spike guard in front of Redis (configurable)
 - [ ] 429 responses with `X-RateLimit-Limit/-Remaining/-Reset` headers
 - [ ] Multi-pod correctness test documented in smoke script (two replicas share counters)
 
@@ -246,3 +246,15 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   over max, never extends the period). Verified against real Redis (renewal
   + 20-concurrent-admit-exactly-5). Next: local token-bucket spike guard in
   front of Redis.
+- **2026-08-30 (13)** — M3 spike guard landed (`g2-middleware::spike`): a
+  pod-local, **lock-free** token bucket (packed `AtomicU64` CAS loop —
+  hi 32 = last-refill secs since guard epoch, lo 32 = tokens) sharded into a
+  fixed 4096-bucket array by identity hash — collisions only ever make the
+  guard stricter. Whole-second refill; the refill timestamp advances **only
+  when credit lands** (else constant sub-second traffic would starve refill
+  — tested). Config: `GatewayConfig.spike_guard: Option<{capacity,
+  refill_per_sec}>` (None = off; zeros rejected by validate()). Not yet
+  consulted anywhere — it fronts Redis inside the rate-limit middleware,
+  which is the next checkbox (429 + X-RateLimit headers) and will also pick
+  the guarded identity. 8-thread × 50-acquire test proves exactly-capacity
+  admissions. Next: 429 middleware wiring rate+quota+spike into the chain.

@@ -15,6 +15,22 @@ fn default_apps_dir() -> PathBuf {
     PathBuf::from("./apps")
 }
 
+/// Settings for the pod-local token-bucket spike guard placed in front of
+/// the distributed (Redis) rate limiter.
+///
+/// The guard sheds excess per-identity traffic locally before it costs a
+/// Redis round-trip; the authoritative limit stays in Redis. Absent from
+/// the config means the guard is disabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpikeGuardConfig {
+    /// Burst size: tokens an idle identity accumulates (must be > 0).
+    pub capacity: u32,
+
+    /// Tokens credited back per second (must be > 0). Refill happens at
+    /// whole-second granularity; `capacity` absorbs sub-second bursts.
+    pub refill_per_sec: u32,
+}
+
 /// Process-level settings for a gateway node.
 ///
 /// Loaded from an optional YAML/JSON file, with individual fields
@@ -47,6 +63,10 @@ pub struct GatewayConfig {
     /// `X-G2-Authorization` header. Required (non-empty) whenever
     /// `admin_listen_addr` is set: the admin API never runs unsecured.
     pub admin_secret: Option<String>,
+
+    /// Pod-local spike guard in front of the distributed rate limiter.
+    /// `None` (the default) disables it.
+    pub spike_guard: Option<SpikeGuardConfig>,
 }
 
 impl Default for GatewayConfig {
@@ -58,6 +78,7 @@ impl Default for GatewayConfig {
             redis_url: None,
             admin_listen_addr: None,
             admin_secret: None,
+            spike_guard: None,
         }
     }
 }
@@ -103,6 +124,15 @@ impl GatewayConfig {
                     .into(),
             });
         }
+        if let Some(guard) = &self.spike_guard {
+            if guard.capacity == 0 || guard.refill_per_sec == 0 {
+                return Err(Error::InvalidGatewayConfig {
+                    reason: "`spike_guard.capacity` and `spike_guard.refill_per_sec` must be \
+                             greater than zero (omit `spike_guard` to disable it)"
+                        .into(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -147,6 +177,28 @@ mod tests {
         // A secret alone (no listener) is inert but not an error.
         cfg.admin_listen_addr = None;
         cfg.validate().expect("secret without listener is valid");
+    }
+
+    #[test]
+    fn spike_guard_fields_must_be_positive() {
+        let mut cfg = GatewayConfig {
+            spike_guard: Some(SpikeGuardConfig {
+                capacity: 0,
+                refill_per_sec: 10,
+            }),
+            ..GatewayConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "zero capacity");
+        cfg.spike_guard = Some(SpikeGuardConfig {
+            capacity: 10,
+            refill_per_sec: 0,
+        });
+        assert!(cfg.validate().is_err(), "zero refill");
+        cfg.spike_guard = Some(SpikeGuardConfig {
+            capacity: 10,
+            refill_per_sec: 10,
+        });
+        cfg.validate().expect("positive fields are valid");
     }
 
     #[test]
