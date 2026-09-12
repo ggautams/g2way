@@ -37,6 +37,16 @@ pub struct GatewayConfig {
     /// fine for keyless dev runs, but API keys are then neither shared
     /// across pods nor persisted.
     pub redis_url: Option<String>,
+
+    /// Address the admin API binds to (a **separate** listener from the
+    /// proxy, so it can stay off the public network). `None` — the default —
+    /// disables the admin API entirely.
+    pub admin_listen_addr: Option<SocketAddr>,
+
+    /// Shared secret admin requests must present in the
+    /// `X-G2-Authorization` header. Required (non-empty) whenever
+    /// `admin_listen_addr` is set: the admin API never runs unsecured.
+    pub admin_secret: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -46,6 +56,8 @@ impl Default for GatewayConfig {
             apps_dir: default_apps_dir(),
             shutdown_grace_period_secs: 30,
             redis_url: None,
+            admin_listen_addr: None,
+            admin_secret: None,
         }
     }
 }
@@ -68,6 +80,30 @@ impl GatewayConfig {
             path: path.to_owned(),
             reason: e.to_string(),
         })
+    }
+
+    /// Validates cross-field invariants (called by the binary after CLI
+    /// overrides are applied).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::InvalidGatewayConfig`] when `admin_listen_addr` is
+    /// set without a non-empty `admin_secret` — the admin API must never
+    /// start unsecured.
+    pub fn validate(&self) -> Result<(), Error> {
+        if self.admin_listen_addr.is_some()
+            && self
+                .admin_secret
+                .as_deref()
+                .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err(Error::InvalidGatewayConfig {
+                reason: "`admin_listen_addr` is set but `admin_secret` is missing or empty; \
+                         the admin API never runs unsecured"
+                    .into(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -92,6 +128,25 @@ mod tests {
         assert_eq!(cfg.listen_addr.port(), 9999);
         // Unspecified fields keep their defaults.
         assert_eq!(cfg.shutdown_grace_period_secs, 30);
+    }
+
+    #[test]
+    fn admin_listener_requires_a_secret() {
+        let mut cfg = GatewayConfig::default();
+        cfg.validate().expect("no admin config is valid");
+
+        cfg.admin_listen_addr = Some("127.0.0.1:9696".parse().expect("addr"));
+        assert!(cfg.validate().is_err(), "listener without secret");
+
+        cfg.admin_secret = Some("  ".into());
+        assert!(cfg.validate().is_err(), "blank secret");
+
+        cfg.admin_secret = Some("s3cret".into());
+        cfg.validate().expect("listener with secret is valid");
+
+        // A secret alone (no listener) is inert but not an error.
+        cfg.admin_listen_addr = None;
+        cfg.validate().expect("secret without listener is valid");
     }
 
     #[test]

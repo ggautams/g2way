@@ -8,6 +8,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+g2-admin.workspace = true
 g2-core.workspace = true
 g2-proxy.workspace = true
 g2-storage.workspace = true

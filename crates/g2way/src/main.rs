@@ -37,6 +37,17 @@ struct Cli {
     #[arg(long, env = "G2_REDIS_URL")]
     redis_url: Option<String>,
 
+    /// Admin API listen address, e.g. 127.0.0.1:9696 (overrides the config
+    /// file). The admin API is disabled unless an address is configured, and
+    /// requires an admin secret.
+    #[arg(long, env = "G2_ADMIN_LISTEN")]
+    admin_listen: Option<SocketAddr>,
+
+    /// Secret admin requests must present in `X-G2-Authorization`
+    /// (overrides the config file).
+    #[arg(long, env = "G2_ADMIN_SECRET", hide_env_values = true)]
+    admin_secret: Option<String>,
+
     /// Log output format: `json` (default) or `pretty`.
     #[arg(long, env = "G2_LOG_FORMAT", default_value = "json")]
     log_format: LogFormat,
@@ -70,6 +81,13 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(redis_url) = cli.redis_url {
         config.redis_url = Some(redis_url);
     }
+    if let Some(admin_listen) = cli.admin_listen {
+        config.admin_listen_addr = Some(admin_listen);
+    }
+    if let Some(admin_secret) = cli.admin_secret {
+        config.admin_secret = Some(admin_secret);
+    }
+    config.validate()?;
 
     let defs = g2_core::loader::load_dir(&config.apps_dir)?;
     tracing::info!(
@@ -108,7 +126,42 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             version = env!("CARGO_PKG_VERSION"),
             "g2way listening"
         );
-        server::serve(listener, gateway, server::shutdown_signal(), grace).await?;
+
+        // One OS signal fans out to every listener's graceful shutdown.
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(());
+        tokio::spawn(async move {
+            server::shutdown_signal().await;
+            let _ = shutdown_tx.send(());
+        });
+        let wait_for_shutdown = |mut rx: tokio::sync::watch::Receiver<()>| async move {
+            // Resolves on the signal, or if the sender task ever vanished.
+            let _ = rx.changed().await;
+        };
+
+        let proxy = server::serve(
+            listener,
+            gateway,
+            wait_for_shutdown(shutdown_rx.clone()),
+            grace,
+        );
+        match &config.admin_listen_addr {
+            Some(admin_addr) => {
+                let secret = config
+                    .admin_secret
+                    .as_deref()
+                    .expect("validate() guarantees a secret when the admin listener is set");
+                let admin_router = g2_admin::router(secret)?;
+                let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
+                tracing::info!(admin_listen_addr = %admin_addr, "admin API listening");
+                let admin = g2_admin::serve(
+                    admin_listener,
+                    admin_router,
+                    wait_for_shutdown(shutdown_rx.clone()),
+                );
+                tokio::try_join!(proxy, admin)?;
+            }
+            None => proxy.await?,
+        }
         Ok::<(), Box<dyn std::error::Error>>(())
     })?;
     tracing::info!("g2way stopped");

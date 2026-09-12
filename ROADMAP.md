@@ -39,7 +39,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] Auth: JWT with static keys (HS256 secret / RS256 public-key PEM; claims → ephemeral session)
 - [ ] Auth: JWT `jwks_url` fetch + cache (needs an HTTPS fetch client — decide alongside the M7 TLS work)
 - [x] Auth: basic auth
-- [ ] Admin API skeleton (axum on separate port, `X-G2-Authorization` admin secret)
+- [x] Admin API skeleton (axum on separate port, `X-G2-Authorization` admin secret)
 - [ ] Admin key CRUD: `POST/GET/PUT/DELETE /g2/keys[/{key}]`
 
 ## M3 — Rate limiting & quotas (distributed)
@@ -190,3 +190,19 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   revisit if basic-auth traffic matters. New workspace deps: `bcrypt` 0.17,
   `base64` 0.22 (both pure Rust); g2-middleware's `tokio` moved dev→real dep.
   Next: admin API skeleton (axum, separate port, `X-G2-Authorization`).
+- **2026-08-30 (9)** — M2 admin API skeleton landed (`g2-admin`, axum 0.8 on
+  its **own listener**). Enabled only when `admin_listen_addr` is configured
+  (`--admin-listen`/`G2_ADMIN_LISTEN`), and `GatewayConfig::validate()` (new)
+  hard-fails startup if the listener is set without a non-empty
+  `admin_secret` (`--admin-secret`/`G2_ADMIN_SECRET`, hidden from `--help`
+  env display) — never unsecured. Secret checked by comparing SHA-256
+  digests (timing-safe enough: digest comparison leaks nothing about the
+  secret). Missing and wrong secret are one 403 message; the authed
+  router's *fallback* is behind the auth layer too, so unknown admin paths
+  read 403 to outsiders and 404 only with the secret. `/g2/health` is
+  unauthenticated (probes); `/g2/version` authed. Binary now fans one
+  SIGTERM/SIGINT out to both listeners via a `tokio::sync::watch` channel and
+  `try_join!`s the two serve loops. Verified live: 403/200/graceful-drain on
+  a local run. New `Error::InvalidGatewayConfig`. deploy/k8s deliberately
+  untouched until key CRUD makes the admin port useful. Next: admin key CRUD
+  (`/g2/keys`).

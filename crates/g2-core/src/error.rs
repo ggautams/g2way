@@ -22,6 +22,13 @@ pub enum Error {
         reason: String,
     },
 
+    /// The process-level gateway configuration is invalid.
+    #[error("invalid gateway config: {reason}")]
+    InvalidGatewayConfig {
+        /// Human-readable description of what is wrong.
+        reason: String,
+    },
+
     /// Two API definitions collide (same `api_id` or same `listen_path`).
     #[error("conflicting API definitions: {reason}")]
     ConflictingApiDefinitions {

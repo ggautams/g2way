@@ -35,6 +35,7 @@ http-body = "1"
 http-body-util = "0.1"
 bytes = "1"
 tower = { version = "0.5", features = ["util"] }
+axum = "0.8"
 
 # Data / config
 serde = { version = "1", features = ["derive"] }
