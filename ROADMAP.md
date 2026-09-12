@@ -57,7 +57,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] Admin CRUD for API definitions and policies (`/g2/apis`, `/g2/policies`)
 - [x] `GET /g2/keys` listing (needs a `Storage::scan`/SCAN operation — deferred from M2 key CRUD)
 - [x] `POST /g2/reload` + Redis pub/sub broadcast → every pod rebuilds its route table
-- [ ] Dashboard-support API: node info, loaded APIs, health, version, per-API stats snapshot
+- [x] Dashboard-support API: node info, loaded APIs, health, version, per-API stats snapshot
 - [ ] OpenAPI spec for the admin API (utoipa) served at `/g2/openapi.json`
 
 ## M5 — Observability
@@ -369,3 +369,18 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   worth folding into the dashboard-support-API task's smoke pass. Next:
   M4 dashboard-support API (node info, loaded APIs, health, version,
   per-API stats snapshot).
+- **2026-08-30 (21)** — M4 dashboard-support API landed: `GET /g2/node`
+  (node_id from `$HOSTNAME` — k8s pod name, null bare; version; uptime;
+  APIs currently routed, straight from the live table so hot reloads show
+  immediately, each with auth_mode via new `AuthConfig::mode_name`) and
+  `GET /g2/stats` (per-API requests + status-class counters). Counters:
+  new `g2-middleware::stats` — `StatsLayer` outermost in every chain
+  (rejections count too), atomics in a process-wide `StatsRegistry` keyed
+  by api_id so counters survive reloads (verified live) but reset on
+  restart; cluster-wide durable analytics stay an M5 concern.
+  `RouteTable::build` grew a 5th param `Option<&Arc<StatsRegistry>>`;
+  `g2_admin::router` grew `Option<Dashboard>` (503s from the two endpoints
+  when absent; binary always wires it; g2-admin now deps g2-proxy +
+  g2-middleware). Health/version halves of the checkbox existed since the
+  M2 skeleton. Verified live: 3×2xx+1×5xx counted, node lists the API.
+  Next: M4's last box — OpenAPI spec (utoipa) at `/g2/openapi.json`.

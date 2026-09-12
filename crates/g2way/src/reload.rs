@@ -33,6 +33,10 @@ pub struct ReloadContext {
     /// The pod-local spike guard, if enabled (shared across reloads so
     /// bucket state survives).
     pub spike_guard: Option<Arc<SpikeGuard>>,
+
+    /// Per-API request counters, if enabled (shared across reloads so
+    /// counters survive table swaps).
+    pub stats: Option<Arc<g2_middleware::StatsRegistry>>,
 }
 
 impl ReloadContext {
@@ -53,6 +57,7 @@ impl ReloadContext {
             &self.forwarder,
             &self.storage,
             self.spike_guard.as_ref(),
+            self.stats.as_ref(),
         )?)
     }
 }
@@ -105,6 +110,7 @@ mod tests {
             storage: Arc::clone(storage),
             forwarder: Forwarder::new(),
             spike_guard: None,
+            stats: None,
         }
     }
 

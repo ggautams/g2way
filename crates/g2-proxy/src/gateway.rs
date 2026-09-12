@@ -45,6 +45,14 @@ impl Gateway {
         self.table.load().routes().len()
     }
 
+    /// Handles to the currently served routes, most specific first (for the
+    /// dashboard-support API). The snapshot stays valid across reloads —
+    /// it simply describes the table that was live when it was taken.
+    #[must_use]
+    pub fn routes_snapshot(&self) -> Vec<std::sync::Arc<crate::router::Route>> {
+        self.table.load().routes().to_vec()
+    }
+
     /// Handles one client request end to end.
     ///
     /// Generic over the request body `B` so production code passes hyper's
@@ -159,7 +167,9 @@ mod tests {
         defs: Vec<ApiDefinition>,
         storage: &g2_storage::SharedStorage,
     ) -> Gateway {
-        Gateway::new(RouteTable::build(defs, &Forwarder::new(), storage, None).expect("table"))
+        Gateway::new(
+            RouteTable::build(defs, &Forwarder::new(), storage, None, None).expect("table"),
+        )
     }
 
     fn gateway_for(defs: Vec<ApiDefinition>) -> Gateway {
@@ -329,6 +339,7 @@ mod tests {
             vec![def_to("echo", "/echo/", &format!("http://{upstream}"))],
             &Forwarder::new(),
             &memory_storage(),
+            None,
             None,
         )
         .expect("table");

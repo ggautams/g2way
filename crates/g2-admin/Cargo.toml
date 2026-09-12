@@ -9,6 +9,8 @@ rust-version.workspace = true
 
 [dependencies]
 g2-core.workspace = true
+g2-middleware.workspace = true
+g2-proxy.workspace = true
 g2-storage.workspace = true
 axum.workspace = true
 hex.workspace = true

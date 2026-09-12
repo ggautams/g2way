@@ -11,6 +11,7 @@ use crate::auth::AuthLayer;
 use crate::context::RequestContext;
 use crate::rate_limit::RateLimitLayer;
 use crate::set_context::SetContextLayer;
+use crate::stats::StatsLayer;
 use crate::{ChainService, ProxyBody};
 
 /// Builds the middleware chain for one API.
@@ -19,11 +20,13 @@ use crate::{ChainService, ProxyBody};
 /// path. The resulting [`ChainService`] wraps the innermost forwarding
 /// service with, outermost first:
 ///
-/// 1. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
-/// 2. [`AuthLayer`] — token auth (absent for keyless APIs).
-/// 3. [`RateLimitLayer`] — session rate/quota enforcement (absent for
+/// 1. [`StatsLayer`] — per-API request counters (outermost so rejections
+///    count too; absent when stats are disabled).
+/// 2. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
+/// 3. [`AuthLayer`] — token auth (absent for keyless APIs).
+/// 4. [`RateLimitLayer`] — session rate/quota enforcement (absent for
 ///    keyless APIs, which have no session to read limits from).
-/// 4. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+/// 5. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
 ///
 /// Transform layers slot in here as later M6 tasks land.
 #[derive(Debug, Clone)]
@@ -31,6 +34,7 @@ pub struct ChainBuilder {
     ctx: RequestContext,
     auth: Option<AuthLayer>,
     rate_limit: Option<RateLimitLayer>,
+    stats: Option<StatsLayer>,
 }
 
 impl ChainBuilder {
@@ -41,7 +45,15 @@ impl ChainBuilder {
             ctx,
             auth: None,
             rate_limit: None,
+            stats: None,
         }
+    }
+
+    /// Adds per-API request counting (`None` is a no-op).
+    #[must_use]
+    pub fn stats(mut self, stats: Option<StatsLayer>) -> Self {
+        self.stats = stats;
+        self
     }
 
     /// Adds token authentication (`None` — from a keyless config — is a
@@ -72,6 +84,7 @@ impl ChainBuilder {
         S::Future: Send + 'static,
     {
         let svc = ServiceBuilder::new()
+            .option_layer(self.stats)
             .layer(SetContextLayer::new(self.ctx))
             .option_layer(self.auth)
             .option_layer(self.rate_limit)

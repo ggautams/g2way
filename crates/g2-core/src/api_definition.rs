@@ -141,6 +141,18 @@ impl Default for AuthConfig {
 }
 
 impl AuthConfig {
+    /// The mode's serialized tag (`"keyless"`, `"auth_token"`, …) — for
+    /// logs and status/dashboard APIs.
+    #[must_use]
+    pub fn mode_name(&self) -> &'static str {
+        match self {
+            Self::Keyless => "keyless",
+            Self::AuthToken { .. } => "auth_token",
+            Self::Jwt { .. } => "jwt",
+            Self::BasicAuth { .. } => "basic_auth",
+        }
+    }
+
     /// Validates auth settings; `api` names the owning definition in errors.
     fn validate(&self, api: &str) -> Result<(), Error> {
         let fail = |reason: String| Error::InvalidApiDefinition {

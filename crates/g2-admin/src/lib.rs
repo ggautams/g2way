@@ -15,12 +15,17 @@
 //! are returned only at creation — storage holds hashes, see
 //! [`g2_core::session::hash_key`]), API definition / policy CRUD under
 //! `/g2/apis` and `/g2/policies` (authenticated; definition changes go
-//! live on reload, not on write), and `POST /g2/reload` (authenticated) —
+//! live on reload, not on write), `POST /g2/reload` (authenticated) —
 //! broadcasts a reload nudge over storage pub/sub so every pod rebuilds
-//! its route table from the current files + storage.
+//! its route table from the current files + storage — and the
+//! dashboard-support pair `GET /g2/node` / `GET /g2/stats`
+//! (authenticated; see [`Dashboard`]).
 
+mod dashboard;
 mod keys;
 mod resources;
+
+pub use dashboard::Dashboard;
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -49,6 +54,10 @@ struct AdminState {
 
     /// The same storage backend the gateway authenticates against.
     storage: SharedStorage,
+
+    /// Live-gateway handles for the dashboard endpoints; `None` when the
+    /// router is built without them (those endpoints then answer 503).
+    dashboard: Option<Dashboard>,
 }
 
 impl AdminState {
@@ -67,7 +76,11 @@ impl AdminState {
 /// the admin API never runs unsecured. (The binary also enforces this via
 /// [`g2_core::GatewayConfig::validate`]; this is defense in depth for other
 /// callers.)
-pub fn router(admin_secret: &str, storage: SharedStorage) -> Result<Router, Error> {
+pub fn router(
+    admin_secret: &str,
+    storage: SharedStorage,
+    dashboard: Option<Dashboard>,
+) -> Result<Router, Error> {
     if admin_secret.trim().is_empty() {
         return Err(Error::InvalidGatewayConfig {
             reason: "admin secret must not be empty".into(),
@@ -76,6 +89,7 @@ pub fn router(admin_secret: &str, storage: SharedStorage) -> Result<Router, Erro
     let state = AdminState {
         secret_digest: Sha256::digest(admin_secret.as_bytes()).into(),
         storage,
+        dashboard,
     };
 
     // The fallback lives inside the authed router so unknown paths are
@@ -83,6 +97,8 @@ pub fn router(admin_secret: &str, storage: SharedStorage) -> Result<Router, Erro
     let authed = Router::new()
         .route("/g2/version", get(version))
         .route("/g2/reload", post(reload))
+        .route("/g2/node", get(dashboard::node))
+        .route("/g2/stats", get(dashboard::stats))
         .route("/g2/keys", get(keys::list_keys).post(keys::create_key))
         .route(
             "/g2/keys/{key}",
@@ -212,7 +228,7 @@ mod tests {
     const SECRET: &str = "test-admin-secret";
 
     fn test_router(storage: MemoryStorage) -> Router {
-        router(SECRET, Arc::new(storage)).expect("router")
+        router(SECRET, Arc::new(storage), None).expect("router")
     }
 
     fn request(path: &str, secret: Option<&str>) -> Request {
@@ -249,7 +265,7 @@ mod tests {
     fn empty_secret_is_rejected_at_construction() {
         for empty in ["", "   "] {
             assert!(
-                router(empty, Arc::new(MemoryStorage::new())).is_err(),
+                router(empty, Arc::new(MemoryStorage::new()), None).is_err(),
                 "secret `{empty:?}` must be rejected"
             );
         }
@@ -289,6 +305,73 @@ mod tests {
         let (status, body) = call("/g2/nope", Some(SECRET)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.contains("no such admin endpoint"), "body: {body}");
+    }
+
+    mod dashboard {
+        use g2_core::ApiDefinition;
+        use g2_middleware::StatsRegistry;
+        use g2_proxy::{Forwarder, Gateway, RouteTable};
+
+        use super::*;
+
+        fn dashboard_router(storage: MemoryStorage) -> (Router, Arc<Gateway>, Arc<StatsRegistry>) {
+            let shared: g2_storage::SharedStorage = Arc::new(storage);
+            let def: ApiDefinition = serde_json::from_str(
+                r#"{"api_id":"echo","name":"Echo","listen_path":"/echo/",
+                    "target_url":"http://up.internal","auth":{"mode":"keyless"}}"#,
+            )
+            .expect("def");
+            let stats = Arc::new(StatsRegistry::new());
+            let table =
+                RouteTable::build(vec![def], &Forwarder::new(), &shared, None, Some(&stats))
+                    .expect("table");
+            let gateway = Arc::new(Gateway::new(table));
+            let router = router(
+                SECRET,
+                shared,
+                Some(Dashboard::new(Arc::clone(&gateway), Arc::clone(&stats))),
+            )
+            .expect("router");
+            (router, gateway, stats)
+        }
+
+        #[tokio::test]
+        async fn node_reports_version_and_loaded_apis() {
+            let (router, _gateway, _stats) = dashboard_router(MemoryStorage::new());
+            let (status, body) = send(router, request("/g2/node", Some(SECRET))).await;
+            assert_eq!(status, StatusCode::OK);
+            let node: serde_json::Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(node["version"], env!("CARGO_PKG_VERSION"));
+            assert_eq!(node["routes"], 1);
+            assert_eq!(node["apis"][0]["api_id"], "echo");
+            assert_eq!(node["apis"][0]["auth_mode"], "keyless");
+        }
+
+        #[tokio::test]
+        async fn stats_snapshot_lists_built_apis() {
+            let (router, _gateway, stats) = dashboard_router(MemoryStorage::new());
+            // The route build registered the API; traffic-driven counting
+            // is unit-tested in g2-middleware::stats.
+            let _ = stats.for_api("echo"); // idempotent handle, same counters
+            let (status, body) = send(router, request("/g2/stats", Some(SECRET))).await;
+            assert_eq!(status, StatusCode::OK);
+            let snap: serde_json::Value = serde_json::from_str(&body).expect("json");
+            assert_eq!(snap["apis"][0]["api_id"], "echo");
+            assert_eq!(snap["apis"][0]["requests"], 0);
+        }
+
+        #[tokio::test]
+        async fn dashboard_endpoints_are_503_without_wiring() {
+            for path in ["/g2/node", "/g2/stats"] {
+                let (status, body) = send(
+                    test_router(MemoryStorage::new()),
+                    request(path, Some(SECRET)),
+                )
+                .await;
+                assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "path: {path}");
+                assert!(body.contains("unavailable"), "body: {body}");
+            }
+        }
     }
 
     mod resources {

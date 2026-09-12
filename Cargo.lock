@@ -603,6 +603,8 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "g2-core",
+ "g2-middleware",
+ "g2-proxy",
  "g2-storage",
  "hex",
  "http-body-util",
@@ -644,6 +646,7 @@ dependencies = [
  "http-body",
  "http-body-util",
  "jsonwebtoken",
+ "serde",
  "serde_json",
  "tokio",
  "tower",

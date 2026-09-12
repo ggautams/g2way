@@ -1,0 +1,95 @@
+//! Dashboard-support endpoints: what a dashboard needs to render a node.
+//!
+//! - `GET /g2/node` — node identity, version, uptime, and the APIs the
+//!   node is currently routing (from the live route table, so it reflects
+//!   hot reloads immediately).
+//! - `GET /g2/stats` — per-API request counters
+//!   ([`g2_middleware::StatsRegistry`] snapshot): process-local and reset
+//!   on restart. Cluster-wide durable analytics are milestone M5's
+//!   `AnalyticsSink`.
+//!
+//! Both answer `503` when the router was built without a [`Dashboard`]
+//! (possible for embedders; the g2way binary always wires one).
+
+use std::sync::Arc;
+use std::time::Instant;
+
+use axum::extract::State;
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::Json;
+use g2_middleware::StatsRegistry;
+use g2_proxy::Gateway;
+
+use crate::{error_response, AdminState};
+
+/// Live-gateway handles behind the dashboard endpoints.
+///
+/// Constructed by the binary after the [`Gateway`] exists and passed to
+/// [`router`](crate::router).
+#[derive(Clone)]
+pub struct Dashboard {
+    gateway: Arc<Gateway>,
+    stats: Arc<StatsRegistry>,
+    started_at: Instant,
+}
+
+impl Dashboard {
+    /// Wires the dashboard to the running gateway and its stats registry.
+    /// Uptime is measured from this call.
+    #[must_use]
+    pub fn new(gateway: Arc<Gateway>, stats: Arc<StatsRegistry>) -> Self {
+        Self {
+            gateway,
+            stats,
+            started_at: Instant::now(),
+        }
+    }
+}
+
+/// The 503 for a router built without a [`Dashboard`].
+fn unavailable() -> Response {
+    error_response(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "node status unavailable on this deployment",
+    )
+}
+
+/// `GET /g2/node` — node identity plus the APIs currently being routed.
+pub(crate) async fn node(State(state): State<AdminState>) -> Response {
+    let Some(d) = &state.dashboard else {
+        return unavailable();
+    };
+    let apis: Vec<serde_json::Value> = d
+        .gateway
+        .routes_snapshot()
+        .iter()
+        .map(|route| {
+            serde_json::json!({
+                "api_id": route.def.api_id,
+                "name": route.def.name,
+                "org_id": route.def.org_id,
+                "listen_path": route.def.listen_path,
+                "target_url": route.def.target_url,
+                "auth_mode": route.def.auth.mode_name(),
+            })
+        })
+        .collect();
+    Json(serde_json::json!({
+        // The pod name under k8s; absent in bare processes.
+        "node_id": std::env::var("HOSTNAME").ok(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "uptime_secs": d.started_at.elapsed().as_secs(),
+        "routes": apis.len(),
+        "apis": apis,
+    }))
+    .into_response()
+}
+
+/// `GET /g2/stats` — per-API request counters since process start.
+pub(crate) async fn stats(State(state): State<AdminState>) -> Response {
+    let Some(d) = &state.dashboard else {
+        return unavailable();
+    };
+    Json(serde_json::json!({ "apis": d.stats.snapshot() })).into_response()
+}

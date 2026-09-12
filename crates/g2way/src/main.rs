@@ -117,6 +117,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             Arc::new(g2_middleware::SpikeGuard::new(cfg))
         });
+        let stats = Arc::new(g2_middleware::StatsRegistry::new());
         // Both definition sources (files + storage, ADR-0002) are loaded
         // through the reload context, at startup and on every reload nudge.
         let reload_ctx = reload::ReloadContext {
@@ -125,6 +126,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             storage: Arc::clone(&storage),
             forwarder: Forwarder::new(),
             spike_guard,
+            stats: Some(Arc::clone(&stats)),
         };
         let gateway = Arc::new(Gateway::new(reload_ctx.build_table().await?));
         tracing::info!(apps_dir = %config.apps_dir.display(), "API definitions loaded");
@@ -161,7 +163,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
         let proxy = server::serve(
             listener,
-            gateway,
+            Arc::clone(&gateway),
             wait_for_shutdown(shutdown_rx.clone()),
             grace,
         );
@@ -171,7 +173,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .admin_secret
                     .as_deref()
                     .expect("validate() guarantees a secret when the admin listener is set");
-                let admin_router = g2_admin::router(secret, Arc::clone(&storage))?;
+                let dashboard = g2_admin::Dashboard::new(Arc::clone(&gateway), Arc::clone(&stats));
+                let admin_router = g2_admin::router(secret, Arc::clone(&storage), Some(dashboard))?;
                 let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
                 tracing::info!(admin_listen_addr = %admin_addr, "admin API listening");
                 let admin = g2_admin::serve(

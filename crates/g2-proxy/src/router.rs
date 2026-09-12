@@ -5,7 +5,8 @@ use std::sync::Arc;
 
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{
-    AuthLayer, ChainBuilder, ChainService, RateLimitLayer, RequestContext, SpikeGuard,
+    AuthLayer, ChainBuilder, ChainService, RateLimitLayer, RequestContext, SpikeGuard, StatsLayer,
+    StatsRegistry,
 };
 use g2_storage::SharedStorage;
 
@@ -44,6 +45,7 @@ impl Route {
         forwarder: &Forwarder,
         storage: &SharedStorage,
         spike_guard: Option<&Arc<SpikeGuard>>,
+        stats: Option<&Arc<StatsRegistry>>,
     ) -> Result<Self, Error> {
         let target = Arc::new(UpstreamTarget::build(&def)?);
         let ctx = RequestContext::new(def.api_id.clone(), def.org_id.clone());
@@ -60,6 +62,7 @@ impl Route {
             )
         });
         let chain = ChainBuilder::new(ctx)
+            .stats(stats.map(|r| StatsLayer::new(r.for_api(&def.api_id))))
             .auth(auth)
             .rate_limit(rate_limit)
             .build(Forward::new(forwarder, Arc::clone(&target)));
@@ -103,7 +106,9 @@ impl RouteTable {
     /// middleware chain is composed here, around a forwarding service using
     /// `forwarder`'s shared client; token-auth APIs look sessions up in
     /// `storage`. `spike_guard` is the optional process-wide pod-local
-    /// guard shared by every route's rate limiter.
+    /// guard shared by every route's rate limiter, and `stats` the optional
+    /// process-wide counter registry (shared across reloads so counters
+    /// survive table swaps).
     ///
     /// # Errors
     ///
@@ -115,11 +120,12 @@ impl RouteTable {
         forwarder: &Forwarder,
         storage: &SharedStorage,
         spike_guard: Option<&Arc<SpikeGuard>>,
+        stats: Option<&Arc<StatsRegistry>>,
     ) -> Result<Self, Error> {
         let mut routes = Vec::with_capacity(defs.len());
         for def in defs {
             let active = def.active;
-            let route = Route::build(def, forwarder, storage, spike_guard)?;
+            let route = Route::build(def, forwarder, storage, spike_guard, stats)?;
             if active {
                 routes.push(Arc::new(route));
             } else {
@@ -161,7 +167,7 @@ mod tests {
 
     fn table(defs: Vec<ApiDefinition>) -> Result<RouteTable, Error> {
         let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
-        RouteTable::build(defs, &Forwarder::new(), &storage, None)
+        RouteTable::build(defs, &Forwarder::new(), &storage, None, None)
     }
 
     #[test]
