@@ -1,0 +1,6 @@
+{
+  "api_id": "httpbin",
+  "name": "Httpbin passthrough",
+  "listen_path": "/httpbin/",
+  "target_url": "http://localhost:8000"
+}

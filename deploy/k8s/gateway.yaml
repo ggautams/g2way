@@ -1,0 +1,85 @@
+# The g2way gateway: 2 stateless replicas reading API definitions from a
+# ConfigMap. Build/load the image first: `make minikube-load`.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: g2way-apps
+  namespace: g2way
+data:
+  httpbin.json: |
+    {
+      "api_id": "httpbin",
+      "name": "Httpbin passthrough",
+      "listen_path": "/httpbin/",
+      "target_url": "http://httpbin.g2way.svc.cluster.local:8080"
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: g2way
+  namespace: g2way
+  labels:
+    app: g2way
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: g2way
+  template:
+    metadata:
+      labels:
+        app: g2way
+    spec:
+      # Slightly longer than the gateway's default 30s drain grace.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: g2way
+          image: g2way:dev
+          imagePullPolicy: IfNotPresent
+          args:
+            - --apps-dir=/etc/g2way/apps
+          env:
+            - name: RUST_LOG
+              value: info
+          ports:
+            - name: proxy
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: proxy
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /hello
+              port: proxy
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: apps
+              mountPath: /etc/g2way/apps
+              readOnly: true
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: apps
+          configMap:
+            name: g2way-apps
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: g2way
+  namespace: g2way
+spec:
+  selector:
+    app: g2way
+  ports:
+    - name: proxy
+      port: 8080
+      targetPort: proxy
