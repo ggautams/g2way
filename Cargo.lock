@@ -674,6 +674,7 @@ name = "g2-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "futures-util",
  "g2-core",
  "rand 0.9.5",
  "redis",
@@ -712,6 +713,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]

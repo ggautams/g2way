@@ -56,7 +56,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] Policies: reusable rate/quota/ACL bundles referenced by keys
 - [x] Admin CRUD for API definitions and policies (`/g2/apis`, `/g2/policies`)
 - [x] `GET /g2/keys` listing (needs a `Storage::scan`/SCAN operation — deferred from M2 key CRUD)
-- [ ] `POST /g2/reload` + Redis pub/sub broadcast → every pod rebuilds its route table
+- [x] `POST /g2/reload` + Redis pub/sub broadcast → every pod rebuilds its route table
 - [ ] Dashboard-support API: node info, loaded APIs, health, version, per-API stats snapshot
 - [ ] OpenAPI spec for the admin API (utoipa) served at `/g2/openapi.json`
 
@@ -350,3 +350,22 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   restart (the biggest remaining M4 piece — needs an in-process rebuild
   path from `SharedStorage` + file defs to a new `RouteTable`, an ArcSwap
   store the binary already has, and a subscriber task per pod).
+- **2026-08-30 (20)** — M4 hot reload landed. `Storage` grew fire-and-forget
+  pub/sub: `publish(channel, payload)` + `subscribe(channel) ->
+  mpsc::Receiver<String>` (best-effort delivery; payloads must be
+  re-derivable from storage). Redis impl keeps the `Client` and dials a
+  dedicated pub/sub connection per subscription inside a re-dial-with-
+  backoff task (new `futures-util` workspace dep for `StreamExt`); memory
+  impl is per-channel `tokio::broadcast` bridged to mpsc. `POST /g2/reload`
+  (admin) publishes to `g2:{org}:channel:reload`
+  (`g2_core::config::reload_channel`) and returns immediately; each pod's
+  `g2way::reload::listen` task (new module; `ReloadContext.build_table()`
+  is now the one files+storage→RouteTable path, also used at startup)
+  rebuilds and `Gateway::reload`-swaps — a failed rebuild logs and keeps
+  the old table (tested, incl. listener surviving the failure). **Verified
+  live: two gateway processes sharing Redis; def POSTed via admin on pod A
+  + one reload → both pods 404→200 with "route table reloaded" in both
+  logs, no restarts.** Note: deploy/k8s smoke not extended for reload yet —
+  worth folding into the dashboard-support-API task's smoke pass. Next:
+  M4 dashboard-support API (node info, loaded APIs, health, version,
+  per-API stats snapshot).

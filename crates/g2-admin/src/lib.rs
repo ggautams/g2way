@@ -13,10 +13,11 @@
 //! Endpoints: `/g2/health` (liveness, unauthenticated), `/g2/version`
 //! (authenticated), key CRUD under `/g2/keys` (authenticated; raw keys
 //! are returned only at creation — storage holds hashes, see
-//! [`g2_core::session::hash_key`]), and API definition / policy CRUD under
+//! [`g2_core::session::hash_key`]), API definition / policy CRUD under
 //! `/g2/apis` and `/g2/policies` (authenticated; definition changes go
-//! live on reload, not on write). `POST /g2/reload` arrives next in
-//! milestone M4.
+//! live on reload, not on write), and `POST /g2/reload` (authenticated) —
+//! broadcasts a reload nudge over storage pub/sub so every pod rebuilds
+//! its route table from the current files + storage.
 
 mod keys;
 mod resources;
@@ -25,7 +26,7 @@ use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use g2_core::{ApiDefinition, Error, Policy};
 use g2_storage::SharedStorage;
@@ -81,6 +82,7 @@ pub fn router(admin_secret: &str, storage: SharedStorage) -> Result<Router, Erro
     // only distinguishable from known ones by authenticated callers.
     let authed = Router::new()
         .route("/g2/version", get(version))
+        .route("/g2/reload", post(reload))
         .route("/g2/keys", get(keys::list_keys).post(keys::create_key))
         .route(
             "/g2/keys/{key}",
@@ -162,6 +164,28 @@ async fn health() -> Response {
 /// version equals the binary's).
 async fn version() -> Response {
     Json(serde_json::json!({ "version": env!("CARGO_PKG_VERSION") })).into_response()
+}
+
+/// `POST /g2/reload` — broadcast a config-reload nudge to every gateway
+/// pod (this one included) via storage pub/sub.
+///
+/// Returns as soon as the nudge is published: reloads happen
+/// asynchronously on each pod, which re-reads definitions from files and
+/// storage, rebuilds its route table, and keeps the old table if the new
+/// config fails to load (logged per pod).
+async fn reload(State(state): State<AdminState>) -> Response {
+    let channel = g2_core::config::reload_channel(g2_core::DEFAULT_ORG_ID);
+    match state.storage.publish(&channel, "reload").await {
+        Ok(()) => {
+            tracing::info!("reload nudge broadcast");
+            Json(serde_json::json!({ "status": "ok", "message": "reload broadcast" }))
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "reload broadcast failed");
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "storage unavailable")
+        }
+    }
 }
 
 /// Authenticated fallback for unmatched admin paths.

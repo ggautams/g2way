@@ -15,6 +15,16 @@ fn default_apps_dir() -> PathBuf {
     PathBuf::from("./apps")
 }
 
+/// Pub/sub channel a config-reload nudge for `org_id` is broadcast on:
+/// `g2:{org_id}:channel:reload`.
+///
+/// The message payload carries no data — receivers re-read definitions
+/// from storage and rebuild their route table (see ADR-0002).
+#[must_use]
+pub fn reload_channel(org_id: &str) -> String {
+    format!("g2:{org_id}:channel:reload")
+}
+
 /// Settings for the pod-local token-bucket spike guard placed in front of
 /// the distributed (Redis) rate limiter.
 ///

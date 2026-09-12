@@ -76,6 +76,26 @@ pub trait Storage: Send + Sync + 'static {
     /// take time proportional to the whole keyspace.
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError>;
 
+    /// Broadcasts `payload` to every current subscriber of `channel`.
+    ///
+    /// Fire-and-forget fan-out (Redis pub/sub semantics): delivery is
+    /// best-effort, nothing is stored, and a subscriber that is down or
+    /// lagging simply misses the message. Suitable for "go look at
+    /// storage" nudges (config reload), not for data transfer — make the
+    /// payload re-derivable from storage.
+    async fn publish(&self, channel: &str, payload: &str) -> Result<(), StorageError>;
+
+    /// Subscribes to `channel`, returning a receiver of published payloads.
+    ///
+    /// The subscription lives until the receiver is dropped. Backends
+    /// re-establish broken transport (with backoff) transparently; messages
+    /// published while the transport was down are lost, per the
+    /// [`publish`](Storage::publish) contract.
+    async fn subscribe(
+        &self,
+        channel: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<String>, StorageError>;
+
     /// Atomically checks (and, when allowed, records) one request against a
     /// sliding window of at most `limit` requests per `window` at `key`.
     ///

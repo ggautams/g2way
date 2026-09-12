@@ -93,6 +93,10 @@ return {1, max - count, ttl}
 /// `RedisStorage` is created at startup and cloned wherever needed.
 pub struct RedisStorage {
     conn: ConnectionManager,
+    /// Kept for [`Storage::subscribe`]: pub/sub needs a dedicated
+    /// connection per subscription (a connection in subscribe mode cannot
+    /// run regular commands), so subscriptions dial fresh from the client.
+    client: ::redis::Client,
     /// Cached rate-limit script (EVALSHA after the first call).
     rate_script: Arc<Script>,
     /// Cached quota script (EVALSHA after the first call).
@@ -103,6 +107,7 @@ impl Clone for RedisStorage {
     fn clone(&self) -> Self {
         Self {
             conn: self.conn.clone(),
+            client: self.client.clone(),
             rate_script: Arc::clone(&self.rate_script),
             quota_script: Arc::clone(&self.quota_script),
         }
@@ -131,6 +136,7 @@ impl RedisStorage {
         let conn = client.get_connection_manager().await.map_err(backend_err)?;
         Ok(Self {
             conn,
+            client,
             rate_script: Arc::new(Script::new(RATE_SCRIPT)),
             quota_script: Arc::new(Script::new(QUOTA_SCRIPT)),
         })
@@ -199,6 +205,59 @@ impl Storage for RedisStorage {
         keys.sort_unstable();
         keys.dedup();
         Ok(keys)
+    }
+
+    async fn publish(&self, channel: &str, payload: &str) -> Result<(), StorageError> {
+        redis::cmd("PUBLISH")
+            .arg(channel)
+            .arg(payload)
+            .query_async::<()>(&mut self.conn.clone())
+            .await
+            .map_err(backend_err)
+    }
+
+    async fn subscribe(
+        &self,
+        channel: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<String>, StorageError> {
+        use futures_util::StreamExt as _;
+
+        let client = self.client.clone();
+        let channel = channel.to_owned();
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        // The forwarding task owns the pub/sub connection and re-dials with
+        // backoff when it breaks (messages published meanwhile are lost —
+        // the trait's best-effort contract). It ends when the subscriber
+        // drops its receiver.
+        tokio::spawn(async move {
+            loop {
+                match client.get_async_pubsub().await {
+                    Ok(mut pubsub) => match pubsub.subscribe(&channel).await {
+                        Ok(()) => {
+                            let mut stream = pubsub.on_message();
+                            while let Some(msg) = stream.next().await {
+                                let payload: String = msg.get_payload().unwrap_or_default();
+                                if tx.send(payload).await.is_err() {
+                                    return;
+                                }
+                            }
+                            tracing::warn!(channel, "pub/sub connection ended; re-dialing");
+                        }
+                        Err(e) => {
+                            tracing::warn!(channel, error = %e, "pub/sub subscribe failed; retrying");
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(channel, error = %e, "pub/sub connect failed; retrying");
+                    }
+                }
+                if tx.is_closed() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        Ok(rx)
     }
 
     async fn check_rate(
@@ -368,6 +427,28 @@ mod tests {
 
         store.delete(&literal).await.expect("cleanup");
         store.delete(&decoy).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real Redis: `make redis-up`"]
+    async fn publish_reaches_subscriber() {
+        let store = store().await;
+        let channel = test_key("channel:reload");
+        let mut rx = store.subscribe(&channel).await.expect("subscribe");
+        // Subscription setup races the first publish; retry a few times
+        // (best-effort contract) until the round trip lands.
+        let received = async {
+            for _ in 0..20 {
+                store.publish(&channel, "nudge").await.expect("publish");
+                match tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {
+                    Ok(msg) => return msg,
+                    Err(_elapsed) => {}
+                }
+            }
+            None
+        }
+        .await;
+        assert_eq!(received.as_deref(), Some("nudge"));
     }
 
     #[tokio::test]

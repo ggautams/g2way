@@ -430,6 +430,15 @@ mod tests {
             async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
                 self.0.scan_prefix(prefix).await
             }
+            async fn publish(&self, channel: &str, payload: &str) -> Result<(), StorageError> {
+                self.0.publish(channel, payload).await
+            }
+            async fn subscribe(
+                &self,
+                channel: &str,
+            ) -> Result<tokio::sync::mpsc::Receiver<String>, StorageError> {
+                self.0.subscribe(channel).await
+            }
             async fn check_rate(
                 &self,
                 _key: &str,
@@ -496,6 +505,15 @@ mod tests {
             }
             async fn scan_prefix(&self, _prefix: &str) -> Result<Vec<String>, StorageError> {
                 Ok(Vec::new())
+            }
+            async fn publish(&self, _channel: &str, _payload: &str) -> Result<(), StorageError> {
+                Err(StorageError::Backend("redis is down".into()))
+            }
+            async fn subscribe(
+                &self,
+                _channel: &str,
+            ) -> Result<tokio::sync::mpsc::Receiver<String>, StorageError> {
+                Err(StorageError::Backend("redis is down".into()))
             }
             async fn check_rate(
                 &self,

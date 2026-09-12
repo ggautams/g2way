@@ -11,10 +11,10 @@ use std::time::Duration;
 
 use clap::Parser;
 use g2_core::GatewayConfig;
-use g2_proxy::{Forwarder, Gateway, RouteTable};
+use g2_proxy::{Forwarder, Gateway};
 use g2_storage::{MemoryStorage, RedisStorage, SharedStorage};
 use g2_telemetry::LogFormat;
-use g2way::server;
+use g2way::{reload, server};
 
 /// g2way — an API gateway written in Rust.
 #[derive(Debug, Parser)]
@@ -89,12 +89,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     config.validate()?;
 
-    let file_defs = g2_core::loader::load_dir(&config.apps_dir)?;
-    tracing::info!(
-        count = file_defs.len(),
-        apps_dir = %config.apps_dir.display(),
-        "loaded API definitions from files"
-    );
     let grace = Duration::from_secs(config.shutdown_grace_period_secs);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -115,17 +109,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 Arc::new(MemoryStorage::new())
             }
         };
-        // The storage-backed definition source (ADR-0002): definitions
-        // created through the admin API, merged with the file-loaded set.
-        let storage_defs =
-            g2_storage::load_api_definitions(storage.as_ref(), g2_core::DEFAULT_ORG_ID).await?;
-        tracing::info!(
-            count = storage_defs.len(),
-            "loaded API definitions from storage"
-        );
-        let defs = g2_core::loader::merge_sources(file_defs, storage_defs)?;
-
-        let forwarder = Forwarder::new();
         let spike_guard = config.spike_guard.as_ref().map(|cfg| {
             tracing::info!(
                 capacity = cfg.capacity,
@@ -134,8 +117,28 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             Arc::new(g2_middleware::SpikeGuard::new(cfg))
         });
-        let table = RouteTable::build(defs, &forwarder, &storage, spike_guard.as_ref())?;
-        let gateway = Arc::new(Gateway::new(table));
+        // Both definition sources (files + storage, ADR-0002) are loaded
+        // through the reload context, at startup and on every reload nudge.
+        let reload_ctx = reload::ReloadContext {
+            apps_dir: config.apps_dir.clone(),
+            org_id: g2_core::DEFAULT_ORG_ID.to_owned(),
+            storage: Arc::clone(&storage),
+            forwarder: Forwarder::new(),
+            spike_guard,
+        };
+        let gateway = Arc::new(Gateway::new(reload_ctx.build_table().await?));
+        tracing::info!(apps_dir = %config.apps_dir.display(), "API definitions loaded");
+
+        // Hot reload: `POST /g2/reload` on any pod's admin API broadcasts
+        // a nudge; this task rebuilds and swaps the route table on each.
+        {
+            let gateway = Arc::clone(&gateway);
+            tokio::spawn(async move {
+                if let Err(e) = reload::listen(reload_ctx, gateway).await {
+                    tracing::error!(error = %e, "reload subscription failed; hot reload disabled");
+                }
+            });
+        }
 
         let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
         tracing::info!(

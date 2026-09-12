@@ -38,6 +38,10 @@ pub struct MemoryStorage {
     /// Fixed-period counters for [`Storage::check_quota`]: requests so far
     /// and when the period renews.
     quotas: Arc<RwLock<HashMap<String, QuotaEntry>>>,
+
+    /// Pub/sub fan-out per channel for [`Storage::publish`]/`subscribe`.
+    /// Senders are created lazily on first use of a channel.
+    channels: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<String>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +105,47 @@ impl Storage for MemoryStorage {
             .filter(|(k, e)| k.starts_with(prefix) && !e.is_expired(now))
             .map(|(k, _)| k.clone())
             .collect())
+    }
+
+    async fn publish(&self, channel: &str, payload: &str) -> Result<(), StorageError> {
+        let channels = self.channels.read().await;
+        if let Some(sender) = channels.get(channel) {
+            // A send error just means no live subscribers: fine for
+            // fire-and-forget fan-out.
+            let _ = sender.send(payload.to_owned());
+        }
+        Ok(())
+    }
+
+    async fn subscribe(
+        &self,
+        channel: &str,
+    ) -> Result<tokio::sync::mpsc::Receiver<String>, StorageError> {
+        let mut channels = self.channels.write().await;
+        let sender = channels
+            .entry(channel.to_owned())
+            .or_insert_with(|| tokio::sync::broadcast::channel(32).0);
+        let mut broadcast_rx = sender.subscribe();
+        drop(channels);
+
+        // Adapt broadcast → mpsc so the trait exposes one receiver type.
+        let (tx, rx) = tokio::sync::mpsc::channel(32);
+        tokio::spawn(async move {
+            loop {
+                match broadcast_rx.recv().await {
+                    Ok(msg) => {
+                        if tx.send(msg).await.is_err() {
+                            return; // subscriber dropped its receiver
+                        }
+                    }
+                    // Lagged: older messages were dropped, keep receiving —
+                    // best-effort delivery is the contract.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                }
+            }
+        });
+        Ok(rx)
     }
 
     async fn check_rate(
@@ -248,6 +293,33 @@ mod tests {
             .await
             .expect("scan")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_reaches_every_subscriber_on_the_channel() {
+        let store = MemoryStorage::new();
+        let mut a = store.subscribe("g2:default:channel:reload").await.unwrap();
+        let mut b = store.subscribe("g2:default:channel:reload").await.unwrap();
+        let mut other = store.subscribe("g2:default:channel:other").await.unwrap();
+
+        store
+            .publish("g2:default:channel:reload", "nudge")
+            .await
+            .expect("publish");
+
+        assert_eq!(a.recv().await.as_deref(), Some("nudge"));
+        assert_eq!(b.recv().await.as_deref(), Some("nudge"));
+        // The unrelated channel saw nothing.
+        assert!(other.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn publish_without_subscribers_is_ok() {
+        let store = MemoryStorage::new();
+        store
+            .publish("g2:default:channel:reload", "into the void")
+            .await
+            .expect("publish");
     }
 
     #[tokio::test]

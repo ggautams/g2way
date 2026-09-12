@@ -4,4 +4,5 @@
 //! everything runnable lives here so integration tests can start a real
 //! gateway in-process on an ephemeral port.
 
+pub mod reload;
 pub mod server;
