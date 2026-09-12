@@ -1,15 +1,44 @@
 //! Redis-backed [`Storage`] implementation for multi-pod deployments.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 // `::redis` disambiguates the extern crate from this module (also `redis`).
 use ::redis::aio::ConnectionManager;
+use ::redis::Script;
 
-use crate::{Storage, StorageError};
+use crate::{RateDecision, Storage, StorageError};
 
 fn backend_err(e: ::redis::RedisError) -> StorageError {
     StorageError::Backend(e.to_string())
 }
+
+/// Sliding-window-log rate check, executed atomically inside Redis.
+///
+/// Uses the **Redis server's clock** (`TIME`), so every gateway pod sees
+/// the same window regardless of pod clock skew. The log is a sorted set
+/// scored by milliseconds; `ARGV[3]` makes concurrent members unique.
+/// Returns `{allowed (0|1), remaining, reset_after_ms}`.
+const RATE_SCRIPT: &str = r"
+local t = redis.call('TIME')
+local now = t[1] * 1000 + math.floor(t[2] / 1000)
+local window = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)
+local count = redis.call('ZCARD', KEYS[1])
+local oldest = redis.call('ZRANGE', KEYS[1], 0, 0, 'WITHSCORES')
+local reset = window
+if oldest[2] then
+    reset = tonumber(oldest[2]) + window - now
+    if reset < 0 then reset = 0 end
+end
+if count < limit then
+    redis.call('ZADD', KEYS[1], now, now .. '-' .. ARGV[3])
+    redis.call('PEXPIRE', KEYS[1], window)
+    return {1, limit - count - 1, reset}
+end
+return {0, 0, reset}
+";
 
 /// A [`Storage`] backed by a shared Redis instance.
 ///
@@ -24,12 +53,15 @@ fn backend_err(e: ::redis::RedisError) -> StorageError {
 /// `RedisStorage` is created at startup and cloned wherever needed.
 pub struct RedisStorage {
     conn: ConnectionManager,
+    /// Cached rate-limit script (EVALSHA after the first call).
+    rate_script: Arc<Script>,
 }
 
 impl Clone for RedisStorage {
     fn clone(&self) -> Self {
         Self {
             conn: self.conn.clone(),
+            rate_script: Arc::clone(&self.rate_script),
         }
     }
 }
@@ -54,7 +86,10 @@ impl RedisStorage {
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
         let client = redis::Client::open(url).map_err(backend_err)?;
         let conn = client.get_connection_manager().await.map_err(backend_err)?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            rate_script: Arc::new(Script::new(RATE_SCRIPT)),
+        })
     }
 }
 
@@ -89,6 +124,33 @@ impl Storage for RedisStorage {
             .await
             .map_err(backend_err)?;
         Ok(removed > 0)
+    }
+
+    async fn check_rate(
+        &self,
+        key: &str,
+        limit: u64,
+        window: Duration,
+    ) -> Result<RateDecision, StorageError> {
+        // The script compares against ms; clamp like `set` does for PX.
+        let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+        // Uniquifies members: two requests landing in the same millisecond
+        // must not collapse into one sorted-set entry.
+        let member_suffix: u64 = rand::random();
+        let (allowed, remaining, reset_ms): (u8, u64, u64) = self
+            .rate_script
+            .key(key)
+            .arg(window_ms)
+            .arg(limit)
+            .arg(member_suffix)
+            .invoke_async(&mut self.conn.clone())
+            .await
+            .map_err(backend_err)?;
+        Ok(RateDecision {
+            allowed: allowed == 1,
+            remaining,
+            reset_after: Duration::from_millis(reset_ms),
+        })
     }
 }
 
@@ -174,5 +236,71 @@ mod tests {
         // Parse failure surfaces as Backend without any server involved.
         let err = RedisStorage::connect("not-a-redis-url").await.unwrap_err();
         assert!(matches!(err, StorageError::Backend(_)));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real Redis: `make redis-up`"]
+    async fn rate_burst_fills_then_denies_then_slides() {
+        let store = store().await;
+        let key = test_key("rate-burst");
+        let window = Duration::from_millis(500);
+
+        for expected_remaining in [2, 1, 0] {
+            let d = store.check_rate(&key, 3, window).await.expect("check");
+            assert!(d.allowed);
+            assert_eq!(d.remaining, expected_remaining);
+        }
+        let d = store.check_rate(&key, 3, window).await.expect("denied");
+        assert!(!d.allowed);
+        assert!(
+            d.reset_after <= window && d.reset_after > Duration::ZERO,
+            "reset_after within the window, got {:?}",
+            d.reset_after
+        );
+
+        // After the window slides past the burst, slots free again.
+        tokio::time::sleep(window + Duration::from_millis(100)).await;
+        let d = store.check_rate(&key, 3, window).await.expect("after");
+        assert!(d.allowed);
+        assert_eq!(d.remaining, 2, "all three slots freed");
+        store.delete(&key).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real Redis: `make redis-up`"]
+    async fn rate_check_is_atomic_under_concurrency() {
+        let store = store().await;
+        let key = test_key("rate-atomic");
+        let window = Duration::from_secs(5);
+
+        // 20 concurrent checks against a limit of 5: the Lua script must
+        // admit exactly 5 (this is the multi-pod correctness property —
+        // concurrent EVALs are serialized inside Redis).
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let store = store.clone();
+            let key = key.clone();
+            tasks.spawn(async move { store.check_rate(&key, 5, window).await.expect("check") });
+        }
+        let allowed = tasks
+            .join_all()
+            .await
+            .into_iter()
+            .filter(|d| d.allowed)
+            .count();
+        assert_eq!(allowed, 5);
+        store.delete(&key).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real Redis: `make redis-up`"]
+    async fn rate_zero_limit_denies() {
+        let store = store().await;
+        let key = test_key("rate-zero");
+        let d = store
+            .check_rate(&key, 0, Duration::from_secs(1))
+            .await
+            .expect("check");
+        assert!(!d.allowed);
     }
 }

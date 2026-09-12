@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 async-trait.workspace = true
+rand.workspace = true
 redis.workspace = true
 thiserror.workspace = true
 tokio.workspace = true

@@ -673,6 +673,7 @@ name = "g2-storage"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "rand 0.9.5",
  "redis",
  "thiserror",
  "tokio",

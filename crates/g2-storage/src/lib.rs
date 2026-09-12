@@ -32,6 +32,22 @@ pub enum StorageError {
     Backend(String),
 }
 
+/// The outcome of one sliding-window rate check
+/// ([`Storage::check_rate`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RateDecision {
+    /// Whether the request fit inside the window (and was recorded).
+    pub allowed: bool,
+
+    /// Requests left in the window after this one (`0` when denied).
+    pub remaining: u64,
+
+    /// Time until the window frees the next slot: how long the oldest
+    /// recorded request still counts. The value behind `Retry-After` /
+    /// `X-RateLimit-Reset` headers.
+    pub reset_after: Duration,
+}
+
 /// Shared key-value state used by gateway features across pods.
 ///
 /// Implementations must be cheap to clone or be used behind an `Arc`;
@@ -48,4 +64,20 @@ pub trait Storage: Send + Sync + 'static {
 
     /// Deletes `key`, returning `true` if a live value was present.
     async fn delete(&self, key: &str) -> Result<bool, StorageError>;
+
+    /// Atomically checks (and, when allowed, records) one request against a
+    /// sliding window of at most `limit` requests per `window` at `key`.
+    ///
+    /// Sliding-window-log semantics: each allowed request is remembered
+    /// with its timestamp and counts against the limit until exactly
+    /// `window` has passed — there is no fixed-window boundary burst.
+    /// **Denied requests are not recorded** and never consume a slot.
+    ///
+    /// A `limit` of `0` denies every request.
+    async fn check_rate(
+        &self,
+        key: &str,
+        limit: u64,
+        window: Duration,
+    ) -> Result<RateDecision, StorageError>;
 }

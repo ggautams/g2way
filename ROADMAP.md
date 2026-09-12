@@ -44,7 +44,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 
 ## M3 — Rate limiting & quotas (distributed)
 
-- [ ] Redis sliding-window rate limiter as an atomic Lua script (`redis::Script`), per-key and per-API
+- [x] Redis sliding-window rate limiter as an atomic Lua script (`redis::Script`), per-key and per-API
 - [ ] Quotas: long-period counters with reset timestamps
 - [ ] Local token-bucket spike guard in front of Redis (configurable)
 - [ ] 429 responses with `X-RateLimit-Limit/-Remaining/-Reset` headers
@@ -222,3 +222,17 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   optimization). Verified live end-to-end: POST key → 401/403/passed-auth on
   the proxy → DELETE → 403. Next: M3 Redis sliding-window rate limiter
   (Lua), or revisit deferred `jwks_url` when M7 TLS lands.
+- **2026-08-30 (11)** — M3 sliding-window rate limiter landed as a `Storage`
+  trait method: `check_rate(key, limit, window) -> RateDecision {allowed,
+  remaining, reset_after}` — sliding-window **log** (no boundary bursts),
+  denied requests consume no slot, limit 0 denies all. Redis impl is one
+  atomic `redis::Script` over a sorted set (ZREMRANGEBYSCORE→ZCARD→ZADD→
+  PEXPIRE) that reads the **Redis server clock** (`TIME`) so pods need no
+  clock sync; a random `u64` member suffix keeps same-millisecond requests
+  distinct. Verified against real Redis incl. 20-concurrent-checks-admit-
+  exactly-5 atomicity test. Memory impl mirrors semantics on `tokio::time`
+  (pause/advance in tests). The limiter is a primitive — nothing calls it
+  yet; identity composition (`{key_hash}` vs per-API) and 429s land with
+  the middleware checkbox. Note: `make redis-up` errors if the container
+  already exists from a prior run — harmless, but worth an idempotency fix
+  someday. Next: quota counters (long-period, reset timestamps).
