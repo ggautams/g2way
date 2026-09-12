@@ -54,7 +54,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 
 - [x] API definitions stored in Redis; file loader becomes one of two sources (ADR-0002; policy records follow with the policy model below)
 - [x] Policies: reusable rate/quota/ACL bundles referenced by keys
-- [ ] Admin CRUD for API definitions and policies
+- [x] Admin CRUD for API definitions and policies (`/g2/apis`, `/g2/policies`)
 - [ ] `GET /g2/keys` listing (needs a `Storage::scan`/SCAN operation — deferred from M2 key CRUD)
 - [ ] `POST /g2/reload` + Redis pub/sub broadcast → every pod rebuilds its route table
 - [ ] Dashboard-support API: node info, loaded APIs, health, version, per-API stats snapshot
@@ -328,3 +328,17 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   rate got 429'd at the policy's 2/60 with correct headers. Policy admin
   CRUD is deliberately the next-but-one checkbox (defs CRUD first). Next:
   M4 admin CRUD for API definitions and policies.
+- **2026-08-30 (18)** — M4 admin CRUD for API definitions and policies
+  landed: `/g2/apis` and `/g2/policies` (GET list / POST create /
+  GET/PUT/DELETE by id). Both are one generic
+  handler set (`g2-admin::resources`, `StoredResource` trait supplies key
+  schema + validation) — a third resource kind costs one trait impl. POST
+  of an existing id = 409 (PUT is the overwrite path); PUT body-id ≠
+  path-id = 400; list uses `scan_prefix` and returns full records sorted
+  by id. **Writes do not touch the running route table** (by design):
+  verified live — POST def → listed + in Redis + 409 on dup, 404 on the
+  proxy until a restart picked it up, then 200. Cross-source conflicts
+  (admin def vs file def) surface at load/reload per ADR-0002, not at
+  write time — the reload task should surface that error to the caller.
+  Next: M4 `GET /g2/keys` listing (trivial now with scan_prefix), then
+  `POST /g2/reload` + pub/sub.

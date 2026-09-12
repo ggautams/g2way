@@ -11,12 +11,15 @@
 //! only revealed as `404` to authenticated callers.
 //!
 //! Endpoints: `/g2/health` (liveness, unauthenticated), `/g2/version`
-//! (authenticated) and key CRUD under `/g2/keys` (authenticated; raw keys
+//! (authenticated), key CRUD under `/g2/keys` (authenticated; raw keys
 //! are returned only at creation — storage holds hashes, see
-//! [`g2_core::session::hash_key`]). Definition/policy CRUD and `/g2/reload`
-//! arrive in milestone M4.
+//! [`g2_core::session::hash_key`]), and API definition / policy CRUD under
+//! `/g2/apis` and `/g2/policies` (authenticated; definition changes go
+//! live on reload, not on write). `POST /g2/reload` arrives next in
+//! milestone M4.
 
 mod keys;
+mod resources;
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
@@ -24,7 +27,7 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use g2_core::Error;
+use g2_core::{ApiDefinition, Error, Policy};
 use g2_storage::SharedStorage;
 use sha2::{Digest, Sha256};
 
@@ -84,6 +87,26 @@ pub fn router(admin_secret: &str, storage: SharedStorage) -> Result<Router, Erro
             get(keys::get_key)
                 .put(keys::put_key)
                 .delete(keys::delete_key),
+        )
+        .route(
+            "/g2/apis",
+            get(resources::list::<ApiDefinition>).post(resources::create::<ApiDefinition>),
+        )
+        .route(
+            "/g2/apis/{id}",
+            get(resources::get::<ApiDefinition>)
+                .put(resources::put::<ApiDefinition>)
+                .delete(resources::delete::<ApiDefinition>),
+        )
+        .route(
+            "/g2/policies",
+            get(resources::list::<Policy>).post(resources::create::<Policy>),
+        )
+        .route(
+            "/g2/policies/{id}",
+            get(resources::get::<Policy>)
+                .put(resources::put::<Policy>)
+                .delete(resources::delete::<Policy>),
         )
         .fallback(not_found)
         .layer(middleware::from_fn_with_state(
@@ -242,6 +265,230 @@ mod tests {
         let (status, body) = call("/g2/nope", Some(SECRET)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert!(body.contains("no such admin endpoint"), "body: {body}");
+    }
+
+    mod resources {
+        use g2_core::api_definition::api_definition_storage_key;
+        use g2_core::policy::policy_storage_key;
+        use g2_storage::Storage as _;
+
+        use super::*;
+
+        fn api_json(api_id: &str, listen_path: &str) -> serde_json::Value {
+            serde_json::json!({
+                "api_id": api_id,
+                "name": api_id,
+                "listen_path": listen_path,
+                "target_url": "http://up.internal",
+            })
+        }
+
+        fn policy_json(policy_id: &str) -> serde_json::Value {
+            serde_json::json!({
+                "policy_id": policy_id,
+                "name": policy_id,
+                "rate": { "requests": 10, "per_seconds": 60 },
+            })
+        }
+
+        fn method_request(method: &str, path: &str) -> Request {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header(ADMIN_AUTH_HEADER, SECRET)
+                .body(Body::empty())
+                .expect("request")
+        }
+
+        #[tokio::test]
+        async fn api_create_fetch_list_delete_round_trips() {
+            let storage = MemoryStorage::new();
+
+            let (status, body) = send(
+                test_router(storage.clone()),
+                json_request("POST", "/g2/apis", &api_json("users", "/users/")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "body: {body}");
+            assert!(body.contains("\"action\":\"added\""), "body: {body}");
+
+            // Stored exactly where the definition loader reads it.
+            let stored = storage
+                .get(&api_definition_storage_key(
+                    g2_core::DEFAULT_ORG_ID,
+                    "users",
+                ))
+                .await
+                .expect("get");
+            assert!(stored.is_some());
+
+            let (status, body) = send(
+                test_router(storage.clone()),
+                request("/g2/apis/users", Some(SECRET)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let def: g2_core::ApiDefinition = serde_json::from_str(&body).expect("definition");
+            assert_eq!(def.listen_path, "/users/");
+
+            // List returns the full records sorted by id.
+            send(
+                test_router(storage.clone()),
+                json_request("POST", "/g2/apis", &api_json("admin", "/admin/")),
+            )
+            .await;
+            let (status, body) = send(
+                test_router(storage.clone()),
+                request("/g2/apis", Some(SECRET)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let listed: Vec<g2_core::ApiDefinition> = serde_json::from_str(&body).expect("list");
+            let ids: Vec<_> = listed.iter().map(|d| d.api_id.as_str()).collect();
+            assert_eq!(ids, ["admin", "users"]);
+
+            let (status, body) = send(
+                test_router(storage.clone()),
+                method_request("DELETE", "/g2/apis/users"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("\"action\":\"deleted\""), "body: {body}");
+            let (status, _) = send(
+                test_router(storage),
+                request("/g2/apis/users", Some(SECRET)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn post_of_existing_id_is_409_put_updates() {
+            let storage = MemoryStorage::new();
+            send(
+                test_router(storage.clone()),
+                json_request("POST", "/g2/apis", &api_json("users", "/users/")),
+            )
+            .await;
+
+            let (status, body) = send(
+                test_router(storage.clone()),
+                json_request("POST", "/g2/apis", &api_json("users", "/other/")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+
+            let (status, body) = send(
+                test_router(storage.clone()),
+                json_request("PUT", "/g2/apis/users", &api_json("users", "/other/")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("\"action\":\"modified\""), "body: {body}");
+
+            // PUT of a fresh id reports "added".
+            let (status, body) = send(
+                test_router(storage),
+                json_request("PUT", "/g2/apis/new", &api_json("new", "/new/")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(body.contains("\"action\":\"added\""), "body: {body}");
+        }
+
+        #[tokio::test]
+        async fn put_with_mismatched_body_id_is_400() {
+            let (status, body) = send(
+                test_router(MemoryStorage::new()),
+                json_request("PUT", "/g2/apis/users", &api_json("other", "/users/")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(body.contains("does not match path id"), "body: {body}");
+        }
+
+        #[tokio::test]
+        async fn invalid_bodies_are_400_with_reason() {
+            let (status, body) = send(
+                test_router(MemoryStorage::new()),
+                json_request("POST", "/g2/apis", &api_json("bad", "no-leading-slash")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(body.contains("listen_path"), "body: {body}");
+
+            let mut policy = policy_json("bad");
+            policy["rate"]["requests"] = serde_json::json!(0);
+            let (status, body) = send(
+                test_router(MemoryStorage::new()),
+                json_request("POST", "/g2/policies", &policy),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(body.contains("rate.requests"), "body: {body}");
+        }
+
+        #[tokio::test]
+        async fn policy_crud_round_trips_where_auth_reads_it() {
+            let storage = MemoryStorage::new();
+            let (status, body) = send(
+                test_router(storage.clone()),
+                json_request("POST", "/g2/policies", &policy_json("free-tier")),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "body: {body}");
+
+            // Stored exactly where the auth middleware resolves policies.
+            let stored = storage
+                .get(&policy_storage_key(g2_core::DEFAULT_ORG_ID, "free-tier"))
+                .await
+                .expect("get");
+            assert!(stored.is_some());
+
+            let (status, body) = send(
+                test_router(storage.clone()),
+                request("/g2/policies/free-tier", Some(SECRET)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let policy: g2_core::Policy = serde_json::from_str(&body).expect("policy");
+            assert_eq!(policy.rate.expect("rate").requests, 10);
+
+            let (status, _) = send(
+                test_router(storage.clone()),
+                method_request("DELETE", "/g2/policies/free-tier"),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            let (status, _) = send(
+                test_router(storage),
+                request("/g2/policies/free-tier", Some(SECRET)),
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND);
+        }
+
+        #[tokio::test]
+        async fn empty_collections_list_as_empty_arrays() {
+            for path in ["/g2/apis", "/g2/policies"] {
+                let (status, body) = send(
+                    test_router(MemoryStorage::new()),
+                    request(path, Some(SECRET)),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK, "path: {path}");
+                assert_eq!(body, "[]", "path: {path}");
+            }
+        }
+
+        #[tokio::test]
+        async fn resource_routes_require_the_admin_secret() {
+            for path in ["/g2/apis", "/g2/policies", "/g2/apis/x", "/g2/policies/x"] {
+                let (status, _) =
+                    send(test_router(MemoryStorage::new()), request(path, None)).await;
+                assert_eq!(status, StatusCode::FORBIDDEN, "path: {path}");
+            }
+        }
     }
 
     mod keys {
