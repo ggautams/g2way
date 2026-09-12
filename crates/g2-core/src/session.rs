@@ -128,6 +128,16 @@ pub struct KeySession {
     /// basic auth.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basic_auth: Option<BasicAuthData>,
+
+    /// Policies applied to this key (see [`crate::Policy`]). When
+    /// non-empty, the referenced policy's rate/quota/access **replace**
+    /// this session's own at auth time ([`Self::apply_policy`]).
+    ///
+    /// A `Vec` for forward compatibility, but currently at most one entry
+    /// (enforced by [`Self::validate`]); combining multiple policies needs
+    /// partitioned policies, a later refinement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub apply_policies: Vec<String>,
 }
 
 impl Default for KeySession {
@@ -143,6 +153,7 @@ impl Default for KeySession {
             active: true,
             access: BTreeMap::new(),
             basic_auth: None,
+            apply_policies: Vec::new(),
         }
     }
 }
@@ -188,7 +199,29 @@ impl KeySession {
                 return Err(fail("`basic_auth.password_hash` must not be empty"));
             }
         }
+        if self.apply_policies.len() > 1 {
+            return Err(fail(
+                "`apply_policies` currently supports at most one policy \
+                 (combining policies needs partitioned policies, not yet implemented)",
+            ));
+        }
+        if self.apply_policies.iter().any(|p| p.trim().is_empty()) {
+            return Err(fail("`apply_policies` entries must not be empty"));
+        }
         Ok(())
+    }
+
+    /// Replaces this session's rate, quota, and access with `policy`'s
+    /// (non-partitioned policy semantics).
+    ///
+    /// Per-key state — `expires_at`, `active`, `alias`, `basic_auth`,
+    /// `org_id` — is deliberately untouched: a policy shapes what a key may
+    /// do, not whether the key itself is alive. Callers are responsible for
+    /// rejecting inactive policies and org mismatches before applying.
+    pub fn apply_policy(&mut self, policy: &crate::Policy) {
+        self.rate = policy.rate;
+        self.quota = policy.quota;
+        self.access = policy.access.clone();
     }
 
     /// Whether the session has expired as of `now_unix_secs`.
@@ -287,6 +320,7 @@ mod tests {
             basic_auth: Some(BasicAuthData {
                 password_hash: "$2b$12$abcdefghijklmnopqrstuv".into(),
             }),
+            apply_policies: vec!["free-tier".into()],
         };
         session.validate().expect("full session is valid");
         let json = serde_json::to_string(&session).expect("serializes");
@@ -297,12 +331,77 @@ mod tests {
     #[test]
     fn unlimited_fields_are_omitted_from_json() {
         let json = serde_json::to_string(&KeySession::default()).expect("serializes");
-        for absent in ["alias", "rate", "quota", "expires_at", "basic_auth"] {
+        for absent in [
+            "alias",
+            "rate",
+            "quota",
+            "expires_at",
+            "basic_auth",
+            "apply_policies",
+        ] {
             assert!(
                 !json.contains(absent),
                 "`{absent}` should be omitted: {json}"
             );
         }
+    }
+
+    #[test]
+    fn policy_reference_rules() {
+        let mut session = KeySession {
+            apply_policies: vec!["free-tier".into()],
+            ..KeySession::default()
+        };
+        session.validate().expect("one policy reference is valid");
+
+        session.apply_policies = vec!["a".into(), "b".into()];
+        let err = session.validate().unwrap_err();
+        assert!(err.to_string().contains("at most one"), "got: {err}");
+
+        session.apply_policies = vec!["  ".into()];
+        assert!(session.validate().is_err(), "blank policy id rejected");
+    }
+
+    #[test]
+    fn apply_policy_replaces_allowances_and_preserves_key_state() {
+        let mut session = KeySession {
+            alias: Some("mobile".into()),
+            rate: Some(RateLimit {
+                requests: 1,
+                per_seconds: 1,
+            }),
+            quota: None,
+            expires_at: Some(1_790_000_000),
+            active: true,
+            access: BTreeMap::from([("old-api".to_owned(), ApiAccess::default())]),
+            apply_policies: vec!["gold".into()],
+            ..KeySession::default()
+        };
+        let policy = crate::Policy {
+            policy_id: "gold".into(),
+            name: "Gold".into(),
+            org_id: DEFAULT_ORG_ID.into(),
+            active: true,
+            rate: Some(RateLimit {
+                requests: 100,
+                per_seconds: 60,
+            }),
+            quota: Some(Quota {
+                max: 10_000,
+                renewal_rate_secs: 86_400,
+            }),
+            access: BTreeMap::from([("new-api".to_owned(), ApiAccess::default())]),
+        };
+
+        session.apply_policy(&policy);
+
+        assert_eq!(session.rate, policy.rate);
+        assert_eq!(session.quota, policy.quota);
+        assert!(session.allows_api("new-api") && !session.allows_api("old-api"));
+        // Per-key state untouched.
+        assert_eq!(session.alias.as_deref(), Some("mobile"));
+        assert_eq!(session.expires_at, Some(1_790_000_000));
+        assert!(session.active);
     }
 
     #[test]

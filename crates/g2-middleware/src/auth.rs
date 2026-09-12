@@ -19,6 +19,12 @@
 //!   (bcrypt costs ~100ms by design); per-user verification caching is a
 //!   possible later optimization, deliberately not built yet.
 //!
+//! Stored sessions referencing a policy (`apply_policies`) get the
+//! policy's rate/quota/access applied before the access check — one extra
+//! storage `GET`, only for keys that reference one. (A session/policy
+//! read-through cache is a possible later optimization, deliberately not
+//! built yet.)
+//!
 //! Either way a live session is stamped onto the request as a
 //! [`SessionContext`] extension for downstream layers; anything else is
 //! rejected before the request reaches the upstream.
@@ -33,14 +39,16 @@
 //!   scheme, bad base64/UTF-8, no `:`, empty username) and carries a
 //!   `WWW-Authenticate: Basic realm="…"` challenge.
 //! - `403` — token unknown or fails verification, wrong password, session
-//!   inactive/expired, or the session does not grant this API. One message
-//!   for all of these: which one it was must not leak to the caller
-//!   (details are logged). Unknown basic-auth users still cost one bcrypt
-//!   verify (against a dummy hash) so response timing does not reveal
-//!   whether a username exists.
+//!   inactive/expired, the session does not grant this API, or its policy
+//!   is missing or inactive. One message for all of these: which one it
+//!   was must not leak to the caller (details are logged). Unknown
+//!   basic-auth users still cost one bcrypt verify (against a dummy hash)
+//!   so response timing does not reveal whether a username exists.
 //! - `503` — the storage backend errored; the request may be retried.
-//! - `500` — the stored session record is not valid JSON or its stored
-//!   bcrypt hash is malformed (operational bugs, logged loudly).
+//! - `500` — the stored session or policy record is corrupt (not valid
+//!   JSON, disagrees with its storage key, references multiple policies)
+//!   or a stored bcrypt hash is malformed (operational bugs, logged
+//!   loudly).
 
 use std::convert::Infallible;
 use std::future::Future;
@@ -50,8 +58,9 @@ use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use g2_core::policy::policy_storage_key;
 use g2_core::session::{hash_key, session_storage_key};
-use g2_core::{AuthConfig, Error, JwtSigningMethod, KeySession};
+use g2_core::{AuthConfig, Error, JwtSigningMethod, KeySession, Policy};
 use g2_storage::SharedStorage;
 use http::header::{HeaderName, HeaderValue};
 use http::{header, Request, Response, StatusCode};
@@ -384,18 +393,23 @@ async fn authenticate_basic(
         )
     })?;
 
-    match session {
-        Some(session)
-            if password_matches
-                && session.basic_auth.is_some()
-                && session.active
-                && !session.is_expired(unix_now_secs())
-                && session.allows_api(&state.api_id) =>
-        {
-            Ok(SessionContext::new(session, key_hash))
-        }
-        _ => Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG)),
+    let Some(session) = session else {
+        return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+    };
+    if !(password_matches
+        && session.basic_auth.is_some()
+        && session.active
+        && !session.is_expired(unix_now_secs()))
+    {
+        return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
     }
+    // Policy resolution must precede the access check: the policy's ACL
+    // replaces the session's own.
+    let session = resolve_policy(state, storage, session).await?;
+    if !session.allows_api(&state.api_id) {
+        return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+    }
+    Ok(SessionContext::new(session, key_hash))
 }
 
 /// `auth_token` mode: hash the token and resolve the stored [`KeySession`].
@@ -426,11 +440,87 @@ async fn authenticate_stored_token(
         )
     })?;
 
-    if !session.active || session.is_expired(unix_now_secs()) || !session.allows_api(&state.api_id)
-    {
+    if !session.active || session.is_expired(unix_now_secs()) {
+        return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+    }
+    // Policy resolution must precede the access check: the policy's ACL
+    // replaces the session's own. Dead keys were rejected above without
+    // paying for the policy lookup.
+    let session = resolve_policy(state, storage, session).await?;
+    if !session.allows_api(&state.api_id) {
         return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
     }
     Ok(SessionContext::new(session, key_hash))
+}
+
+/// Applies the session's referenced policy, if any (see
+/// [`KeySession::apply_policies`] and [`Policy`]): fetches it from storage
+/// and replaces the session's rate/quota/access with the policy's.
+///
+/// Rejections mirror the session-lookup contract: a key referencing a
+/// missing or inactive policy gets the standard no-oracle 403 (details are
+/// logged — both are operator states, a kill switch or a dangling
+/// reference); a corrupt or misfiled policy record is a 500; storage
+/// failure is a 503.
+async fn resolve_policy(
+    state: &AuthState,
+    storage: &SharedStorage,
+    mut session: KeySession,
+) -> Result<KeySession, Response<ProxyBody>> {
+    // Sessions are validated to at most one policy on write; a stored
+    // record violating that is treated like any other corrupt record.
+    let policy_id = match session.apply_policies.as_slice() {
+        [] => return Ok(session),
+        [policy_id] => policy_id,
+        more => {
+            tracing::error!(
+                api_id = %state.api_id,
+                count = more.len(),
+                "stored key session references multiple policies (unsupported)"
+            );
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "malformed key session record",
+            ));
+        }
+    };
+
+    let storage_key = policy_storage_key(&session.org_id, policy_id);
+    let record = storage.get(&storage_key).await.map_err(|e| {
+        tracing::error!(api_id = %state.api_id, error = %e, "policy storage lookup failed");
+        json_error(StatusCode::SERVICE_UNAVAILABLE, "key storage unavailable")
+    })?;
+    let Some(record) = record else {
+        tracing::error!(
+            api_id = %state.api_id,
+            policy_id,
+            "key session references a policy that does not exist"
+        );
+        return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+    };
+    let policy: Policy = serde_json::from_str(&record).map_err(|e| {
+        tracing::error!(policy_id, error = %e, "stored policy is not valid JSON");
+        json_error(StatusCode::INTERNAL_SERVER_ERROR, "malformed policy record")
+    })?;
+    if policy.org_id != session.org_id || policy.policy_id != *policy_id {
+        tracing::error!(
+            policy_id,
+            record_policy_id = %policy.policy_id,
+            record_org_id = %policy.org_id,
+            "stored policy record does not match its storage key"
+        );
+        return Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "malformed policy record",
+        ));
+    }
+    if !policy.active {
+        tracing::debug!(api_id = %state.api_id, policy_id, "policy is inactive; rejecting key");
+        return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+    }
+
+    session.apply_policy(&policy);
+    Ok(session)
 }
 
 /// `jwt` mode: verify the token and synthesize an ephemeral session from
@@ -607,6 +697,14 @@ mod tests {
             "x-echo-alias",
             http::HeaderValue::from_str(&alias).expect("alias"),
         );
+        // Lets policy tests observe the effective (post-policy) rate.
+        if let Some(rate) = &ctx.session().rate {
+            resp.headers_mut().insert(
+                "x-echo-rate",
+                http::HeaderValue::from_str(&format!("{}/{}", rate.requests, rate.per_seconds))
+                    .expect("rate"),
+            );
+        }
         Ok(resp)
     }
 
@@ -774,6 +872,208 @@ mod tests {
             .await
             .expect("infallible");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    mod policy {
+        use g2_core::session::RateLimit;
+
+        use super::*;
+
+        async fn seed_policy(storage: &MemoryStorage, policy: &Policy) {
+            storage
+                .set(
+                    &policy_storage_key(&policy.org_id, &policy.policy_id),
+                    &serde_json::to_string(policy).expect("json"),
+                    None,
+                )
+                .await
+                .expect("seed policy");
+        }
+
+        fn policy(policy_id: &str, access_api: Option<&str>) -> Policy {
+            Policy {
+                policy_id: policy_id.into(),
+                name: policy_id.into(),
+                org_id: ORG.into(),
+                active: true,
+                rate: Some(RateLimit {
+                    requests: 100,
+                    per_seconds: 60,
+                }),
+                quota: None,
+                access: access_api
+                    .map(|api| [(api.to_owned(), Default::default())].into())
+                    .unwrap_or_default(),
+            }
+        }
+
+        fn session_with_policy(policy_id: &str) -> KeySession {
+            KeySession {
+                // Deliberately restrictive on their own: the policy must
+                // replace both.
+                rate: Some(RateLimit {
+                    requests: 1,
+                    per_seconds: 1,
+                }),
+                access: [("some-other-api".to_owned(), Default::default())].into(),
+                apply_policies: vec![policy_id.into()],
+                ..KeySession::default()
+            }
+        }
+
+        async fn call(storage: MemoryStorage, token: &str) -> Response<ProxyBody> {
+            let mut req = request("/x");
+            req.headers_mut()
+                .insert("authorization", token.parse().expect("value"));
+            service(&token_cfg(None, None), storage)
+                .oneshot(req)
+                .await
+                .expect("infallible")
+        }
+
+        #[tokio::test]
+        async fn policy_replaces_session_access_and_rate() {
+            let storage = MemoryStorage::new();
+            seed(&storage, "k", &session_with_policy("gold")).await;
+            // The session's own ACL does not grant this API; the policy's
+            // does — and its rate must win too.
+            seed_policy(&storage, &policy("gold", Some(API))).await;
+
+            let resp = call(storage, "k").await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("x-echo-rate").expect("rate").as_bytes(),
+                b"100/60"
+            );
+        }
+
+        #[tokio::test]
+        async fn policy_can_revoke_access_the_session_would_have_had() {
+            let storage = MemoryStorage::new();
+            // Session with an empty ACL (= every API) but a policy scoped
+            // to a different API: the policy's ACL replaces, so 403.
+            let session = KeySession {
+                apply_policies: vec!["scoped".into()],
+                ..KeySession::default()
+            };
+            seed(&storage, "k", &session).await;
+            seed_policy(&storage, &policy("scoped", Some("not-this-api"))).await;
+
+            let resp = call(storage, "k").await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn missing_and_inactive_policies_are_403() {
+            let storage = MemoryStorage::new();
+            seed(&storage, "dangling", &session_with_policy("nonexistent")).await;
+
+            seed(&storage, "killed", &session_with_policy("off")).await;
+            let mut off = policy("off", Some(API));
+            off.active = false;
+            seed_policy(&storage, &off).await;
+
+            for token in ["dangling", "killed"] {
+                let resp = call(storage.clone(), token).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "token `{token}`");
+            }
+        }
+
+        #[tokio::test]
+        async fn corrupt_and_misfiled_policy_records_are_500() {
+            let storage = MemoryStorage::new();
+            seed(&storage, "corrupt", &session_with_policy("broken")).await;
+            storage
+                .set(&policy_storage_key(ORG, "broken"), "not json", None)
+                .await
+                .expect("seed");
+
+            seed(&storage, "misfiled", &session_with_policy("claimed")).await;
+            // A valid policy stored under a key naming a different policy_id.
+            seed_policy(
+                &storage,
+                &Policy {
+                    policy_id: "claimed".into(),
+                    ..policy("actual", Some(API))
+                },
+            )
+            .await;
+            // seed_policy keys by the record's own id; re-file it under the
+            // referenced id with a mismatched body.
+            let record = storage
+                .get(&policy_storage_key(ORG, "claimed"))
+                .await
+                .expect("get")
+                .expect("seeded");
+            let record = record.replace("\"claimed\"", "\"actual\"");
+            storage
+                .set(&policy_storage_key(ORG, "claimed"), &record, None)
+                .await
+                .expect("re-file");
+
+            for token in ["corrupt", "misfiled"] {
+                let resp = call(storage.clone(), token).await;
+                assert_eq!(
+                    resp.status(),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "token `{token}`"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn stored_session_with_multiple_policies_is_500() {
+            let storage = MemoryStorage::new();
+            // Bypasses validate() the way a hand-written record could.
+            let session = KeySession {
+                apply_policies: vec!["a".into(), "b".into()],
+                ..KeySession::default()
+            };
+            seed(&storage, "multi", &session).await;
+
+            let resp = call(storage, "multi").await;
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        #[tokio::test]
+        async fn basic_auth_sessions_resolve_policies_too() {
+            use g2_core::BasicAuthData;
+
+            let storage = MemoryStorage::new();
+            let session = KeySession {
+                basic_auth: Some(BasicAuthData {
+                    password_hash: bcrypt::hash("pw", 4).expect("hash"),
+                }),
+                access: [("some-other-api".to_owned(), Default::default())].into(),
+                apply_policies: vec!["gold".into()],
+                ..KeySession::default()
+            };
+            let key = session_storage_key(ORG, &hash_key("basic:alice"));
+            storage
+                .set(&key, &serde_json::to_string(&session).expect("json"), None)
+                .await
+                .expect("seed");
+            seed_policy(&storage, &policy("gold", Some(API))).await;
+
+            let cfg = AuthConfig::BasicAuth {
+                realm: "g2way".into(),
+            };
+            let mut req = request("/x");
+            let encoded = base64::engine::general_purpose::STANDARD.encode("alice:pw");
+            req.headers_mut().insert(
+                "authorization",
+                format!("Basic {encoded}").parse().expect("value"),
+            );
+            let resp = service(&cfg, storage)
+                .oneshot(req)
+                .await
+                .expect("infallible");
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("x-echo-rate").expect("rate").as_bytes(),
+                b"100/60"
+            );
+        }
     }
 
     mod jwt {

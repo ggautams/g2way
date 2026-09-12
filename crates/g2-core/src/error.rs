@@ -22,6 +22,15 @@ pub enum Error {
         reason: String,
     },
 
+    /// A policy failed semantic validation.
+    #[error("invalid policy `{policy}`: {reason}")]
+    InvalidPolicy {
+        /// The `policy_id` of the offending policy.
+        policy: String,
+        /// Human-readable description of what is wrong.
+        reason: String,
+    },
+
     /// The process-level gateway configuration is invalid.
     #[error("invalid gateway config: {reason}")]
     InvalidGatewayConfig {

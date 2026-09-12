@@ -53,7 +53,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 ## M4 — Control plane & hot reload
 
 - [x] API definitions stored in Redis; file loader becomes one of two sources (ADR-0002; policy records follow with the policy model below)
-- [ ] Policies: reusable rate/quota/ACL bundles referenced by keys
+- [x] Policies: reusable rate/quota/ACL bundles referenced by keys
 - [ ] Admin CRUD for API definitions and policies
 - [ ] `GET /g2/keys` listing (needs a `Storage::scan`/SCAN operation — deferred from M2 key CRUD)
 - [ ] `POST /g2/reload` + Redis pub/sub broadcast → every pod rebuilds its route table
@@ -309,3 +309,22 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   `make redis-up` is now idempotent (`docker start ||` fallback — the
   session-11 nit). Note: nothing writes defs to Redis yet; admin CRUD is
   two checkboxes away. Next: M4 policies (rate/quota/ACL bundles).
+- **2026-08-30 (17)** — M4 policies landed. `Policy` (g2-core::policy):
+  policy_id/name/org_id/active/rate/quota/access, JSON at
+  `g2:{org}:policy:{id}`. `KeySession.apply_policies: Vec<String>` (a list
+  for forward compatibility; old records deserialize) — **validate() caps
+  it at one** because combining needs partitioned policies (a later
+  refinement if wanted). Semantics: non-partitioned — the policy's
+  rate/quota/access **replace** the session's wholesale
+  (`KeySession::apply_policy`); expires_at/active/alias/basic_auth stay
+  per-key. Auth middleware resolves the policy after per-key active/expiry
+  checks but **before** `allows_api` (the policy ACL can grant *or* revoke):
+  missing or inactive policy → no-oracle 403 (logged; inactive = tier kill
+  switch, verified live), corrupt/misfiled/multi-policy record → 500,
+  storage error → 503. One extra storage GET per request only for keys
+  referencing a policy; a session/policy read-through cache is a noted
+  future optimization. JWT sessions are ephemeral and never carry policies.
+  Verified live on Redis: key with `apply_policies:["free"]` and no own
+  rate got 429'd at the policy's 2/60 with correct headers. Policy admin
+  CRUD is deliberately the next-but-one checkbox (defs CRUD first). Next:
+  M4 admin CRUD for API definitions and policies.

@@ -9,6 +9,8 @@
 //! - [`KeySession`] — the state attached to one API key: org, per-API
 //!   access, rate/quota allowances, expiry (keys are stored hashed; see
 //!   [`session::hash_key`]).
+//! - [`Policy`] — a reusable rate/quota/ACL bundle; keys referencing one
+//!   inherit its allowances instead of carrying their own.
 //! - [`Error`] — the shared error type for configuration and validation
 //!   failures.
 //!
@@ -22,9 +24,11 @@ pub mod api_definition;
 pub mod config;
 mod error;
 pub mod loader;
+pub mod policy;
 pub mod session;
 
 pub use api_definition::{ApiDefinition, AuthConfig, JwtSigningMethod, DEFAULT_ORG_ID};
 pub use config::{GatewayConfig, SpikeGuardConfig};
 pub use error::Error;
+pub use policy::Policy;
 pub use session::{BasicAuthData, KeySession};
