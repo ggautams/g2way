@@ -12,6 +12,7 @@ use std::time::Duration;
 use clap::Parser;
 use g2_core::GatewayConfig;
 use g2_proxy::{Forwarder, Gateway, RouteTable};
+use g2_storage::{MemoryStorage, RedisStorage, SharedStorage};
 use g2_telemetry::LogFormat;
 use g2way::server;
 
@@ -30,6 +31,11 @@ struct Cli {
     /// Directory containing API definition files (overrides the config file).
     #[arg(long, env = "G2_APPS_DIR")]
     apps_dir: Option<PathBuf>,
+
+    /// Redis URL for shared key/counter storage (overrides the config file).
+    /// Without one, storage is in-memory: per-pod and lost on restart.
+    #[arg(long, env = "G2_REDIS_URL")]
+    redis_url: Option<String>,
 
     /// Log output format: `json` (default) or `pretty`.
     #[arg(long, env = "G2_LOG_FORMAT", default_value = "json")]
@@ -61,6 +67,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(apps_dir) = cli.apps_dir {
         config.apps_dir = apps_dir;
     }
+    if let Some(redis_url) = cli.redis_url {
+        config.redis_url = Some(redis_url);
+    }
 
     let defs = g2_core::loader::load_dir(&config.apps_dir)?;
     tracing::info!(
@@ -68,15 +77,30 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         apps_dir = %config.apps_dir.display(),
         "loaded API definitions"
     );
-    let forwarder = Forwarder::new();
-    let table = RouteTable::build(defs, &forwarder)?;
-    let gateway = Arc::new(Gateway::new(table));
     let grace = Duration::from_secs(config.shutdown_grace_period_secs);
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
     runtime.block_on(async {
+        let storage: SharedStorage = match &config.redis_url {
+            Some(url) => {
+                let storage = RedisStorage::connect(url).await?;
+                tracing::info!("connected to Redis storage");
+                Arc::new(storage)
+            }
+            None => {
+                tracing::warn!(
+                    "no redis_url configured: using in-memory storage \
+                     (API keys are per-process and lost on restart)"
+                );
+                Arc::new(MemoryStorage::new())
+            }
+        };
+        let forwarder = Forwarder::new();
+        let table = RouteTable::build(defs, &forwarder, &storage)?;
+        let gateway = Arc::new(Gateway::new(table));
+
         let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
         tracing::info!(
             listen_addr = %config.listen_addr,
@@ -84,7 +108,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             version = env!("CARGO_PKG_VERSION"),
             "g2way listening"
         );
-        server::serve(listener, gateway, server::shutdown_signal(), grace).await
+        server::serve(listener, gateway, server::shutdown_signal(), grace).await?;
+        Ok::<(), Box<dyn std::error::Error>>(())
     })?;
     tracing::info!("g2way stopped");
     Ok(())

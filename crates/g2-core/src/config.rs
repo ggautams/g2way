@@ -31,6 +31,12 @@ pub struct GatewayConfig {
 
     /// Grace period in seconds to let in-flight requests finish on shutdown.
     pub shutdown_grace_period_secs: u64,
+
+    /// Redis connection URL (e.g. `redis://redis.g2way.svc:6379/`). When
+    /// unset, the gateway falls back to process-local in-memory storage:
+    /// fine for keyless dev runs, but API keys are then neither shared
+    /// across pods nor persisted.
+    pub redis_url: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -39,6 +45,7 @@ impl Default for GatewayConfig {
             listen_addr: default_listen_addr(),
             apps_dir: default_apps_dir(),
             shutdown_grace_period_secs: 30,
+            redis_url: None,
         }
     }
 }

@@ -367,11 +367,15 @@ name = "g2-middleware"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "g2-core",
+ "g2-storage",
  "http",
  "http-body",
  "http-body-util",
+ "serde_json",
  "tokio",
  "tower",
+ "tracing",
 ]
 
 [[package]]
@@ -382,6 +386,7 @@ dependencies = [
  "bytes",
  "g2-core",
  "g2-middleware",
+ "g2-storage",
  "http",
  "http-body-util",
  "hyper",
@@ -420,6 +425,7 @@ dependencies = [
  "clap",
  "g2-core",
  "g2-proxy",
+ "g2-storage",
  "g2-telemetry",
  "http",
  "http-body-util",

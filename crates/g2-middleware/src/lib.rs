@@ -13,19 +13,23 @@
 //! contract holds end to end.
 //!
 //! Layers communicate through request extensions: [`SetContextLayer`] stamps
-//! the per-API [`RequestContext`] outermost, and downstream layers (like
-//! [`ApiIdHeaderLayer`]) read it back.
+//! the per-API [`RequestContext`] outermost, [`AuthLayer`] adds the resolved
+//! [`SessionContext`], and downstream layers (like [`ApiIdHeaderLayer`])
+//! read them back.
 
 pub mod api_id_header;
+pub mod auth;
 pub mod body;
 pub mod chain;
 pub mod context;
+pub mod response;
 pub mod set_context;
 
 pub use api_id_header::{ApiIdHeader, ApiIdHeaderLayer, API_ID_HEADER};
+pub use auth::{Auth, AuthLayer};
 pub use body::ProxyBody;
 pub use chain::ChainBuilder;
-pub use context::{ClientAddr, RequestContext};
+pub use context::{ClientAddr, RequestContext, SessionContext};
 pub use set_context::{SetContext, SetContextLayer};
 
 /// Boxed error type used for proxied body streams.

@@ -37,6 +37,40 @@ impl RequestContext {
     }
 }
 
+/// The authenticated key session of a request.
+///
+/// Inserted into request extensions by the auth layer after a credential
+/// resolves to a live [`KeySession`](g2_core::KeySession); downstream layers (rate limiting,
+/// quotas, analytics) read it back. Keyless APIs carry no `SessionContext`.
+#[derive(Debug, Clone)]
+pub struct SessionContext {
+    session: Arc<g2_core::KeySession>,
+    key_hash: Arc<str>,
+}
+
+impl SessionContext {
+    /// Wraps a resolved session and the (hashed) key it was looked up under.
+    #[must_use]
+    pub fn new(session: g2_core::KeySession, key_hash: impl Into<Arc<str>>) -> Self {
+        Self {
+            session: Arc::new(session),
+            key_hash: key_hash.into(),
+        }
+    }
+
+    /// The resolved key session.
+    #[must_use]
+    pub fn session(&self) -> &g2_core::KeySession {
+        &self.session
+    }
+
+    /// SHA-256 hex digest identifying the key (never the raw credential).
+    #[must_use]
+    pub fn key_hash(&self) -> &str {
+        &self.key_hash
+    }
+}
+
 /// The remote (client) socket address of a request.
 ///
 /// Inserted into request extensions by the gateway before the chain runs,

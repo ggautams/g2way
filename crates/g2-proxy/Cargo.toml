@@ -10,6 +10,7 @@ rust-version.workspace = true
 [dependencies]
 g2-core.workspace = true
 g2-middleware.workspace = true
+g2-storage.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true
 http.workspace = true

@@ -49,10 +49,13 @@ async fn spawn_echo_upstream() -> SocketAddr {
     addr
 }
 
-/// Starts a full g2way server for `defs`; returns its address and a shutdown
-/// trigger.
-async fn spawn_gateway(defs: Vec<ApiDefinition>) -> (SocketAddr, oneshot::Sender<()>) {
-    let table = RouteTable::build(defs, &Forwarder::new()).expect("route table");
+/// Starts a full g2way server for `defs` backed by `storage`; returns its
+/// address and a shutdown trigger.
+async fn spawn_gateway_with_storage(
+    defs: Vec<ApiDefinition>,
+    storage: g2_storage::SharedStorage,
+) -> (SocketAddr, oneshot::Sender<()>) {
+    let table = RouteTable::build(defs, &Forwarder::new(), &storage).expect("route table");
     let gateway = Arc::new(Gateway::new(table));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
@@ -74,9 +77,16 @@ async fn spawn_gateway(defs: Vec<ApiDefinition>) -> (SocketAddr, oneshot::Sender
     (addr, tx)
 }
 
+/// Starts a full g2way server for `defs`; returns its address and a shutdown
+/// trigger.
+async fn spawn_gateway(defs: Vec<ApiDefinition>) -> (SocketAddr, oneshot::Sender<()>) {
+    spawn_gateway_with_storage(defs, Arc::new(g2_storage::MemoryStorage::new())).await
+}
+
+/// A keyless definition: these tests exercise proxying, not auth.
 fn api(listen_path: &str, target: &str) -> ApiDefinition {
     serde_json::from_str::<ApiDefinition>(&format!(
-        r#"{{"api_id":"e2e","name":"e2e","listen_path":"{listen_path}","target_url":"{target}"}}"#
+        r#"{{"api_id":"e2e","name":"e2e","listen_path":"{listen_path}","target_url":"{target}","auth":{{"mode":"keyless"}}}}"#
     ))
     .expect("definition")
 }
@@ -145,6 +155,43 @@ async fn serves_health_and_404_end_to_end() {
     let (status, body) = http_get(&format!("http://{gw}/unrouted")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body.contains("no API found"), "body: {body}");
+}
+
+#[tokio::test]
+async fn token_auth_end_to_end() {
+    use g2_core::session::{hash_key, session_storage_key};
+
+    let upstream = spawn_echo_upstream().await;
+    let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+    storage
+        .set(
+            &session_storage_key("default", &hash_key("e2e-key")),
+            &serde_json::to_string(&g2_core::KeySession::default()).expect("json"),
+            None,
+        )
+        .await
+        .expect("seed key");
+
+    // Default auth mode: token on the Authorization header.
+    let def = serde_json::from_str::<ApiDefinition>(&format!(
+        r#"{{"api_id":"sec","name":"sec","listen_path":"/sec/","target_url":"http://{upstream}"}}"#
+    ))
+    .expect("definition");
+    let (gw, _stop) = spawn_gateway_with_storage(vec![def], storage).await;
+
+    // No credential → 401 JSON error.
+    let (status, body) = http_get(&format!("http://{gw}/sec/x")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(body.contains("authorization field missing"), "body: {body}");
+
+    // Valid bearer token → proxied.
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::get(format!("http://{gw}/sec/x"))
+        .header("authorization", "Bearer e2e-key")
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let resp = client.request(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]

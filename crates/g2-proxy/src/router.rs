@@ -4,7 +4,8 @@
 use std::sync::Arc;
 
 use g2_core::{ApiDefinition, Error};
-use g2_middleware::{ChainBuilder, ChainService, RequestContext};
+use g2_middleware::{AuthLayer, ChainBuilder, ChainService, RequestContext};
+use g2_storage::SharedStorage;
 
 use crate::forward::{Forward, Forwarder, UpstreamTarget};
 
@@ -36,10 +37,18 @@ impl std::fmt::Debug for Route {
 }
 
 impl Route {
-    fn build(def: ApiDefinition, forwarder: &Forwarder) -> Result<Self, Error> {
+    fn build(
+        def: ApiDefinition,
+        forwarder: &Forwarder,
+        storage: &SharedStorage,
+    ) -> Result<Self, Error> {
         let target = Arc::new(UpstreamTarget::build(&def)?);
         let ctx = RequestContext::new(def.api_id.clone(), def.org_id.clone());
-        let chain = ChainBuilder::new(ctx).build(Forward::new(forwarder, Arc::clone(&target)));
+        let auth =
+            AuthLayer::from_config(&def.auth, Arc::clone(storage), &def.api_id, &def.org_id)?;
+        let chain = ChainBuilder::new(ctx)
+            .auth(auth)
+            .build(Forward::new(forwarder, Arc::clone(&target)));
         Ok(Self {
             listen_prefix: target.listen_prefix.clone(),
             def,
@@ -78,18 +87,23 @@ pub struct RouteTable {
 impl RouteTable {
     /// Builds a table from definitions, skipping inactive ones. Each route's
     /// middleware chain is composed here, around a forwarding service using
-    /// `forwarder`'s shared client.
+    /// `forwarder`'s shared client; token-auth APIs look sessions up in
+    /// `storage`.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidApiDefinition`] if any definition (active or
     /// not) fails validation — a broken definition should fail loudly at load
     /// time, not silently at request time.
-    pub fn build(defs: Vec<ApiDefinition>, forwarder: &Forwarder) -> Result<Self, Error> {
+    pub fn build(
+        defs: Vec<ApiDefinition>,
+        forwarder: &Forwarder,
+        storage: &SharedStorage,
+    ) -> Result<Self, Error> {
         let mut routes = Vec::with_capacity(defs.len());
         for def in defs {
             let active = def.active;
-            let route = Route::build(def, forwarder)?;
+            let route = Route::build(def, forwarder, storage)?;
             if active {
                 routes.push(Arc::new(route));
             } else {
@@ -124,13 +138,14 @@ mod tests {
 
     fn def(api_id: &str, listen_path: &str, target_url: &str) -> ApiDefinition {
         serde_json::from_str(&format!(
-            r#"{{"api_id":"{api_id}","name":"{api_id}","listen_path":"{listen_path}","target_url":"{target_url}"}}"#
+            r#"{{"api_id":"{api_id}","name":"{api_id}","listen_path":"{listen_path}","target_url":"{target_url}","auth":{{"mode":"keyless"}}}}"#
         ))
         .expect("valid definition")
     }
 
     fn table(defs: Vec<ApiDefinition>) -> Result<RouteTable, Error> {
-        RouteTable::build(defs, &Forwarder::new())
+        let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        RouteTable::build(defs, &Forwarder::new(), &storage)
     }
 
     #[test]

@@ -35,7 +35,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] Middleware chain scaffolding: per-API tower stack composed at route-build time (g2-middleware)
 - [x] `KeySession` model (rate, quota, expiry, org_id, per-API access; SHA-256 key hashing)
 - [x] Redis-backed `Storage` implementation (connection pool, `g2:{org}:...` schema) + `make redis-up` integration tests
-- [ ] Auth: keyless mode (explicit) and auth-token mode (header/query param/cookie lookup → `KeySession`)
+- [x] Auth: keyless mode (explicit) and auth-token mode (header/query param/cookie lookup → `KeySession`)
 - [ ] Auth: JWT (HS256/RS256, `jwks_url` fetch + cache, claims → session)
 - [ ] Auth: basic auth
 - [ ] Admin API skeleton (axum on separate port, `X-G2-Authorization` admin secret)
@@ -147,3 +147,17 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   Docker (Docker Desktop working again this session). Gotcha: a crate-root
   `mod redis` shadows the extern crate in `use` paths → use `::redis::…`.
   Next: M2 auth middleware (keyless + auth-token modes).
+- **2026-08-30 (6)** — M2 auth landed. `ApiDefinition.auth` is a tagged enum
+  (`{"mode":"keyless"}` / `{"mode":"auth_token", header/query_param/cookie}`);
+  **default is auth_token on `Authorization`** — keyless must be explicit, so
+  a definition missing `auth` is protected, not exposed (examples/apis and the
+  k8s configmap now declare keyless; redeploy needed before next smoke).
+  `AuthLayer` (g2-middleware) extracts header→query→cookie, strips `Bearer `
+  case-insensitively, hashes, looks up `g2:{org}:apikey:{hash}`, checks
+  active/expiry/allows_api, stamps `SessionContext` extension; 401 missing,
+  403 unknown/inactive/expired/wrong-API (one message, no oracle), 503
+  storage down, 500 corrupt record. `RouteTable::build` now takes
+  `&SharedStorage` (new alias `Arc<dyn Storage>`); binary grew
+  `--redis-url`/`G2_REDIS_URL`/config `redis_url` → RedisStorage, else
+  MemoryStorage with a loud warning. `ChainBuilder.auth(Option<AuthLayer>)`
+  uses tower's `option_layer`. Next: JWT auth (HS256/RS256 + jwks).

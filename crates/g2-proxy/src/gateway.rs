@@ -151,13 +151,25 @@ mod tests {
         addr
     }
 
-    fn gateway_for(defs: Vec<ApiDefinition>) -> Gateway {
-        Gateway::new(RouteTable::build(defs, &Forwarder::new()).expect("table"))
+    fn memory_storage() -> g2_storage::SharedStorage {
+        std::sync::Arc::new(g2_storage::MemoryStorage::new())
     }
 
+    fn gateway_with_storage(
+        defs: Vec<ApiDefinition>,
+        storage: &g2_storage::SharedStorage,
+    ) -> Gateway {
+        Gateway::new(RouteTable::build(defs, &Forwarder::new(), storage).expect("table"))
+    }
+
+    fn gateway_for(defs: Vec<ApiDefinition>) -> Gateway {
+        gateway_with_storage(defs, &memory_storage())
+    }
+
+    /// A keyless definition (most tests exercise routing/forwarding, not auth).
     fn def_to(api_id: &str, listen_path: &str, target: &str) -> ApiDefinition {
         serde_json::from_str(&format!(
-            r#"{{"api_id":"{api_id}","name":"{api_id}","listen_path":"{listen_path}","target_url":"{target}"}}"#
+            r#"{{"api_id":"{api_id}","name":"{api_id}","listen_path":"{listen_path}","target_url":"{target}","auth":{{"mode":"keyless"}}}}"#
         ))
         .expect("def")
     }
@@ -316,6 +328,7 @@ mod tests {
         let table = RouteTable::build(
             vec![def_to("echo", "/echo/", &format!("http://{upstream}"))],
             &Forwarder::new(),
+            &memory_storage(),
         )
         .expect("table");
         gw.reload(table);
@@ -324,6 +337,49 @@ mod tests {
             gw.handle(get("/echo/x"), CLIENT).await.status(),
             StatusCode::OK
         );
+    }
+
+    #[tokio::test]
+    async fn token_protected_api_end_to_end() {
+        use g2_core::session::{hash_key, session_storage_key};
+        use g2_core::KeySession;
+
+        let upstream = spawn_echo_upstream().await;
+        let storage = memory_storage();
+        storage
+            .set(
+                &session_storage_key("default", &hash_key("s3cret")),
+                &serde_json::to_string(&KeySession::default()).expect("json"),
+                None,
+            )
+            .await
+            .expect("seed session");
+
+        // No "auth" field: token auth on the Authorization header by default.
+        let def: ApiDefinition = serde_json::from_str(&format!(
+            r#"{{"api_id":"sec","name":"sec","listen_path":"/sec/","target_url":"http://{upstream}"}}"#
+        ))
+        .expect("def");
+        let gw = gateway_with_storage(vec![def], &storage);
+
+        // Missing token → 401.
+        let resp = gw.handle(get("/sec/x"), CLIENT).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Wrong token → 403.
+        let mut req = get("/sec/x");
+        req.headers_mut()
+            .insert("authorization", HeaderValue::from_static("wrong"));
+        let resp = gw.handle(req, CLIENT).await;
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Valid token → proxied upstream.
+        let mut req = get("/sec/x");
+        req.headers_mut()
+            .insert("authorization", HeaderValue::from_static("Bearer s3cret"));
+        let resp = gw.handle(req, CLIENT).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body_string(resp).await, "GET /x");
     }
 
     #[tokio::test]

@@ -21,6 +21,9 @@ use std::time::Duration;
 pub use memory::MemoryStorage;
 pub use redis::RedisStorage;
 
+/// A [`Storage`] shared across the gateway (routes, middleware, admin API).
+pub type SharedStorage = std::sync::Arc<dyn Storage>;
+
 /// Errors returned by [`Storage`] implementations.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {

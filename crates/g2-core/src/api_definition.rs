@@ -23,6 +23,88 @@ fn default_upstream_timeout_ms() -> u64 {
     DEFAULT_UPSTREAM_TIMEOUT_MS
 }
 
+/// Header the auth-token mode reads when a definition does not name one.
+pub const DEFAULT_AUTH_HEADER: &str = "Authorization";
+
+fn default_auth_header() -> String {
+    DEFAULT_AUTH_HEADER.to_owned()
+}
+
+/// How clients authenticate to one API.
+///
+/// The default is [`AuthConfig::AuthToken`] reading the `Authorization`
+/// header: an API is protected unless its definition **explicitly** opts out
+/// with `{"auth": {"mode": "keyless"}}`. Forgetting to configure auth must
+/// never silently expose an upstream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum AuthConfig {
+    /// No authentication: every request is forwarded. Explicit opt-out.
+    Keyless,
+
+    /// Bearer/API-token auth: the token is looked up (hashed) in storage and
+    /// must resolve to a live [`KeySession`](crate::KeySession).
+    ///
+    /// The token is searched in `header` first, then `query_param`, then
+    /// `cookie` (each only if configured).
+    AuthToken {
+        /// Request header carrying the token. A `Bearer ` prefix, if present,
+        /// is stripped.
+        #[serde(default = "default_auth_header")]
+        header: String,
+
+        /// Optional query parameter also accepted as a token carrier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        query_param: Option<String>,
+
+        /// Optional cookie name also accepted as a token carrier.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cookie: Option<String>,
+    },
+}
+
+impl Default for AuthConfig {
+    /// Token auth against the `Authorization` header (protected by default).
+    fn default() -> Self {
+        Self::AuthToken {
+            header: default_auth_header(),
+            query_param: None,
+            cookie: None,
+        }
+    }
+}
+
+impl AuthConfig {
+    /// Validates auth settings; `api` names the owning definition in errors.
+    fn validate(&self, api: &str) -> Result<(), Error> {
+        let fail = |reason: String| Error::InvalidApiDefinition {
+            api: api.to_owned(),
+            reason,
+        };
+        match self {
+            Self::Keyless => Ok(()),
+            Self::AuthToken {
+                header,
+                query_param,
+                cookie,
+            } => {
+                if http::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
+                    return Err(fail(format!(
+                        "`auth.header` is not a valid header name: `{header}`"
+                    )));
+                }
+                if query_param.as_deref().is_some_and(|p| p.trim().is_empty()) {
+                    return Err(fail("`auth.query_param` must not be empty".into()));
+                }
+                if cookie.as_deref().is_some_and(|c| c.trim().is_empty()) {
+                    return Err(fail("`auth.cookie` must not be empty".into()));
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 /// One API proxied by the gateway.
 ///
 /// This is the unit of configuration: requests whose path falls under
@@ -78,6 +160,11 @@ pub struct ApiDefinition {
     /// Inactive definitions are loaded and listed but never routed to.
     #[serde(default = "default_true")]
     pub active: bool,
+
+    /// How clients authenticate. Defaults to token auth on the
+    /// `Authorization` header; keyless must be requested explicitly.
+    #[serde(default)]
+    pub auth: AuthConfig,
 }
 
 impl ApiDefinition {
@@ -131,6 +218,7 @@ impl ApiDefinition {
         if uri.authority().is_none() {
             return Err(fail("`target_url` must include a host".into()));
         }
+        self.auth.validate(&self.api_id)?;
         Ok(())
     }
 
@@ -210,6 +298,76 @@ mod tests {
             }
             assert!(def.validate().is_err(), "expected empty `{field}` rejected");
         }
+    }
+
+    #[test]
+    fn auth_defaults_to_token_on_authorization_header() {
+        let def = parse(minimal_json());
+        assert_eq!(def.auth, AuthConfig::default());
+        match &def.auth {
+            AuthConfig::AuthToken {
+                header,
+                query_param,
+                cookie,
+            } => {
+                assert_eq!(header, DEFAULT_AUTH_HEADER);
+                assert!(query_param.is_none() && cookie.is_none());
+            }
+            AuthConfig::Keyless => panic!("default must not be keyless"),
+        }
+    }
+
+    #[test]
+    fn keyless_must_be_explicit() {
+        let json = r#"{
+            "api_id": "open",
+            "name": "Open API",
+            "listen_path": "/open/",
+            "target_url": "http://open.internal",
+            "auth": { "mode": "keyless" }
+        }"#;
+        let def = parse(json);
+        assert_eq!(def.auth, AuthConfig::Keyless);
+        def.validate().expect("keyless definition is valid");
+    }
+
+    #[test]
+    fn auth_token_carriers_are_configurable() {
+        let json = r#"{
+            "api_id": "custom",
+            "name": "Custom",
+            "listen_path": "/c/",
+            "target_url": "http://c.internal",
+            "auth": { "mode": "auth_token", "header": "X-Api-Key", "query_param": "api_key" }
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        assert_eq!(
+            def.auth,
+            AuthConfig::AuthToken {
+                header: "X-Api-Key".into(),
+                query_param: Some("api_key".into()),
+                cookie: None,
+            }
+        );
+    }
+
+    #[test]
+    fn invalid_auth_settings_are_rejected() {
+        let mut def = parse(minimal_json());
+        def.auth = AuthConfig::AuthToken {
+            header: "bad header\n".into(),
+            query_param: None,
+            cookie: None,
+        };
+        assert!(def.validate().is_err());
+
+        def.auth = AuthConfig::AuthToken {
+            header: DEFAULT_AUTH_HEADER.into(),
+            query_param: Some("  ".into()),
+            cookie: None,
+        };
+        assert!(def.validate().is_err());
     }
 
     #[test]

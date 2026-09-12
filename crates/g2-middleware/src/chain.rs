@@ -7,6 +7,7 @@ use tower::util::BoxCloneSyncService;
 use tower::{Service, ServiceBuilder};
 
 use crate::api_id_header::ApiIdHeaderLayer;
+use crate::auth::AuthLayer;
 use crate::context::RequestContext;
 use crate::set_context::SetContextLayer;
 use crate::{ChainService, ProxyBody};
@@ -18,20 +19,30 @@ use crate::{ChainService, ProxyBody};
 /// service with, outermost first:
 ///
 /// 1. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
-/// 2. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+/// 2. [`AuthLayer`] — token auth (absent for keyless APIs).
+/// 3. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
 ///
-/// Auth, rate-limit, quota, and transform layers slot in here as later M2+
+/// Rate-limit, quota, and transform layers slot in here as later M2+/M3
 /// tasks land.
 #[derive(Debug, Clone)]
 pub struct ChainBuilder {
     ctx: RequestContext,
+    auth: Option<AuthLayer>,
 }
 
 impl ChainBuilder {
     /// Starts a chain for the API identified by `ctx`.
     #[must_use]
     pub fn new(ctx: RequestContext) -> Self {
-        Self { ctx }
+        Self { ctx, auth: None }
+    }
+
+    /// Adds token authentication (`None` — from a keyless config — is a
+    /// no-op, keeping the call site branch-free).
+    #[must_use]
+    pub fn auth(mut self, auth: Option<AuthLayer>) -> Self {
+        self.auth = auth;
+        self
     }
 
     /// Wraps `forward` — the innermost service that actually proxies to the
@@ -48,6 +59,7 @@ impl ChainBuilder {
     {
         let svc = ServiceBuilder::new()
             .layer(SetContextLayer::new(self.ctx))
+            .option_layer(self.auth)
             .layer(ApiIdHeaderLayer::new())
             .service(forward);
         BoxCloneSyncService::new(svc)
