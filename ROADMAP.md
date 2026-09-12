@@ -34,7 +34,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 
 - [x] Middleware chain scaffolding: per-API tower stack composed at route-build time (g2-middleware)
 - [x] `KeySession` model (rate, quota, expiry, org_id, per-API access; SHA-256 key hashing)
-- [ ] Redis-backed `Storage` implementation (connection pool, `g2:{org}:...` schema) + `make redis-up` integration tests
+- [x] Redis-backed `Storage` implementation (connection pool, `g2:{org}:...` schema) + `make redis-up` integration tests
 - [ ] Auth: keyless mode (explicit) and auth-token mode (header/query param/cookie lookup → `KeySession`)
 - [ ] Auth: JWT (HS256/RS256, `jwks_url` fetch + cache, claims → session)
 - [ ] Auth: basic auth
@@ -137,3 +137,13 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   session — they're live state and belong in storage (M3). Added `sha2`+`hex`
   workspace deps; new `Error::InvalidKeySession`. Next: M2 Redis-backed
   `Storage` (`make redis-up` + integration tests).
+- **2026-08-30 (5)** — M2 `RedisStorage` landed (`g2-storage::redis`), built on
+  `redis` crate **1.6** (post-1.0 API; `tokio-comp` + `connection-manager`
+  features — the manager is one multiplexed auto-reconnecting connection, so
+  no separate pool needed; cheap clone). TTLs use `SET … PX` (ms precision;
+  sub-ms rounds up to 1ms since PX rejects 0). Integration tests are
+  `#[ignore]`d (`make redis-up`, then `cargo test -p g2-storage --
+  --ignored`) — **verified green this session** against redis:7-alpine in
+  Docker (Docker Desktop working again this session). Gotcha: a crate-root
+  `mod redis` shadows the extern crate in `use` paths → use `::redis::…`.
+  Next: M2 auth middleware (keyless + auth-token modes).

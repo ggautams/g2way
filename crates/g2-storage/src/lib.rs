@@ -4,8 +4,8 @@
 //! counters, config sync) goes through the [`Storage`] trait so that:
 //!
 //! - unit tests run against [`MemoryStorage`] with no external services, and
-//! - production pods share state through the Redis implementation
-//!   (added in milestone M2; see `ROADMAP.md`).
+//! - production pods share state through [`RedisStorage`], where every pod
+//!   points at the same Redis instance.
 //!
 //! # Key schema
 //!
@@ -14,10 +14,12 @@
 //! for multi-organization support without a future data migration.
 
 mod memory;
+mod redis;
 
 use std::time::Duration;
 
 pub use memory::MemoryStorage;
+pub use redis::RedisStorage;
 
 /// Errors returned by [`Storage`] implementations.
 #[derive(Debug, thiserror::Error)]
