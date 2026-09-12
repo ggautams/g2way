@@ -9,7 +9,11 @@ rust-version.workspace = true
 
 [dependencies]
 g2-core.workspace = true
+g2-storage.workspace = true
 axum.workspace = true
+hex.workspace = true
+rand.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tokio.workspace = true

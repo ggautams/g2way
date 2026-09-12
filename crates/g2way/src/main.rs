@@ -150,7 +150,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .admin_secret
                     .as_deref()
                     .expect("validate() guarantees a secret when the admin listener is set");
-                let admin_router = g2_admin::router(secret)?;
+                let admin_router = g2_admin::router(secret, Arc::clone(&storage))?;
                 let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
                 tracing::info!(admin_listen_addr = %admin_addr, "admin API listening");
                 let admin = g2_admin::serve(

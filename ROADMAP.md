@@ -40,7 +40,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [ ] Auth: JWT `jwks_url` fetch + cache (needs an HTTPS fetch client — decide alongside the M7 TLS work)
 - [x] Auth: basic auth
 - [x] Admin API skeleton (axum on separate port, `X-G2-Authorization` admin secret)
-- [ ] Admin key CRUD: `POST/GET/PUT/DELETE /g2/keys[/{key}]`
+- [x] Admin key CRUD: `POST/GET/PUT/DELETE /g2/keys[/{key}]`
 
 ## M3 — Rate limiting & quotas (distributed)
 
@@ -55,6 +55,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [ ] API definitions and policies stored in Redis; file loader becomes one of two sources
 - [ ] Policies: reusable rate/quota/ACL bundles referenced by keys
 - [ ] Admin CRUD for API definitions and policies
+- [ ] `GET /g2/keys` listing (needs a `Storage::scan`/SCAN operation — deferred from M2 key CRUD)
 - [ ] `POST /g2/reload` + Redis pub/sub broadcast → every pod rebuilds its route table
 - [ ] Dashboard-support API: node info, loaded APIs, health, version, per-API stats snapshot
 - [ ] OpenAPI spec for the admin API (utoipa) served at `/g2/openapi.json`
@@ -206,3 +207,18 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   a local run. New `Error::InvalidGatewayConfig`. deploy/k8s deliberately
   untouched until key CRUD makes the admin port useful. Next: admin key CRUD
   (`/g2/keys`).
+- **2026-08-30 (10)** — M2 admin key CRUD landed (`g2-admin::keys`), closing
+  M2 except the deferred `jwks_url` task. `POST /g2/keys` generates the raw
+  key server-side (32 random bytes, hex; `rand` 0.9 workspace dep) and
+  returns it **once** — storage only ever holds the SHA-256. `GET/PUT/DELETE
+  /g2/keys/{key}` address by raw key, or by hash with `?hashed=true` (the
+  only handle left after creation); `GET`/`DELETE` take `?org_id=`
+  (default org), `POST`/`PUT` read org from the session body. Sessions are
+  `validate()`d → 400 with reason; storage errors → 503; corrupt records →
+  500. `PUT /g2/keys/basic:alice` provisions basic-auth users (same virtual-
+  key namespace the auth middleware reads — tested). Listing deferred to a
+  new M4 checkbox (needs `Storage::scan`). No session TTLs written yet
+  (auth already enforces `expires_at`; storage-side GC is a possible M3+
+  optimization). Verified live end-to-end: POST key → 401/403/passed-auth on
+  the proxy → DELETE → 403. Next: M3 Redis sliding-window rate limiter
+  (Lua), or revisit deferred `jwks_url` when M7 TLS lands.

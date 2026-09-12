@@ -47,6 +47,7 @@ redis = { version = "1.6", features = ["tokio-comp", "connection-manager"] }
 # Crypto / hashing
 sha2 = "0.10"
 hex = "0.4"
+rand = "0.9"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }
 bcrypt = "0.17"
 base64 = "0.22"
