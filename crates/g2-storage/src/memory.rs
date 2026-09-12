@@ -8,7 +8,7 @@ use tokio::sync::RwLock;
 // tokio's Instant (not std's) so tests can pause and advance the clock.
 use tokio::time::Instant;
 
-use crate::{RateDecision, Storage, StorageError};
+use crate::{LimitDecision, Storage, StorageError};
 
 #[derive(Debug, Clone)]
 struct Entry {
@@ -34,6 +34,16 @@ pub struct MemoryStorage {
     /// Sliding-window request logs for [`Storage::check_rate`], keyed like
     /// the value map but holding timestamps instead of strings.
     windows: Arc<RwLock<HashMap<String, VecDeque<Instant>>>>,
+
+    /// Fixed-period counters for [`Storage::check_quota`]: requests so far
+    /// and when the period renews.
+    quotas: Arc<RwLock<HashMap<String, QuotaEntry>>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuotaEntry {
+    count: u64,
+    resets_at: Instant,
 }
 
 impl MemoryStorage {
@@ -88,7 +98,7 @@ impl Storage for MemoryStorage {
         key: &str,
         limit: u64,
         window: Duration,
-    ) -> Result<RateDecision, StorageError> {
+    ) -> Result<LimitDecision, StorageError> {
         let now = Instant::now();
         let mut windows = self.windows.write().await;
         let log = windows.entry(key.to_owned()).or_default();
@@ -107,7 +117,7 @@ impl Storage for MemoryStorage {
         if count < limit {
             let reset_after = reset_after(log);
             log.push_back(now);
-            Ok(RateDecision {
+            Ok(LimitDecision {
                 allowed: true,
                 remaining: limit - count - 1,
                 reset_after,
@@ -117,9 +127,45 @@ impl Storage for MemoryStorage {
             if log.is_empty() {
                 windows.remove(key); // limit == 0: keep the map clean
             }
-            Ok(RateDecision {
+            Ok(LimitDecision {
                 allowed: false,
                 remaining: 0,
+                reset_after,
+            })
+        }
+    }
+
+    async fn check_quota(
+        &self,
+        key: &str,
+        max: u64,
+        period: Duration,
+    ) -> Result<LimitDecision, StorageError> {
+        let now = Instant::now();
+        let mut quotas = self.quotas.write().await;
+        let entry = quotas.entry(key.to_owned()).or_insert(QuotaEntry {
+            count: 0,
+            resets_at: now + period,
+        });
+        if entry.resets_at <= now {
+            // The period elapsed: this request starts a fresh one.
+            *entry = QuotaEntry {
+                count: 0,
+                resets_at: now + period,
+            };
+        }
+        entry.count += 1;
+        let reset_after = entry.resets_at.saturating_duration_since(now);
+        if entry.count > max {
+            Ok(LimitDecision {
+                allowed: false,
+                remaining: 0,
+                reset_after,
+            })
+        } else {
+            Ok(LimitDecision {
+                allowed: true,
+                remaining: max - entry.count,
                 reset_after,
             })
         }
@@ -255,6 +301,64 @@ mod tests {
             store.check_rate("a", 1, WINDOW).await.expect("fill a");
             let d = store.check_rate("b", 1, WINDOW).await.expect("check b");
             assert!(d.allowed, "key `b` has its own window");
+        }
+    }
+
+    mod check_quota {
+        use super::*;
+
+        const KEY: &str = "g2:default:quota:k";
+        const PERIOD: Duration = Duration::from_secs(3600);
+
+        #[tokio::test]
+        async fn counts_down_then_denies() {
+            tokio::time::pause();
+            let store = MemoryStorage::new();
+
+            for expected_remaining in [1, 0] {
+                let d = store.check_quota(KEY, 2, PERIOD).await.expect("check");
+                assert!(d.allowed);
+                assert_eq!(d.remaining, expected_remaining);
+            }
+            let d = store.check_quota(KEY, 2, PERIOD).await.expect("check");
+            assert!(!d.allowed);
+            assert_eq!(d.reset_after, PERIOD, "period started with request one");
+        }
+
+        #[tokio::test]
+        async fn period_is_fixed_not_sliding() {
+            tokio::time::pause();
+            let store = MemoryStorage::new();
+
+            store.check_quota(KEY, 1, PERIOD).await.expect("fill");
+            // Halfway through, still denied — and the denial must not
+            // extend the period.
+            tokio::time::advance(PERIOD / 2).await;
+            let d = store.check_quota(KEY, 1, PERIOD).await.expect("denied");
+            assert!(!d.allowed);
+            assert_eq!(d.reset_after, PERIOD / 2);
+
+            // Once the period from the *first* request elapses, the whole
+            // allowance renews at once (fixed window, unlike check_rate).
+            tokio::time::advance(PERIOD / 2).await;
+            let d = store.check_quota(KEY, 1, PERIOD).await.expect("renewed");
+            assert!(d.allowed);
+            assert_eq!(d.reset_after, PERIOD, "fresh period starts now");
+        }
+
+        #[tokio::test]
+        async fn zero_max_denies_everything() {
+            let store = MemoryStorage::new();
+            let d = store.check_quota(KEY, 0, PERIOD).await.expect("check");
+            assert!(!d.allowed);
+        }
+
+        #[tokio::test]
+        async fn keys_are_independent() {
+            let store = MemoryStorage::new();
+            store.check_quota("a", 1, PERIOD).await.expect("fill a");
+            let d = store.check_quota("b", 1, PERIOD).await.expect("check b");
+            assert!(d.allowed, "key `b` has its own quota");
         }
     }
 }

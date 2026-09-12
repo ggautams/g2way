@@ -7,7 +7,7 @@ use std::time::Duration;
 use ::redis::aio::ConnectionManager;
 use ::redis::Script;
 
-use crate::{RateDecision, Storage, StorageError};
+use crate::{LimitDecision, Storage, StorageError};
 
 fn backend_err(e: ::redis::RedisError) -> StorageError {
     StorageError::Backend(e.to_string())
@@ -40,6 +40,33 @@ end
 return {0, 0, reset}
 ";
 
+/// Fixed-period quota count, executed atomically inside Redis.
+///
+/// A plain counter whose TTL is the period: it starts with the first
+/// request of a period (`INCR` → 1 sets the expiry) and the reset
+/// timestamp is simply the key's remaining TTL. Counting denied requests
+/// too is harmless — the key is already over `max` — and never extends
+/// the period. Returns `{allowed (0|1), remaining, reset_after_ms}`.
+const QUOTA_SCRIPT: &str = r"
+local max = tonumber(ARGV[1])
+local period = tonumber(ARGV[2])
+local count = redis.call('INCR', KEYS[1])
+if count == 1 then
+    redis.call('PEXPIRE', KEYS[1], period)
+end
+local ttl = redis.call('PTTL', KEYS[1])
+if ttl < 0 then
+    -- Defensive: a counter that somehow lost its expiry must not deny
+    -- forever; restart its period.
+    redis.call('PEXPIRE', KEYS[1], period)
+    ttl = period
+end
+if count > max then
+    return {0, 0, ttl}
+end
+return {1, max - count, ttl}
+";
+
 /// A [`Storage`] backed by a shared Redis instance.
 ///
 /// This is the production backend: every gateway pod points at the same
@@ -55,6 +82,8 @@ pub struct RedisStorage {
     conn: ConnectionManager,
     /// Cached rate-limit script (EVALSHA after the first call).
     rate_script: Arc<Script>,
+    /// Cached quota script (EVALSHA after the first call).
+    quota_script: Arc<Script>,
 }
 
 impl Clone for RedisStorage {
@@ -62,6 +91,7 @@ impl Clone for RedisStorage {
         Self {
             conn: self.conn.clone(),
             rate_script: Arc::clone(&self.rate_script),
+            quota_script: Arc::clone(&self.quota_script),
         }
     }
 }
@@ -89,6 +119,7 @@ impl RedisStorage {
         Ok(Self {
             conn,
             rate_script: Arc::new(Script::new(RATE_SCRIPT)),
+            quota_script: Arc::new(Script::new(QUOTA_SCRIPT)),
         })
     }
 }
@@ -131,7 +162,7 @@ impl Storage for RedisStorage {
         key: &str,
         limit: u64,
         window: Duration,
-    ) -> Result<RateDecision, StorageError> {
+    ) -> Result<LimitDecision, StorageError> {
         // The script compares against ms; clamp like `set` does for PX.
         let window_ms = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
         // Uniquifies members: two requests landing in the same millisecond
@@ -146,7 +177,29 @@ impl Storage for RedisStorage {
             .invoke_async(&mut self.conn.clone())
             .await
             .map_err(backend_err)?;
-        Ok(RateDecision {
+        Ok(LimitDecision {
+            allowed: allowed == 1,
+            remaining,
+            reset_after: Duration::from_millis(reset_ms),
+        })
+    }
+
+    async fn check_quota(
+        &self,
+        key: &str,
+        max: u64,
+        period: Duration,
+    ) -> Result<LimitDecision, StorageError> {
+        let period_ms = u64::try_from(period.as_millis()).unwrap_or(u64::MAX).max(1);
+        let (allowed, remaining, reset_ms): (u8, u64, u64) = self
+            .quota_script
+            .key(key)
+            .arg(max)
+            .arg(period_ms)
+            .invoke_async(&mut self.conn.clone())
+            .await
+            .map_err(backend_err)?;
+        Ok(LimitDecision {
             allowed: allowed == 1,
             remaining,
             reset_after: Duration::from_millis(reset_ms),
@@ -281,6 +334,56 @@ mod tests {
             let store = store.clone();
             let key = key.clone();
             tasks.spawn(async move { store.check_rate(&key, 5, window).await.expect("check") });
+        }
+        let allowed = tasks
+            .join_all()
+            .await
+            .into_iter()
+            .filter(|d| d.allowed)
+            .count();
+        assert_eq!(allowed, 5);
+        store.delete(&key).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real Redis: `make redis-up`"]
+    async fn quota_fills_denies_then_renews() {
+        let store = store().await;
+        let key = test_key("quota");
+        let period = Duration::from_millis(500);
+
+        for expected_remaining in [1, 0] {
+            let d = store.check_quota(&key, 2, period).await.expect("check");
+            assert!(d.allowed);
+            assert_eq!(d.remaining, expected_remaining);
+        }
+        let d = store.check_quota(&key, 2, period).await.expect("denied");
+        assert!(!d.allowed);
+        assert!(
+            d.reset_after <= period && d.reset_after > Duration::ZERO,
+            "reset within the period, got {:?}",
+            d.reset_after
+        );
+
+        tokio::time::sleep(period + Duration::from_millis(100)).await;
+        let d = store.check_quota(&key, 2, period).await.expect("renewed");
+        assert!(d.allowed);
+        assert_eq!(d.remaining, 1, "whole allowance renewed");
+        store.delete(&key).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real Redis: `make redis-up`"]
+    async fn quota_check_is_atomic_under_concurrency() {
+        let store = store().await;
+        let key = test_key("quota-atomic");
+        let period = Duration::from_secs(5);
+
+        let mut tasks = tokio::task::JoinSet::new();
+        for _ in 0..20 {
+            let store = store.clone();
+            let key = key.clone();
+            tasks.spawn(async move { store.check_quota(&key, 5, period).await.expect("check") });
         }
         let allowed = tasks
             .join_all()

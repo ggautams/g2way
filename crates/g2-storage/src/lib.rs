@@ -32,19 +32,19 @@ pub enum StorageError {
     Backend(String),
 }
 
-/// The outcome of one sliding-window rate check
-/// ([`Storage::check_rate`]).
+/// The outcome of one limit check ([`Storage::check_rate`] or
+/// [`Storage::check_quota`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RateDecision {
-    /// Whether the request fit inside the window (and was recorded).
+pub struct LimitDecision {
+    /// Whether the request fit inside the limit (and was recorded).
     pub allowed: bool,
 
-    /// Requests left in the window after this one (`0` when denied).
+    /// Requests left before the limit after this one (`0` when denied).
     pub remaining: u64,
 
-    /// Time until the window frees the next slot: how long the oldest
-    /// recorded request still counts. The value behind `Retry-After` /
-    /// `X-RateLimit-Reset` headers.
+    /// Time until the limit frees up: when the oldest recorded request
+    /// slides out of a rate window, or when a quota period renews. The
+    /// value behind `Retry-After` / `X-RateLimit-Reset` headers.
     pub reset_after: Duration,
 }
 
@@ -79,5 +79,23 @@ pub trait Storage: Send + Sync + 'static {
         key: &str,
         limit: u64,
         window: Duration,
-    ) -> Result<RateDecision, StorageError>;
+    ) -> Result<LimitDecision, StorageError>;
+
+    /// Atomically counts one request against a **fixed-period** quota of at
+    /// most `max` requests per `period` at `key`.
+    ///
+    /// Unlike [`check_rate`](Storage::check_rate) (a smoothing sliding
+    /// window over seconds or minutes), a quota is a billing-style
+    /// allowance over hours or days: the counter starts with the first
+    /// request of a period and resets `period` after it — the reset
+    /// timestamp is part of the contract
+    /// (it is reported as [`LimitDecision::reset_after`]).
+    ///
+    /// A `max` of `0` denies every request.
+    async fn check_quota(
+        &self,
+        key: &str,
+        max: u64,
+        period: Duration,
+    ) -> Result<LimitDecision, StorageError>;
 }

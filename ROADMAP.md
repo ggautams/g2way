@@ -45,7 +45,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 ## M3 — Rate limiting & quotas (distributed)
 
 - [x] Redis sliding-window rate limiter as an atomic Lua script (`redis::Script`), per-key and per-API
-- [ ] Quotas: long-period counters with reset timestamps
+- [x] Quotas: long-period counters with reset timestamps
 - [ ] Local token-bucket spike guard in front of Redis (configurable)
 - [ ] 429 responses with `X-RateLimit-Limit/-Remaining/-Reset` headers
 - [ ] Multi-pod correctness test documented in smoke script (two replicas share counters)
@@ -236,3 +236,13 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   the middleware checkbox. Note: `make redis-up` errors if the container
   already exists from a prior run — harmless, but worth an idempotency fix
   someday. Next: quota counters (long-period, reset timestamps).
+- **2026-08-30 (12)** — M3 quota counters landed: `Storage::check_quota(key,
+  max, period)` — **fixed-period** (the period starts at the
+  first request, whole allowance renews at once; deliberately not sliding
+  like `check_rate`). Redis impl is a second Lua script: INCR + PEXPIRE-on-
+  first + PTTL-as-reset, with a defensive re-expire if a counter ever loses
+  its TTL (can't deny forever). `RateDecision` renamed → `LimitDecision`,
+  shared by both checks (same shape). Denied requests still INCR (harmless
+  over max, never extends the period). Verified against real Redis (renewal
+  + 20-concurrent-admit-exactly-5). Next: local token-bucket spike guard in
+  front of Redis.
