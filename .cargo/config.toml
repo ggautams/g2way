@@ -1,0 +1,9 @@
+# Xcode 26's linker asserts on over-long symbol names ("name.size() <=
+# maxLength", SymbolString.cpp) — and the deeply nested tower ServiceBuilder
+# types composed in g2-middleware's chain produce legacy-mangled symbols
+# beyond that cap once the chain passed ~12 layers. The v0 mangling scheme
+# compresses repeated types with back-references, keeping symbols well under
+# the limit. Zero runtime effect; backtrace/perf tooling understands v0.
+# (A RUSTFLAGS environment variable overrides this — keep v0 in it if set.)
+[build]
+rustflags = ["-Csymbol-mangling-version=v0"]

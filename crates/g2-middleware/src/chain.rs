@@ -10,11 +10,14 @@ use crate::analytics::AnalyticsLayer;
 use crate::api_id_header::ApiIdHeaderLayer;
 use crate::auth::AuthLayer;
 use crate::context::RequestContext;
+use crate::cors::CorsLayer;
+use crate::ip_filter::IpFilterLayer;
 use crate::metrics::MetricsLayer;
 use crate::mock::MockResponseLayer;
 use crate::path_policy::PathPolicyLayer;
 use crate::rate_limit::RateLimitLayer;
 use crate::set_context::SetContextLayer;
+use crate::size_limit::RequestSizeLimitLayer;
 use crate::stats::StatsLayer;
 use crate::trace::TraceLayer;
 use crate::transform_headers::HeaderTransformLayer;
@@ -36,23 +39,30 @@ use crate::{ChainService, ProxyBody};
 /// 4. [`AnalyticsLayer`] — per-request analytics records (above auth for
 ///    the same reason; absent when no analytics sink is configured).
 /// 5. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
-/// 6. [`PathPolicyLayer`] — allow/block/ignore path lists (absent when
+/// 6. [`IpFilterLayer`] — client-IP allow/deny lists (absent when
+///    unconfigured). Outermost policy layer: a blocked client gets nothing
+///    — no CORS headers, no path evaluation, no credential work.
+/// 7. [`CorsLayer`] — CORS preflight answers and response decoration
+///    (absent when unconfigured). Above auth so preflights need no
+///    credentials and 401/403/429 rejections still carry CORS headers.
+/// 8. [`PathPolicyLayer`] — allow/block/ignore path lists (absent when
 ///    unconfigured). Above auth so blocked paths are rejected before any
 ///    credential work and ignored paths can tell auth to stand down.
-/// 7. [`AuthLayer`] — token auth (absent for keyless APIs).
-/// 8. [`RateLimitLayer`] — session rate/quota enforcement (absent for
-///    keyless APIs, which have no session to read limits from).
-/// 9. [`HeaderTransformLayer`] — per-API header add/remove on requests and
-///    responses (absent when unconfigured). Below auth/rate-limit so
-///    gateway rejections are not transformed; above [`ApiIdHeaderLayer`] so
-///    a transform can never spoof the anti-spoof api-id header.
-/// 10. [`MockResponseLayer`] — gateway-answered mock responses (absent when
+/// 9. [`RequestSizeLimitLayer`] — request body size limit (absent when
+///    unconfigured). Above auth so oversized requests are rejected before
+///    any credential work.
+/// 10. [`AuthLayer`] — token auth (absent for keyless APIs).
+/// 11. [`RateLimitLayer`] — session rate/quota enforcement (absent for
+///     keyless APIs, which have no session to read limits from).
+/// 12. [`HeaderTransformLayer`] — per-API header add/remove on requests and
+///     responses (absent when unconfigured). Below auth/rate-limit so
+///     gateway rejections are not transformed; above [`ApiIdHeaderLayer`] so
+///     a transform can never spoof the anti-spoof api-id header.
+/// 13. [`MockResponseLayer`] — gateway-answered mock responses (absent when
 ///     unconfigured). Below auth/rate-limit (mocks on a protected API stay
 ///     protected) and below the header transforms, so mock responses get
 ///     the API's response transforms like any upstream response.
-/// 11. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
-///
-/// Further transform layers slot in here as later M6 tasks land.
+/// 14. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
 #[derive(Debug, Clone)]
 pub struct ChainBuilder {
     ctx: RequestContext,
@@ -62,7 +72,10 @@ pub struct ChainBuilder {
     trace: Option<TraceLayer>,
     metrics: Option<MetricsLayer>,
     analytics: Option<AnalyticsLayer>,
+    ip_filter: Option<IpFilterLayer>,
+    cors: Option<CorsLayer>,
     path_policy: Option<PathPolicyLayer>,
+    size_limit: Option<RequestSizeLimitLayer>,
     transform_headers: Option<HeaderTransformLayer>,
     mock: Option<MockResponseLayer>,
 }
@@ -79,7 +92,10 @@ impl ChainBuilder {
             trace: None,
             metrics: None,
             analytics: None,
+            ip_filter: None,
+            cors: None,
             path_policy: None,
+            size_limit: None,
             transform_headers: None,
             mock: None,
         }
@@ -128,10 +144,31 @@ impl ChainBuilder {
         self
     }
 
+    /// Adds client-IP allow/deny enforcement (`None` is a no-op).
+    #[must_use]
+    pub fn ip_filter(mut self, ip_filter: Option<IpFilterLayer>) -> Self {
+        self.ip_filter = ip_filter;
+        self
+    }
+
+    /// Adds CORS handling (`None` is a no-op).
+    #[must_use]
+    pub fn cors(mut self, cors: Option<CorsLayer>) -> Self {
+        self.cors = cors;
+        self
+    }
+
     /// Adds allow/block/ignore path-list enforcement (`None` is a no-op).
     #[must_use]
     pub fn path_policy(mut self, path_policy: Option<PathPolicyLayer>) -> Self {
         self.path_policy = path_policy;
+        self
+    }
+
+    /// Adds request body size enforcement (`None` is a no-op).
+    #[must_use]
+    pub fn size_limit(mut self, size_limit: Option<RequestSizeLimitLayer>) -> Self {
+        self.size_limit = size_limit;
         self
     }
 
@@ -167,7 +204,10 @@ impl ChainBuilder {
             .option_layer(self.stats)
             .option_layer(self.analytics)
             .layer(SetContextLayer::new(self.ctx))
+            .option_layer(self.ip_filter)
+            .option_layer(self.cors)
             .option_layer(self.path_policy)
+            .option_layer(self.size_limit)
             .option_layer(self.auth)
             .option_layer(self.rate_limit)
             .option_layer(self.transform_headers)
@@ -399,6 +439,65 @@ mod tests {
         assert_eq!(resp.status(), http::StatusCode::OK);
         // The mock answered, not the upstream echo.
         assert!(!resp.headers().contains_key("x-echo-api-id"));
+    }
+
+    #[tokio::test]
+    async fn cors_preflight_and_rejections_work_on_a_protected_api() {
+        use std::sync::Arc;
+
+        use g2_core::CorsConfig;
+        use g2_storage::SharedStorage;
+
+        use crate::cors::CorsLayer;
+
+        // Token auth with an empty store: every credentialed request fails.
+        let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let auth = AuthLayer::from_config(
+            &g2_core::AuthConfig::default(),
+            storage,
+            "users-api",
+            "acme",
+        )
+        .expect("valid")
+        .expect("token mode");
+        let cors: CorsConfig =
+            serde_json::from_str(r#"{"allowed_origins": ["https://app.example.com"]}"#)
+                .expect("valid CORS JSON");
+        let chain = ChainBuilder::new(RequestContext::new("users-api", "acme"))
+            .cors(Some(
+                CorsLayer::from_config(&cors, "users-api").expect("compiles"),
+            ))
+            .auth(Some(auth))
+            .build(tower::service_fn(echo_forward));
+
+        // Preflight is answered above auth: no credentials needed.
+        let req = Request::builder()
+            .method(http::Method::OPTIONS)
+            .uri("/x")
+            .header("origin", "https://app.example.com")
+            .header("access-control-request-method", "GET")
+            .body(body(""))
+            .expect("request");
+        let resp = chain.clone().oneshot(req).await.expect("infallible");
+        assert_eq!(resp.status(), http::StatusCode::NO_CONTENT);
+        assert!(resp.headers().contains_key("access-control-allow-origin"));
+
+        // An uncredentialed actual request is rejected by auth, but the
+        // 401 still carries CORS headers so browsers can read it.
+        let req = Request::builder()
+            .uri("/x")
+            .header("origin", "https://app.example.com")
+            .body(body(""))
+            .expect("request");
+        let resp = chain.oneshot(req).await.expect("infallible");
+        assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            resp.headers()
+                .get("access-control-allow-origin")
+                .expect("cors on rejection")
+                .as_bytes(),
+            b"https://app.example.com"
+        );
     }
 
     #[tokio::test]

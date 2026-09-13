@@ -16,6 +16,7 @@ bytes.workspace = true
 http.workspace = true
 http-body.workspace = true
 http-body-util.workspace = true
+ipnet.workspace = true
 jsonwebtoken.workspace = true
 opentelemetry.workspace = true
 regex.workspace = true
@@ -27,6 +28,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+futures-util.workspace = true
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tracing-subscriber.workspace = true
 

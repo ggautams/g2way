@@ -27,6 +27,7 @@ pub mod endpoints;
 mod error;
 pub mod loader;
 pub mod policy;
+pub mod security;
 pub mod session;
 pub mod transform;
 
@@ -36,5 +37,6 @@ pub use config::{AnalyticsSinkKind, GatewayConfig, SpikeGuardConfig};
 pub use endpoints::{MockResponse, PathRule};
 pub use error::Error;
 pub use policy::Policy;
+pub use security::CorsConfig;
 pub use session::{BasicAuthData, KeySession};
 pub use transform::{HeaderTransform, HeaderTransforms, UrlRewriteRule};

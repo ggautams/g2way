@@ -211,6 +211,138 @@ async fn path_lists_and_mock_responses_end_to_end() {
 }
 
 #[tokio::test]
+async fn cors_end_to_end() {
+    let upstream = spawn_echo_upstream().await;
+    let mut def = api("/cors/", &format!("http://{upstream}"));
+    def.cors = Some(
+        serde_json::from_str(
+            r#"{"allowed_origins": ["https://app.example.com"],
+                "allowed_methods": ["GET", "DELETE"],
+                "max_age_secs": 300}"#,
+        )
+        .expect("cors config"),
+    );
+    def.validate().expect("valid definition");
+    let (gw, _stop) = spawn_gateway(vec![def]).await;
+
+    // Preflight: answered by the gateway itself, upstream never contacted.
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::options(format!("http://{gw}/cors/items"))
+        .header("origin", "https://app.example.com")
+        .header("access-control-request-method", "DELETE")
+        .body(Empty::new())
+        .expect("request");
+    let resp = client.request(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(resp.headers().get("x-echo-api-id").is_none());
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .expect("allow-origin")
+            .as_bytes(),
+        b"https://app.example.com"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-methods")
+            .expect("allow-methods")
+            .as_bytes(),
+        b"GET, DELETE"
+    );
+    assert_eq!(
+        resp.headers()
+            .get("access-control-max-age")
+            .expect("max-age")
+            .as_bytes(),
+        b"300"
+    );
+
+    // Actual cross-origin request: proxied and decorated.
+    let req = Request::get(format!("http://{gw}/cors/items"))
+        .header("origin", "https://app.example.com")
+        .body(Empty::new())
+        .expect("request");
+    let resp = client.request(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("x-echo-api-id").is_some());
+    assert_eq!(
+        resp.headers()
+            .get("access-control-allow-origin")
+            .expect("allow-origin")
+            .as_bytes(),
+        b"https://app.example.com"
+    );
+}
+
+#[tokio::test]
+async fn ip_block_list_rejects_the_client_end_to_end() {
+    let upstream = spawn_echo_upstream().await;
+    // The test client connects from 127.0.0.1, so blocking the loopback
+    // network must reject it before anything else runs.
+    let mut blocked = api("/blocked/", &format!("http://{upstream}"));
+    blocked.block_ips = vec!["127.0.0.0/8".into()];
+    let mut open = api("/open/", &format!("http://{upstream}"));
+    open.api_id = "e2e-open".into();
+    open.allow_ips = vec!["127.0.0.1".into()];
+    for def in [&blocked, &open] {
+        def.validate().expect("valid definition");
+    }
+    let (gw, _stop) = spawn_gateway(vec![blocked, open]).await;
+
+    let (status, body) = http_get(&format!("http://{gw}/blocked/x")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("forbidden"), "body: {body}");
+
+    // An allow list matching the client keeps the API reachable.
+    let (status, _) = http_get(&format!("http://{gw}/open/x")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn request_size_limit_end_to_end() {
+    let upstream = spawn_echo_upstream().await;
+    let mut def = api("/sized/", &format!("http://{upstream}"));
+    def.max_request_body_bytes = Some(10);
+    def.validate().expect("valid definition");
+    let (gw, _stop) = spawn_gateway(vec![def]).await;
+
+    // Declared Content-Length over the limit: rejected up front.
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::post(format!("http://{gw}/sized/upload"))
+        .body(Full::new(Bytes::from(vec![b'x'; 11])))
+        .expect("request");
+    let resp = client.request(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    // Within the limit: proxied normally.
+    let req = Request::post(format!("http://{gw}/sized/upload"))
+        .body(Full::new(Bytes::from(vec![b'x'; 10])))
+        .expect("request");
+    let resp = client.request(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.collect().await.expect("body").to_bytes();
+    assert_eq!(&body[..], b"POST /upload len=10");
+
+    // A chunked body with no declared length is caught mid-stream (the
+    // forwarder maps the aborted upstream send to 413, not 502).
+    use http_body_util::StreamBody;
+    let frames = futures_util::stream::iter(
+        std::iter::repeat_with(|| {
+            Ok::<_, std::convert::Infallible>(hyper::body::Frame::data(Bytes::from_static(
+                b"12345678",
+            )))
+        })
+        .take(4),
+    );
+    let client: Client<_, StreamBody<_>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::post(format!("http://{gw}/sized/upload"))
+        .body(StreamBody::new(frames))
+        .expect("request");
+    let resp = client.request(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+#[tokio::test]
 async fn serves_health_and_404_end_to_end() {
     let (gw, _stop) = spawn_gateway(vec![]).await;
 

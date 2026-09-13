@@ -4,6 +4,7 @@ use http::Uri;
 use serde::{Deserialize, Serialize};
 
 use crate::endpoints::{MockResponse, PathRule};
+use crate::security::{self, CorsConfig};
 use crate::transform::{self, HeaderTransforms, UrlRewriteRule};
 use crate::Error;
 
@@ -356,6 +357,30 @@ pub struct ApiDefinition {
     /// upstream (see [`MockResponse`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mock_responses: Vec<MockResponse>,
+
+    /// Optional CORS settings: when present the gateway answers preflight
+    /// requests and decorates responses with `Access-Control-*` headers
+    /// (see [`CorsConfig`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cors: Option<CorsConfig>,
+
+    /// When non-empty, only clients whose socket address matches one of
+    /// these IPs/CIDR networks may use this API; everyone else gets `403`.
+    /// The peer address is used, never client-supplied headers like
+    /// `X-Forwarded-For` (which are spoofable).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_ips: Vec<String>,
+
+    /// Clients whose socket address matches one of these IPs/CIDR networks
+    /// are rejected with `403`. A block always wins over `allow_ips`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub block_ips: Vec<String>,
+
+    /// Maximum request body size in bytes; larger requests are rejected
+    /// with `413`. Enforced on the `Content-Length` header and, for
+    /// chunked/streamed bodies, on the actual bytes read. Unset = no limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_request_body_bytes: Option<u64>,
 }
 
 /// Storage key holding one API definition: `g2:{org_id}:apidef:{api_id}`.
@@ -446,6 +471,16 @@ impl ApiDefinition {
         }
         for (index, mock) in self.mock_responses.iter().enumerate() {
             mock.validate(&self.api_id, index)?;
+        }
+        if let Some(cors) = &self.cors {
+            cors.validate(&self.api_id)?;
+        }
+        security::validate_ip_list(&self.allow_ips, &self.api_id, "allow_ips")?;
+        security::validate_ip_list(&self.block_ips, &self.api_id, "block_ips")?;
+        if self.max_request_body_bytes == Some(0) {
+            return Err(fail(
+                "`max_request_body_bytes` must be greater than zero (omit it for no limit)".into(),
+            ));
         }
         Ok(())
     }
@@ -798,6 +833,47 @@ mod tests {
             headers: Default::default(),
         }];
         assert!(def.validate().is_err());
+    }
+
+    #[test]
+    fn cors_ip_lists_and_size_limit_parse_and_validate() {
+        let json = r#"{
+            "api_id": "s",
+            "name": "s",
+            "listen_path": "/s/",
+            "target_url": "http://s.internal",
+            "cors": {"allowed_origins": ["https://app.example.com"]},
+            "allow_ips": ["10.0.0.0/8"],
+            "block_ips": ["10.1.2.3"],
+            "max_request_body_bytes": 1048576
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        assert!(def.cors.is_some());
+        assert_eq!(def.max_request_body_bytes, Some(1_048_576));
+
+        // Optionals stay off the wire when unset (old records unaffected).
+        let bare = serde_json::to_string(&parse(minimal_json())).expect("serializes");
+        for field in ["cors", "allow_ips", "block_ips", "max_request_body_bytes"] {
+            assert!(!bare.contains(field), "`{field}` serialized when unset");
+        }
+
+        // Broken entries in each new field fail validation.
+        let mut def = parse(minimal_json());
+        def.cors = Some(serde_json::from_str(r#"{"allowed_origins": ["nope"]}"#).expect("parses"));
+        assert!(def.validate().is_err(), "bad origin");
+
+        let mut def = parse(minimal_json());
+        def.allow_ips = vec!["not-an-ip".into()];
+        assert!(def.validate().is_err(), "bad allow_ips entry");
+
+        let mut def = parse(minimal_json());
+        def.block_ips = vec!["10.0.0.0/99".into()];
+        assert!(def.validate().is_err(), "bad block_ips prefix");
+
+        let mut def = parse(minimal_json());
+        def.max_request_body_bytes = Some(0);
+        assert!(def.validate().is_err(), "zero size limit");
     }
 
     #[test]

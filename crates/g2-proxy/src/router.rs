@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{
-    AnalyticsHandle, AnalyticsLayer, AuthLayer, ChainBuilder, ChainService, HeaderTransformLayer,
-    HttpMetrics, MetricsLayer, MockResponseLayer, PathPolicyLayer, RateLimitLayer, RequestContext,
-    SpikeGuard, StatsLayer, StatsRegistry, TraceLayer,
+    AnalyticsHandle, AnalyticsLayer, AuthLayer, ChainBuilder, ChainService, CorsLayer,
+    HeaderTransformLayer, HttpMetrics, IpFilterLayer, MetricsLayer, MockResponseLayer,
+    PathPolicyLayer, RateLimitLayer, RequestContext, RequestSizeLimitLayer, SpikeGuard, StatsLayer,
+    StatsRegistry, TraceLayer,
 };
 use g2_storage::SharedStorage;
 
@@ -76,6 +77,13 @@ impl Route {
             &def.api_id,
         )?;
         let mock = MockResponseLayer::from_config(&def.mock_responses, &def.api_id)?;
+        let ip_filter = IpFilterLayer::from_config(&def.allow_ips, &def.block_ips, &def.api_id)?;
+        let cors = def
+            .cors
+            .as_ref()
+            .map(|c| CorsLayer::from_config(c, &def.api_id))
+            .transpose()?;
+        let size_limit = def.max_request_body_bytes.map(RequestSizeLimitLayer::new);
         // Span names follow the OTel server-span convention (the route, not
         // the full path): the listen path, `/` for a catch-all route.
         let span_name = if target.listen_prefix.is_empty() {
@@ -88,7 +96,10 @@ impl Route {
             .metrics(metrics.map(|m| MetricsLayer::new(Arc::clone(m), &ctx, span_name)))
             .stats(stats.map(|r| StatsLayer::new(r.for_api(&def.api_id))))
             .analytics(analytics.map(|h| AnalyticsLayer::new(h.clone(), ctx.clone())))
+            .ip_filter(ip_filter)
+            .cors(cors)
             .path_policy(path_policy)
+            .size_limit(size_limit)
             .auth(auth)
             .rate_limit(rate_limit)
             .transform_headers(transform_headers)

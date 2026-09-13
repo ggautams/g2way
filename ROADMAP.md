@@ -72,7 +72,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] Header transforms (add/remove, request and response)
 - [x] URL rewrite (regex) and method transform
 - [x] Mock responses; allow/block/ignore path lists
-- [ ] CORS, IP allow/deny lists, request size limits
+- [x] CORS, IP allow/deny lists, request size limits
 - [ ] API versioning (header/param selection, per-version overrides)
 
 ## M7 — Resilience & upstream management
@@ -546,3 +546,28 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   drives ignored-mock/blocked/still-authed paths through a real gateway.
   g2-middleware gained the `regex` workspace dep. Next: M6 CORS, IP
   allow/deny lists, request size limits.
+- **2026-08-31 (8)** — M6 CORS + IP lists + request size limits landed.
+  Config in new `g2-core::security`: `ApiDefinition.cors:
+  Option<CorsConfig>` (origins/methods/headers/expose/credentials/max-age/
+  `options_passthrough`; validation rejects `*`+credentials and `*` mixed
+  with explicit origins; empty `allowed_headers` = mirror the preflight's
+  request), `allow_ips`/`block_ips: Vec<String>` (IP or CIDR — new
+  workspace dep `ipnet`), `max_request_body_bytes: Option<u64>`. Three new
+  layers, all **above auth**, outermost first: `IpFilterLayer` (socket
+  peer address only — **never** X-Forwarded-For, spoofable; fails closed
+  on a missing `ClientAddr`; `to_canonical()` so v4-mapped v6 peers match
+  v4 rules; block wins, non-empty allow = allow-list-only, one 403
+  message), `CorsLayer` (answers preflights gateway-side so they need no
+  credentials, decorates all responses incl. 401/403/429 so browsers can
+  read them; disallowed origins still proxied without CORS headers — CORS
+  is not access control), `RequestSizeLimitLayer` (two-tier:
+  Content-Length over limit → 413 up front; a counting body wrapper fails
+  chunked/h2 streams mid-send with a `RequestTooLarge` the **forwarder
+  downcasts** out of the hyper error chain → 413, not a bogus 502 —
+  e2e-tested). **Surprise:** Xcode 26's ld asserts (`name.size() <=
+  maxLength`) on the legacy-mangled symbols of the now-14-layer tower
+  chain type — fixed by workspace `.cargo/config.toml` setting
+  `-Csymbol-mangling-version=v0` (back-references compress the nested
+  types; zero runtime cost; a RUSTFLAGS env var would override it). Next:
+  M6's last box — API versioning (header/param selection, per-version
+  overrides).

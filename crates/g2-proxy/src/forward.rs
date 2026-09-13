@@ -210,6 +210,12 @@ async fn forward(
             rewrite::strip_hop_by_hop_headers(resp.headers_mut());
             resp.map(ProxyBody::new)
         }
+        // A request body that blew its API's size limit fails the upstream
+        // send from the inside; surface that as 413, not a bogus 502.
+        Ok(Err(err)) if g2_middleware::is_request_too_large(&err) => {
+            tracing::debug!(%api_id, "request body exceeded the API's size limit mid-stream");
+            error_response(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+        }
         Ok(Err(err)) => {
             tracing::warn!(%api_id, error = %err, "upstream request failed");
             error_response(StatusCode::BAD_GATEWAY, "upstream request failed")
