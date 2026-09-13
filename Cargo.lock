@@ -746,6 +746,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "bytes",
+ "futures-util",
  "g2-core",
  "g2-middleware",
  "g2-storage",

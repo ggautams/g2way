@@ -16,7 +16,8 @@
 //!    upstream base-path join), applies any method transform, removes
 //!    hop-by-hop headers, adds `X-Forwarded-*`, and streams the request to
 //!    one of the upstream's addresses (round-robin across a `target_list`
-//!    when configured) through a shared pooled hyper client ([`Forwarder`],
+//!    when configured, skipping addresses evicted by the `health` module's
+//!    active probes) through a shared pooled hyper client ([`Forwarder`],
 //!    speaking TLS to `https://` targets via rustls), enforcing the per-API
 //!    upstream timeout.
 //!
@@ -24,6 +25,7 @@
 
 pub mod forward;
 pub mod gateway;
+mod health;
 mod response;
 mod rewrite;
 pub mod router;

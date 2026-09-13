@@ -78,7 +78,7 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 
 - [x] TLS upstream support (hyper-rustls connector) — removes the M1 https limitation
 - [x] Load balancing across multiple upstream targets (round-robin)
-- [ ] Upstream health checks with eviction
+- [x] Upstream health checks with eviction
 - [ ] Circuit breaker per route; retries for idempotent methods
 - [ ] Response caching (Redis, per-API TTL, safe methods only)
 
@@ -636,3 +636,31 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   health — eviction is exactly the next checkbox (upstream health checks),
   which should hook into `next_addr()`. Next: M7 upstream health checks
   with eviction.
+- **2026-08-31 (12)** — M7 upstream health checks with eviction landed.
+  `ApiDefinition.health_check: Option<HealthCheckConfig>` (path — joined
+  onto each address's base path — interval_ms/timeout_ms/
+  unhealthy_threshold/healthy_threshold; all defaulted). Runtime is new
+  `g2-proxy::health`: per-target checker task spawned at route-build time
+  probing every address concurrently (`GET`, 2xx-within-timeout = healthy)
+  through the shared Forwarder client; flags live in a `HealthState`
+  (`Vec<AtomicBool>`, all-healthy at build) that `next_addr()` reads
+  lock-free, advancing the cursor past evicted addresses so the healthy
+  subset keeps round-robining. **Eviction never empties the pool**: all
+  addresses down → plain rotation (fail open, like the limiter's
+  storage-error stance). **Lifecycle is Weak-based**: the checker holds
+  only a `Weak<UpstreamTarget>` and exits on its first tick after a reload
+  drops the old table — no abort plumbing; spawn is skipped (warn) without
+  a tokio runtime, so sync `RouteTable::build` in tests still works. The
+  base target of a versioned API gets no state/checker (it never
+  forwards); `VersionOverrides` gained `health_check` (wholesale replace),
+  and each version's own target is probed. `/g2/node` APIs now carry
+  `target_health` (null = unchecked or versioned). New g2-proxy dep:
+  futures-util (join_all). Verified: unit (thresholds/reinstatement/
+  task-exit-on-drop), e2e (dead target evicted → all requests 200), and
+  **live** (real gateway: `/g2/node` flipped [true,true]→[false,true],
+  6×200 while evicted, then →[true,true] after the upstream returned;
+  evicted/reinstated log lines). k8s smoke deliberately not extended
+  (needs a second in-cluster upstream; revisit if M7 gets a deploy pass).
+  Next: M7 circuit breaker per route; retries for idempotent methods —
+  the breaker can read the same per-address health idea but should trip
+  on live traffic, not probes.

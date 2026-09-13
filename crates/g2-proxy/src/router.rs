@@ -117,8 +117,13 @@ impl Route {
             .ip_filter(ip_filter)
             .cors(cors);
         let chain = match &def.versioning {
-            None => inner_layers(outer, &def, storage, spike_guard)?
-                .build(Forward::new(forwarder, Arc::clone(&target))),
+            None => {
+                if let Some(health) = &def.health_check {
+                    crate::health::spawn_checker(forwarder, &target, health);
+                }
+                inner_layers(outer, &def, storage, spike_guard)?
+                    .build(Forward::new(forwarder, Arc::clone(&target)))
+            }
             // A versioned API gets one inner chain per version — each built
             // from the version's effective definition, with its own upstream
             // target — behind a dispatcher wrapped in the shared outer stack.
@@ -129,6 +134,9 @@ impl Route {
                         .apply(&def, name)
                         .expect("apply() succeeds for every key of the versions map");
                     let vtarget = Arc::new(UpstreamTarget::build(&vdef)?);
+                    if let Some(health) = &vdef.health_check {
+                        crate::health::spawn_checker(forwarder, &vtarget, health);
+                    }
                     let inner =
                         inner_layers(ChainBuilder::new(ctx.clone()), &vdef, storage, spike_guard)?
                             .build_inner(Forward::new(forwarder, vtarget));

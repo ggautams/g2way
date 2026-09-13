@@ -26,8 +26,9 @@ use tower::Service;
 
 /// The pooled upstream client: TLS-capable, with plain `http://` requests
 /// bypassing TLS inside the connector (`https_or_http`).
-type UpstreamClient = Client<HttpsConnector<HttpConnector>, ProxyBody>;
+pub(crate) type UpstreamClient = Client<HttpsConnector<HttpConnector>, ProxyBody>;
 
+use crate::health::HealthState;
 use crate::response::error_response;
 use crate::rewrite;
 
@@ -86,6 +87,11 @@ pub struct UpstreamTarget {
     /// Round-robin cursor over `targets`, shared across clones so every
     /// handle to this target advances one rotation.
     next_target: Arc<AtomicUsize>,
+    /// Per-address health flags written by the checker task (see
+    /// [`crate::health`]); present iff the definition enables health
+    /// checking and this target forwards traffic (the base target of a
+    /// versioned API does not — each version carries its own target).
+    pub(crate) health: Option<Arc<HealthState>>,
 }
 
 impl UpstreamTarget {
@@ -117,6 +123,16 @@ impl UpstreamTarget {
                 })
             })
             .transpose()?;
+        // The base target of a versioned API never forwards (each version's
+        // effective definition — versioning stripped — builds its own
+        // target), so only unversioned definitions get live health state.
+        let health = if def.versioning.is_none() {
+            def.health_check
+                .as_ref()
+                .map(|_| Arc::new(HealthState::new(targets.len())))
+        } else {
+            None
+        };
         Ok(Self {
             api_id: def.api_id.clone(),
             listen_prefix: def.listen_path.trim_end_matches('/').to_owned(),
@@ -127,23 +143,47 @@ impl UpstreamTarget {
             rewrites,
             method_override,
             next_target: Arc::new(AtomicUsize::new(0)),
+            health,
         })
     }
 
     /// The upstream address the next request should use: round-robin across
     /// [`Self::targets`], pod-local (no cross-pod coordination — each
-    /// gateway process keeps its own rotation).
+    /// gateway process keeps its own rotation). Addresses evicted
+    /// by health checking are skipped — the healthy subset keeps
+    /// round-robining — but eviction never empties the pool: with every
+    /// address evicted, the plain rotation is used (fail open; a dead
+    /// upstream then answers `502` like an unchecked one).
     ///
     /// Single-target APIs skip the atomic entirely, so unbalanced routes pay
     /// nothing for this feature. The cursor wraps at `usize::MAX`, which can
     /// skip ahead in the rotation once per ~2^64 requests — harmless.
     #[must_use]
     pub fn next_addr(&self) -> &UpstreamAddr {
-        if self.targets.len() == 1 {
+        let count = self.targets.len();
+        if count == 1 {
             return &self.targets[0];
         }
-        let index = self.next_target.fetch_add(1, Ordering::Relaxed) % self.targets.len();
+        for _ in 0..count {
+            let index = self.next_target.fetch_add(1, Ordering::Relaxed) % count;
+            if self
+                .health
+                .as_ref()
+                .is_none_or(|health| health.is_healthy(index))
+            {
+                return &self.targets[index];
+            }
+        }
+        let index = self.next_target.fetch_add(1, Ordering::Relaxed) % count;
         &self.targets[index]
+    }
+
+    /// Health of each address in [`Self::targets`], in order; `None` when
+    /// health checking is not active for this target (unconfigured, or the
+    /// unused base target of a versioned API). For status/dashboard APIs.
+    #[must_use]
+    pub fn target_health(&self) -> Option<Vec<bool>> {
+        self.health.as_ref().map(|health| health.snapshot())
     }
 }
 
@@ -194,6 +234,11 @@ impl Forwarder {
         Self {
             client: Client::builder(TokioExecutor::new()).build(connector),
         }
+    }
+
+    /// The shared pooled client (health-check probes reuse it).
+    pub(crate) fn client(&self) -> &UpstreamClient {
+        &self.client
     }
 }
 
@@ -436,6 +481,68 @@ mod tests {
         let clone = target.clone();
         assert_eq!(clone.next_addr().authority.host(), "b.internal");
         assert_eq!(target.next_addr().authority.host(), "c.internal");
+    }
+
+    #[test]
+    fn next_addr_skips_evicted_targets_and_fails_open() {
+        let def: ApiDefinition = serde_json::from_str(
+            r#"{"api_id":"hc","name":"hc","listen_path":"/hc/",
+                "target_url":"http://unused.internal",
+                "target_list":["http://a.internal","http://b.internal","http://c.internal"],
+                "health_check":{}}"#,
+        )
+        .expect("def");
+        let target = UpstreamTarget::build(&def).expect("target");
+        let health = target.health.as_ref().expect("health state built");
+        assert_eq!(target.target_health(), Some(vec![true, true, true]));
+
+        // Evicting `b` leaves the healthy pair round-robining.
+        health.set_healthy(1, false);
+        let hosts: Vec<&str> = (0..4)
+            .map(|_| target.next_addr().authority.host())
+            .collect();
+        assert_eq!(
+            hosts,
+            ["a.internal", "c.internal", "a.internal", "c.internal"]
+        );
+
+        // With every address evicted, requests fall open to the rotation
+        // instead of having nowhere to go.
+        health.set_healthy(0, false);
+        health.set_healthy(2, false);
+        let hosts: Vec<&str> = (0..3)
+            .map(|_| target.next_addr().authority.host())
+            .collect();
+        assert!(
+            hosts.iter().all(|h| h.ends_with(".internal")),
+            "fail-open must still pick real addresses, got {hosts:?}"
+        );
+    }
+
+    #[test]
+    fn versioned_base_target_gets_no_health_state() {
+        let def: ApiDefinition = serde_json::from_str(
+            r#"{"api_id":"v","name":"v","listen_path":"/v/",
+                "target_url":"http://v1.internal",
+                "target_list":["http://a.internal","http://b.internal"],
+                "health_check":{},
+                "versioning":{"default_version":"v1","versions":{"v1":{}}}}"#,
+        )
+        .expect("def");
+        let base = UpstreamTarget::build(&def).expect("target");
+        assert!(
+            base.target_health().is_none(),
+            "the unused base target of a versioned API must not report health"
+        );
+        // …while the version's effective (unversioned) definition does.
+        let vdef = def
+            .versioning
+            .as_ref()
+            .expect("versioning")
+            .apply(&def, "v1")
+            .expect("v1 configured");
+        let vtarget = UpstreamTarget::build(&vdef).expect("target");
+        assert_eq!(vtarget.target_health(), Some(vec![true, true]));
     }
 
     #[test]

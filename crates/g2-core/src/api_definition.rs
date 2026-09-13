@@ -49,6 +49,115 @@ fn default_basic_auth_realm() -> String {
     DEFAULT_BASIC_AUTH_REALM.to_owned()
 }
 
+/// Path probed by upstream health checks when a definition does not name one.
+pub const DEFAULT_HEALTH_CHECK_PATH: &str = "/";
+
+fn default_health_check_path() -> String {
+    DEFAULT_HEALTH_CHECK_PATH.to_owned()
+}
+
+fn default_health_check_interval_ms() -> u64 {
+    10_000
+}
+
+fn default_health_check_timeout_ms() -> u64 {
+    2_000
+}
+
+fn default_unhealthy_threshold() -> u32 {
+    3
+}
+
+fn default_healthy_threshold() -> u32 {
+    2
+}
+
+/// Active upstream health checking with eviction (see
+/// [`ApiDefinition::health_check`]).
+///
+/// Each gateway pod probes every upstream address of the API on a fixed
+/// interval with `GET {address base path}{path}`; only a `2xx` answer within
+/// `timeout_ms` counts as healthy. An address failing `unhealthy_threshold`
+/// consecutive probes is evicted from the load-balancing rotation until it
+/// passes `healthy_threshold` consecutive probes again.
+///
+/// Eviction never empties the pool: when every address is evicted, requests
+/// fall back to the plain rotation (a dead upstream then answers `502`
+/// exactly like an unchecked one), so probing a single-target API observes
+/// health without ever refusing traffic.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HealthCheckConfig {
+    /// Path probed on each upstream address, joined onto the address's own
+    /// base path. Must start with `/`; defaults to
+    /// [`DEFAULT_HEALTH_CHECK_PATH`]. May carry a query string.
+    #[serde(default = "default_health_check_path")]
+    pub path: String,
+
+    /// Milliseconds between probe rounds (per pod). Defaults to `10000`.
+    #[serde(default = "default_health_check_interval_ms")]
+    pub interval_ms: u64,
+
+    /// Milliseconds a probe may take before counting as a failure.
+    /// Defaults to `2000`.
+    #[serde(default = "default_health_check_timeout_ms")]
+    pub timeout_ms: u64,
+
+    /// Consecutive probe failures after which an address is evicted from
+    /// the rotation. Defaults to `3`.
+    #[serde(default = "default_unhealthy_threshold")]
+    pub unhealthy_threshold: u32,
+
+    /// Consecutive probe successes after which an evicted address rejoins
+    /// the rotation. Defaults to `2`.
+    #[serde(default = "default_healthy_threshold")]
+    pub healthy_threshold: u32,
+}
+
+impl HealthCheckConfig {
+    /// Validates the health-check settings; `api` names the owning
+    /// definition in errors.
+    fn validate(&self, api: &str) -> Result<(), Error> {
+        let fail = |reason: String| Error::InvalidApiDefinition {
+            api: api.to_owned(),
+            reason,
+        };
+        if !self.path.starts_with('/') {
+            return Err(fail(format!(
+                "`health_check.path` must start with '/', got `{}`",
+                self.path
+            )));
+        }
+        if self.path.parse::<http::uri::PathAndQuery>().is_err() {
+            return Err(fail(format!(
+                "`health_check.path` is not a valid URL path: `{}`",
+                self.path
+            )));
+        }
+        if self.interval_ms == 0 {
+            return Err(fail(
+                "`health_check.interval_ms` must be greater than zero".into(),
+            ));
+        }
+        if self.timeout_ms == 0 {
+            return Err(fail(
+                "`health_check.timeout_ms` must be greater than zero".into(),
+            ));
+        }
+        if self.unhealthy_threshold == 0 {
+            return Err(fail(
+                "`health_check.unhealthy_threshold` must be greater than zero".into(),
+            ));
+        }
+        if self.healthy_threshold == 0 {
+            return Err(fail(
+                "`health_check.healthy_threshold` must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// JWT signature algorithms supported by [`AuthConfig::Jwt`].
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -391,6 +500,13 @@ pub struct ApiDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_request_body_bytes: Option<u64>,
 
+    /// Optional active upstream health checking: each pod probes every
+    /// upstream address on an interval and evicts failing addresses from the
+    /// load-balancing rotation until they recover (see
+    /// [`HealthCheckConfig`]). Unset = no probing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<HealthCheckConfig>,
+
     /// Optional API versioning: the request header or query parameter that
     /// selects a version, and per-version overrides applied on top of this
     /// definition (see [`VersioningConfig`]). Unset = unversioned.
@@ -509,6 +625,9 @@ impl ApiDefinition {
             return Err(fail(
                 "`max_request_body_bytes` must be greater than zero (omit it for no limit)".into(),
             ));
+        }
+        if let Some(health) = &self.health_check {
+            health.validate(&self.api_id)?;
         }
         // Last, so per-version effective definitions are validated only
         // after the base fields have passed (errors then name the version).
@@ -935,6 +1054,81 @@ mod tests {
         let mut def = parse(minimal_json());
         def.target_list = vec!["ftp://x.example".into()];
         assert!(def.validate().is_err(), "non-http scheme accepted");
+    }
+
+    #[test]
+    fn health_check_parses_defaults_and_validates() {
+        let json = r#"{
+            "api_id": "hc",
+            "name": "hc",
+            "listen_path": "/hc/",
+            "target_url": "http://primary.internal",
+            "target_list": ["http://a.internal", "http://b.internal"],
+            "health_check": {}
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        let hc = def.health_check.as_ref().expect("set");
+        assert_eq!(hc.path, DEFAULT_HEALTH_CHECK_PATH);
+        assert_eq!(hc.interval_ms, 10_000);
+        assert_eq!(hc.timeout_ms, 2_000);
+        assert_eq!(hc.unhealthy_threshold, 3);
+        assert_eq!(hc.healthy_threshold, 2);
+
+        // Optionals stay off the wire when unset (old records unaffected).
+        let bare = serde_json::to_string(&parse(minimal_json())).expect("serializes");
+        assert!(!bare.contains("health_check"), "`health_check` serialized");
+
+        // Each invalid setting is rejected.
+        let mut def = parse(json);
+        let base = def.health_check.clone().expect("set");
+        for (label, broken) in [
+            (
+                "relative path",
+                HealthCheckConfig {
+                    path: "health".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "non-URL path",
+                HealthCheckConfig {
+                    path: "/with space".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "zero interval",
+                HealthCheckConfig {
+                    interval_ms: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "zero timeout",
+                HealthCheckConfig {
+                    timeout_ms: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "zero unhealthy",
+                HealthCheckConfig {
+                    unhealthy_threshold: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "zero healthy",
+                HealthCheckConfig {
+                    healthy_threshold: 0,
+                    ..base.clone()
+                },
+            ),
+        ] {
+            def.health_check = Some(broken);
+            assert!(def.validate().is_err(), "`{label}` accepted");
+        }
     }
 
     #[test]

@@ -276,6 +276,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn health_checked_dead_target_is_evicted_from_rotation() {
+        let live = spawn_echo_upstream().await;
+        // Bind-then-drop a listener to obtain a port with nothing behind it.
+        let dead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let dead_addr = dead.local_addr().expect("addr");
+        drop(dead);
+
+        let mut def = def_to("hc", "/hc/", "http://unroutable.invalid");
+        def.target_list = vec![format!("http://{dead_addr}"), format!("http://{live}")];
+        def.health_check = Some(
+            serde_json::from_str(
+                r#"{"interval_ms": 20, "timeout_ms": 250,
+                    "unhealthy_threshold": 2, "healthy_threshold": 1}"#,
+            )
+            .expect("health JSON"),
+        );
+        let gw = gateway_for(vec![def]);
+        let route = gw.routes_snapshot()[0].clone();
+
+        // Both addresses start healthy; the checker evicts the dead one.
+        let mut evicted = false;
+        for _ in 0..400 {
+            if route.target.target_health() == Some(vec![false, true]) {
+                evicted = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(evicted, "dead target never evicted");
+
+        // Every request now lands on the live upstream — no 502s from the
+        // rotation touching the dead address.
+        for _ in 0..4 {
+            let resp = gw.handle(get("/hc/x"), CLIENT).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(body_string(resp).await, "GET /x");
+        }
+    }
+
+    #[tokio::test]
     async fn unmatched_path_is_404_json() {
         let gw = gateway_for(vec![]);
         let resp = gw.handle(get("/nope"), CLIENT).await;

@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::api_definition::HealthCheckConfig;
 use crate::endpoints::{MockResponse, PathRule};
 use crate::transform::{HeaderTransforms, UrlRewriteRule};
 use crate::{ApiDefinition, Error};
@@ -123,6 +124,10 @@ pub struct VersionOverrides {
     /// Replacement mock-response rules for this version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mock_responses: Option<Vec<MockResponse>>,
+
+    /// Replacement upstream health-check settings for this version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check: Option<HealthCheckConfig>,
 }
 
 impl VersioningConfig {
@@ -238,6 +243,9 @@ impl VersioningConfig {
         }
         if let Some(v) = &overrides.mock_responses {
             def.mock_responses = v.clone();
+        }
+        if let Some(v) = &overrides.health_check {
+            def.health_check = Some(v.clone());
         }
         Some(def)
     }
@@ -388,6 +396,35 @@ mod tests {
         // A broken list entry fails like any invalid effective definition.
         let cfg = versioning(r#"{"versions": {"v2": {"target_list": ["nope"]}}}"#);
         assert!(cfg.validate(&base).is_err());
+    }
+
+    #[test]
+    fn health_check_override_replaces_the_base_settings() {
+        let mut base = base();
+        base.target_list = vec!["http://a.internal".into(), "http://b.internal".into()];
+        base.health_check =
+            Some(serde_json::from_str(r#"{"interval_ms": 5000}"#).expect("health JSON"));
+
+        let cfg = versioning(
+            r#"{"versions": {
+                "v1": {},
+                "v2": {"health_check": {"path": "/status", "interval_ms": 1000}}
+            }}"#,
+        );
+        cfg.validate(&base).expect("valid");
+        let v1 = cfg.apply(&base, "v1").expect("configured");
+        assert_eq!(
+            v1.health_check.as_ref().expect("inherited").interval_ms,
+            5000
+        );
+        let v2 = cfg.apply(&base, "v2").expect("configured");
+        let hc = v2.health_check.as_ref().expect("overridden");
+        assert_eq!((hc.path.as_str(), hc.interval_ms), ("/status", 1000));
+
+        // A broken override fails validation naming the version.
+        let cfg = versioning(r#"{"versions": {"v2": {"health_check": {"interval_ms": 0}}}}"#);
+        let err = cfg.validate(&base).unwrap_err().to_string();
+        assert!(err.contains("version `v2`"), "got: {err}");
     }
 
     #[test]

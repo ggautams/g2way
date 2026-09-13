@@ -79,6 +79,10 @@ pub(crate) async fn node(State(state): State<AdminState>) -> Response {
                 "listen_path": route.def.listen_path,
                 "target_url": route.def.target_url,
                 "target_list": route.def.target_list,
+                // Per-address health flags (target_list order); null when
+                // health checking is off or the API is versioned (each
+                // version probes its own target, not surfaced here).
+                "target_health": route.target.target_health(),
                 "auth_mode": route.def.auth.mode_name(),
             })
         })

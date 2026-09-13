@@ -13,6 +13,7 @@ g2-middleware.workspace = true
 g2-storage.workspace = true
 arc-swap.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
