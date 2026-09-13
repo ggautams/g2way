@@ -16,8 +16,10 @@
 //!   rendered on demand through [`PrometheusHandle`] — the admin API's
 //!   `GET /metrics` endpoint.
 //!
-//! Remaining milestone M5 work: per-request analytics records
-//! behind an `AnalyticsSink` trait. See `ROADMAP.md` at the workspace root.
+//! A third concern arrived with milestone M5's analytics task:
+//! [`analytics`] holds the [`AnalyticsSink`] trait, its sinks
+//! (stdout JSON, Redis list, OTLP logs), and the batching worker draining
+//! the per-request records produced by `g2-middleware`'s analytics layer.
 
 use std::str::FromStr;
 
@@ -26,9 +28,11 @@ use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
 use tracing_subscriber::EnvFilter;
 
+pub mod analytics;
 pub mod metrics;
 pub mod otlp;
 
+pub use analytics::{AnalyticsSink, OtlpLogsSink, RedisListSink, StdoutJsonSink};
 pub use metrics::PrometheusHandle;
 pub use otlp::OtlpConfig;
 

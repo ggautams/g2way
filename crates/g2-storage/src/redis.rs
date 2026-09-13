@@ -207,6 +207,45 @@ impl Storage for RedisStorage {
         Ok(keys)
     }
 
+    async fn list_append(
+        &self,
+        key: &str,
+        values: &[String],
+        max_len: Option<u64>,
+    ) -> Result<(), StorageError> {
+        if values.is_empty() {
+            return Ok(()); // RPUSH without values is a protocol error
+        }
+        // One atomic round trip: append, then (optionally) keep only the
+        // newest `max_len` entries — negative LTRIM indices count from the
+        // tail.
+        let mut pipe = redis::pipe();
+        pipe.atomic();
+        pipe.cmd("RPUSH").arg(key).arg(values).ignore();
+        if let Some(max) = max_len {
+            let start = -i64::try_from(max).unwrap_or(i64::MAX);
+            pipe.cmd("LTRIM").arg(key).arg(start).arg(-1).ignore();
+        }
+        pipe.query_async::<()>(&mut self.conn.clone())
+            .await
+            .map_err(backend_err)
+    }
+
+    async fn list_drain(&self, key: &str, max: usize) -> Result<Vec<String>, StorageError> {
+        if max == 0 {
+            return Ok(Vec::new()); // LPOP with COUNT 0 pops nothing anyway
+        }
+        // LPOP with COUNT (Redis 6.2+) pops atomically from the head;
+        // a missing key answers nil.
+        let popped: Option<Vec<String>> = redis::cmd("LPOP")
+            .arg(key)
+            .arg(max)
+            .query_async(&mut self.conn.clone())
+            .await
+            .map_err(backend_err)?;
+        Ok(popped.unwrap_or_default())
+    }
+
     async fn publish(&self, channel: &str, payload: &str) -> Result<(), StorageError> {
         redis::cmd("PUBLISH")
             .arg(channel)
@@ -427,6 +466,24 @@ mod tests {
 
         store.delete(&literal).await.expect("cleanup");
         store.delete(&decoy).await.expect("cleanup");
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a real Redis: `make redis-up`"]
+    async fn list_append_caps_and_drains_fifo() {
+        let store = store().await;
+        let key = test_key("list");
+        store
+            .list_append(&key, &["a".into(), "b".into(), "c".into()], Some(2))
+            .await
+            .expect("append capped");
+        // Cap of 2 kept only the newest two.
+        assert_eq!(store.list_drain(&key, 1).await.expect("drain one"), ["b"]);
+        assert_eq!(store.list_drain(&key, 10).await.expect("drain rest"), ["c"]);
+        assert!(store.list_drain(&key, 10).await.expect("empty").is_empty());
+        // Empty append and zero-drain are no-ops.
+        store.list_append(&key, &[], None).await.expect("empty");
+        assert!(store.list_drain(&key, 0).await.expect("zero").is_empty());
     }
 
     #[tokio::test]

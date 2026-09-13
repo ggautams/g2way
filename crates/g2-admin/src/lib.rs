@@ -417,6 +417,7 @@ mod tests {
                 None,
                 Some(&stats),
                 None,
+                None,
             )
             .expect("table");
             let gateway = Arc::new(Gateway::new(table));

@@ -287,8 +287,13 @@ where
                     if let Some(alias) = session_ctx.session().alias.as_deref() {
                         tracing::Span::current().record(crate::trace::KEY_ALIAS_FIELD, alias);
                     }
-                    req.extensions_mut().insert(session_ctx);
-                    inner.call(req).await
+                    req.extensions_mut().insert(session_ctx.clone());
+                    let mut resp = inner.call(req).await?;
+                    // Also stamp the session onto the response, for layers
+                    // above auth (analytics) that never see the request
+                    // extensions. Cheap: SessionContext is Arc-backed.
+                    resp.extensions_mut().insert(session_ctx);
+                    Ok(resp)
                 }
                 Err(resp) => Ok(resp),
             }

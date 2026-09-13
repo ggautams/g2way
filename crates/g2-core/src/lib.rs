@@ -20,6 +20,7 @@
 //! carries an `org_id` (defaulting to [`DEFAULT_ORG_ID`]) so multi-org
 //! support can be added later without a data migration.
 
+pub mod analytics;
 pub mod api_definition;
 pub mod config;
 mod error;
@@ -27,8 +28,9 @@ pub mod loader;
 pub mod policy;
 pub mod session;
 
+pub use analytics::AnalyticsRecord;
 pub use api_definition::{ApiDefinition, AuthConfig, JwtSigningMethod, DEFAULT_ORG_ID};
-pub use config::{GatewayConfig, SpikeGuardConfig};
+pub use config::{AnalyticsSinkKind, GatewayConfig, SpikeGuardConfig};
 pub use error::Error;
 pub use policy::Policy;
 pub use session::{BasicAuthData, KeySession};

@@ -174,11 +174,12 @@ async fn forward(
     let outcome = tokio::time::timeout(target.timeout, client.request(upstream_req)).await;
     // Time spent talking to the upstream (to failure/timeout on the error
     // paths), recorded on the request span (a no-op without a TraceLayer).
+    let upstream_elapsed = started.elapsed();
     tracing::Span::current().record(
         g2_middleware::trace::UPSTREAM_LATENCY_FIELD,
-        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        u64::try_from(upstream_elapsed.as_millis()).unwrap_or(u64::MAX),
     );
-    match outcome {
+    let mut resp = match outcome {
         Ok(Ok(mut resp)) => {
             rewrite::strip_hop_by_hop_headers(resp.headers_mut());
             resp.map(ProxyBody::new)
@@ -191,7 +192,12 @@ async fn forward(
             tracing::warn!(%api_id, timeout_ms = target.timeout.as_millis(), "upstream timed out");
             error_response(StatusCode::GATEWAY_TIMEOUT, "upstream request timed out")
         }
-    }
+    };
+    // Stamped on every outcome (502/504 included) so outer layers can
+    // attribute latency to the upstream leg.
+    resp.extensions_mut()
+        .insert(g2_middleware::UpstreamLatency(upstream_elapsed));
+    resp
 }
 
 #[cfg(test)]

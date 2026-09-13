@@ -430,6 +430,17 @@ mod tests {
             async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError> {
                 self.0.scan_prefix(prefix).await
             }
+            async fn list_append(
+                &self,
+                key: &str,
+                values: &[String],
+                max_len: Option<u64>,
+            ) -> Result<(), StorageError> {
+                self.0.list_append(key, values, max_len).await
+            }
+            async fn list_drain(&self, key: &str, max: usize) -> Result<Vec<String>, StorageError> {
+                self.0.list_drain(key, max).await
+            }
             async fn publish(&self, channel: &str, payload: &str) -> Result<(), StorageError> {
                 self.0.publish(channel, payload).await
             }
@@ -505,6 +516,21 @@ mod tests {
             }
             async fn scan_prefix(&self, _prefix: &str) -> Result<Vec<String>, StorageError> {
                 Ok(Vec::new())
+            }
+            async fn list_append(
+                &self,
+                _key: &str,
+                _values: &[String],
+                _max_len: Option<u64>,
+            ) -> Result<(), StorageError> {
+                Err(StorageError::Backend("redis is down".into()))
+            }
+            async fn list_drain(
+                &self,
+                _key: &str,
+                _max: usize,
+            ) -> Result<Vec<String>, StorageError> {
+                Err(StorageError::Backend("redis is down".into()))
             }
             async fn publish(&self, _channel: &str, _payload: &str) -> Result<(), StorageError> {
                 Err(StorageError::Backend("redis is down".into()))

@@ -42,6 +42,9 @@ pub struct MemoryStorage {
     /// Pub/sub fan-out per channel for [`Storage::publish`]/`subscribe`.
     /// Senders are created lazily on first use of a channel.
     channels: Arc<RwLock<HashMap<String, tokio::sync::broadcast::Sender<String>>>>,
+
+    /// FIFO lists for [`Storage::list_append`]/[`Storage::list_drain`].
+    lists: Arc<RwLock<HashMap<String, VecDeque<String>>>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -105,6 +108,39 @@ impl Storage for MemoryStorage {
             .filter(|(k, e)| k.starts_with(prefix) && !e.is_expired(now))
             .map(|(k, _)| k.clone())
             .collect())
+    }
+
+    async fn list_append(
+        &self,
+        key: &str,
+        values: &[String],
+        max_len: Option<u64>,
+    ) -> Result<(), StorageError> {
+        if values.is_empty() {
+            return Ok(());
+        }
+        let mut lists = self.lists.write().await;
+        let list = lists.entry(key.to_owned()).or_default();
+        list.extend(values.iter().cloned());
+        if let Some(max) = max_len {
+            let max = usize::try_from(max).unwrap_or(usize::MAX);
+            while list.len() > max {
+                list.pop_front(); // keep the newest entries
+            }
+        }
+        Ok(())
+    }
+
+    async fn list_drain(&self, key: &str, max: usize) -> Result<Vec<String>, StorageError> {
+        let mut lists = self.lists.write().await;
+        let Some(list) = lists.get_mut(key) else {
+            return Ok(Vec::new());
+        };
+        let drained: Vec<String> = list.drain(..max.min(list.len())).collect();
+        if list.is_empty() {
+            lists.remove(key);
+        }
+        Ok(drained)
     }
 
     async fn publish(&self, channel: &str, payload: &str) -> Result<(), StorageError> {
@@ -293,6 +329,44 @@ mod tests {
             .await
             .expect("scan")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn lists_append_and_drain_in_fifo_order() {
+        let store = MemoryStorage::new();
+        let key = "g2:default:analytics:records";
+        store
+            .list_append(key, &["a".into(), "b".into()], None)
+            .await
+            .expect("append");
+        store
+            .list_append(key, &["c".into()], None)
+            .await
+            .expect("append more");
+
+        assert_eq!(store.list_drain(key, 2).await.expect("drain"), ["a", "b"]);
+        assert_eq!(store.list_drain(key, 10).await.expect("drain rest"), ["c"]);
+        assert!(store.list_drain(key, 10).await.expect("empty").is_empty());
+        assert!(store
+            .list_drain("never-written", 10)
+            .await
+            .expect("absent")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_append_caps_at_max_len_keeping_newest() {
+        let store = MemoryStorage::new();
+        let key = "g2:default:analytics:records";
+        for v in ["1", "2", "3"] {
+            store
+                .list_append(key, &[v.to_owned()], Some(2))
+                .await
+                .expect("append");
+        }
+        assert_eq!(store.list_drain(key, 10).await.expect("drain"), ["2", "3"]);
+        // An empty append is a no-op, not an error.
+        store.list_append(key, &[], Some(2)).await.expect("empty");
     }
 
     #[tokio::test]

@@ -64,7 +64,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 
 - [x] OTLP trace export (opentelemetry-otlp) with per-request spans (api_id, key alias, status, upstream latency)
 - [x] OTLP metrics + Prometheus `/metrics` endpoint
-- [ ] `AnalyticsSink` trait + per-request analytics records; stdout-JSON, Redis-list, and OTLP-logs sinks
+- [x] `AnalyticsSink` trait + per-request analytics records; stdout-JSON, Redis-list, and OTLP-logs sinks
 - [ ] deploy/k8s: otel-collector example; document Datadog exporter wiring
 
 ## M6 — Traffic middleware
@@ -449,3 +449,27 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   push is the 60s default period). Not done: k8s Prometheus scrape
   annotations / otel-collector example — that's the M5 deploy checkbox.
   Next: `AnalyticsSink` trait + per-request analytics records.
+- **2026-08-31 (3)** — M5 analytics landed. `AnalyticsRecord` (g2-core, JSON
+  wire shape, optionals omitted/tolerated for schema growth) is produced by
+  a new `AnalyticsLayer` sitting **above auth** (rejections are traffic
+  too), which therefore reads session identity and upstream latency from
+  **response extensions**: auth now stamps `SessionContext` and the
+  forwarder a new `UpstreamLatency` onto every response — the pattern for
+  any future outer layer needing inner-layer facts. Hand-off is a bounded
+  `try_send` (`AnalyticsHandle`, cap 8192; full channel drops + counts,
+  never blocks); one process-wide worker (`g2_telemetry::analytics::run`)
+  batches (512/1s) into an `AnalyticsSink`: `stdout` (JSON lines),
+  `redis` (`Storage` grew `list_append`/`list_drain` — RPUSH+LTRIM capped
+  at 100k/org at `g2:{org}:analytics:records`, LPOP for a future pump),
+  `otlp_logs` (`/v1/logs`, JSON body + api/org/status attrs, same no-tokio
+  batch design). Config `analytics_sink` / `--analytics-sink` /
+  `G2_ANALYTICS_SINK`; validate() requires redis_url / otlp_endpoint for
+  the matching sinks. Binary stops the worker **after** listener drain, so
+  in-flight records flush before exit. `RouteTable::build` grew a 7th
+  `Option` param — that signature now really wants a params-struct
+  refactor next time it grows. Verified live: stdout + redis sinks end to
+  end (alias/hash on authed records, 401/403 recorded bare); otlp_logs via
+  fake-collector unit test; redis `--ignored` suite green. Next: M5 deploy
+  checkbox (otel-collector example + Datadog wiring docs), which should
+  also pick up the deferred k8s smoke gaps (reload/dashboard assertions,
+  Prometheus scrape annotations).

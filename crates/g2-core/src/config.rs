@@ -41,6 +41,43 @@ pub struct SpikeGuardConfig {
     pub refill_per_sec: u32,
 }
 
+/// Which sink per-request analytics records are delivered to.
+///
+/// The sinks themselves live in `g2-telemetry`; this is only the
+/// configuration vocabulary. Absent from the config means analytics
+/// records are not produced at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalyticsSinkKind {
+    /// One JSON record per line on stdout (interleaves cleanly with the
+    /// gateway's line-delimited JSON logs).
+    Stdout,
+    /// Records appended to a capped Redis list (`g2:{org}:analytics:records`)
+    /// for an external pump to drain. Requires `redis_url`.
+    Redis,
+    /// Records exported as OTLP log records to `{otlp_endpoint}/v1/logs`.
+    /// Requires `otlp_endpoint`.
+    OtlpLogs,
+}
+
+/// Error returned when parsing an [`AnalyticsSinkKind`] from a string fails.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown analytics sink `{0}`; expected `stdout`, `redis`, or `otlp_logs`")]
+pub struct ParseAnalyticsSinkError(String);
+
+impl std::str::FromStr for AnalyticsSinkKind {
+    type Err = ParseAnalyticsSinkError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "stdout" => Ok(Self::Stdout),
+            "redis" => Ok(Self::Redis),
+            "otlp_logs" | "otlp-logs" => Ok(Self::OtlpLogs),
+            other => Err(ParseAnalyticsSinkError(other.to_owned())),
+        }
+    }
+}
+
 /// Process-level settings for a gateway node.
 ///
 /// Loaded from an optional YAML/JSON file, with individual fields
@@ -83,6 +120,11 @@ pub struct GatewayConfig {
     /// appended automatically). `None` — the default — disables OTLP
     /// export; per-request spans then only enrich the process logs.
     pub otlp_endpoint: Option<String>,
+
+    /// Where per-request analytics records are delivered. `None` — the
+    /// default — disables analytics records entirely (the observability
+    /// spans/metrics knobs above are independent of this).
+    pub analytics_sink: Option<AnalyticsSinkKind>,
 }
 
 impl Default for GatewayConfig {
@@ -96,6 +138,7 @@ impl Default for GatewayConfig {
             admin_secret: None,
             spike_guard: None,
             otlp_endpoint: None,
+            analytics_sink: None,
         }
     }
 }
@@ -159,6 +202,23 @@ impl GatewayConfig {
                     ),
                 });
             }
+        }
+        match self.analytics_sink {
+            Some(AnalyticsSinkKind::Redis) if self.redis_url.is_none() => {
+                return Err(Error::InvalidGatewayConfig {
+                    reason: "`analytics_sink: redis` requires `redis_url` — with in-memory \
+                             storage the records would pile up unread in this process"
+                        .into(),
+                });
+            }
+            Some(AnalyticsSinkKind::OtlpLogs) if self.otlp_endpoint.is_none() => {
+                return Err(Error::InvalidGatewayConfig {
+                    reason: "`analytics_sink: otlp_logs` requires `otlp_endpoint` — there is \
+                             no collector to export the records to"
+                        .into(),
+                });
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -239,6 +299,45 @@ mod tests {
         cfg.validate().expect("http endpoint is valid");
         cfg.otlp_endpoint = Some("https://collector.example.com".into());
         cfg.validate().expect("https endpoint is valid");
+    }
+
+    #[test]
+    fn analytics_sink_kind_parses_and_serializes() {
+        assert_eq!(
+            "stdout".parse::<AnalyticsSinkKind>().expect("stdout"),
+            AnalyticsSinkKind::Stdout
+        );
+        assert_eq!(
+            "otlp-logs".parse::<AnalyticsSinkKind>().expect("hyphens"),
+            AnalyticsSinkKind::OtlpLogs
+        );
+        assert!("syslog".parse::<AnalyticsSinkKind>().is_err());
+        // The serde form matches the FromStr form (config file vs CLI).
+        assert_eq!(
+            serde_yaml::to_string(&AnalyticsSinkKind::OtlpLogs).expect("yaml"),
+            "otlp_logs\n"
+        );
+    }
+
+    #[test]
+    fn analytics_sinks_require_their_backends() {
+        let mut cfg = GatewayConfig {
+            analytics_sink: Some(AnalyticsSinkKind::Redis),
+            ..GatewayConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "redis sink without redis_url");
+        cfg.redis_url = Some("redis://localhost:6379/".into());
+        cfg.validate().expect("redis sink with redis_url");
+
+        cfg.analytics_sink = Some(AnalyticsSinkKind::OtlpLogs);
+        assert!(cfg.validate().is_err(), "otlp sink without endpoint");
+        cfg.otlp_endpoint = Some("http://collector:4318".into());
+        cfg.validate().expect("otlp sink with endpoint");
+
+        cfg.analytics_sink = Some(AnalyticsSinkKind::Stdout);
+        cfg.redis_url = None;
+        cfg.otlp_endpoint = None;
+        cfg.validate().expect("stdout sink needs nothing");
     }
 
     #[test]

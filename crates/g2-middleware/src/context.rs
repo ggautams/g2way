@@ -71,6 +71,15 @@ impl SessionContext {
     }
 }
 
+/// Time one request spent on its upstream round trip.
+///
+/// Inserted into **response** extensions by the forwarding service (on
+/// success and on 502/504 alike), so outer layers — which never see the
+/// request extensions stamped below them — can attribute latency. Requests
+/// rejected before the forwarder carry no `UpstreamLatency`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpstreamLatency(pub std::time::Duration);
+
 /// The remote (client) socket address of a request.
 ///
 /// Inserted into request extensions by the gateway before the chain runs,

@@ -72,7 +72,7 @@ pub fn build_tracer_provider(cfg: &OtlpConfig) -> Result<SdkTracerProvider, Expo
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{BufRead as _, BufReader, Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -102,8 +102,9 @@ mod tests {
     }
 
     /// A minimal one-shot OTLP/HTTP collector: accepts one request, sends
-    /// back the request line + headers, and answers 200.
-    fn fake_collector() -> (String, mpsc::Receiver<String>) {
+    /// back the request line + headers, and answers 200. Shared with the
+    /// metric and log export tests.
+    pub(crate) fn fake_collector() -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind collector");
         let endpoint = format!("http://{}", listener.local_addr().expect("addr"));
         let (tx, rx) = mpsc::channel();

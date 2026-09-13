@@ -76,6 +76,29 @@ pub trait Storage: Send + Sync + 'static {
     /// take time proportional to the whole keyspace.
     async fn scan_prefix(&self, prefix: &str) -> Result<Vec<String>, StorageError>;
 
+    /// Appends `values` (in order) to the tail of the list at `key`,
+    /// creating the list if absent.
+    ///
+    /// When `max_len` is given, the list is trimmed to its **newest**
+    /// `max_len` elements afterwards — a bounded buffer where the oldest
+    /// entries fall off. This backs write-heavy queues (analytics records
+    /// awaiting a pump), so implementations should batch the append into
+    /// one backend round trip. An empty `values` is a no-op.
+    async fn list_append(
+        &self,
+        key: &str,
+        values: &[String],
+        max_len: Option<u64>,
+    ) -> Result<(), StorageError>;
+
+    /// Removes and returns up to `max` elements from the **head** (oldest
+    /// end) of the list at `key`, in list order. An absent or empty list
+    /// yields an empty vector.
+    ///
+    /// Together with [`list_append`](Storage::list_append) this gives FIFO
+    /// queue semantics — how an analytics pump drains records.
+    async fn list_drain(&self, key: &str, max: usize) -> Result<Vec<String>, StorageError>;
+
     /// Broadcasts `payload` to every current subscriber of `channel`.
     ///
     /// Fire-and-forget fan-out (Redis pub/sub semantics): delivery is

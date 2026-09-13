@@ -41,6 +41,10 @@ pub struct ReloadContext {
     /// OpenTelemetry request instruments, if metric export is enabled
     /// (created once per process; shared across reloads).
     pub metrics: Option<Arc<g2_middleware::HttpMetrics>>,
+
+    /// Producer handle of the analytics channel, if an analytics sink is
+    /// configured (one process-wide worker; shared across reloads).
+    pub analytics: Option<g2_middleware::AnalyticsHandle>,
 }
 
 impl ReloadContext {
@@ -63,6 +67,7 @@ impl ReloadContext {
             self.spike_guard.as_ref(),
             self.stats.as_ref(),
             self.metrics.as_ref(),
+            self.analytics.as_ref(),
         )?)
     }
 }
@@ -117,6 +122,7 @@ mod tests {
             spike_guard: None,
             stats: None,
             metrics: None,
+            analytics: None,
         }
     }
 

@@ -6,6 +6,7 @@ use http::{Request, Response};
 use tower::util::BoxCloneSyncService;
 use tower::{Service, ServiceBuilder};
 
+use crate::analytics::AnalyticsLayer;
 use crate::api_id_header::ApiIdHeaderLayer;
 use crate::auth::AuthLayer;
 use crate::context::RequestContext;
@@ -29,11 +30,13 @@ use crate::{ChainService, ProxyBody};
 ///    when metrics are disabled).
 /// 3. [`StatsLayer`] — per-API request counters (above auth so rejections
 ///    count too; absent when stats are disabled).
-/// 4. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
-/// 5. [`AuthLayer`] — token auth (absent for keyless APIs).
-/// 6. [`RateLimitLayer`] — session rate/quota enforcement (absent for
+/// 4. [`AnalyticsLayer`] — per-request analytics records (above auth for
+///    the same reason; absent when no analytics sink is configured).
+/// 5. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
+/// 6. [`AuthLayer`] — token auth (absent for keyless APIs).
+/// 7. [`RateLimitLayer`] — session rate/quota enforcement (absent for
 ///    keyless APIs, which have no session to read limits from).
-/// 7. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+/// 8. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
 ///
 /// Transform layers slot in here as later M6 tasks land.
 #[derive(Debug, Clone)]
@@ -44,6 +47,7 @@ pub struct ChainBuilder {
     stats: Option<StatsLayer>,
     trace: Option<TraceLayer>,
     metrics: Option<MetricsLayer>,
+    analytics: Option<AnalyticsLayer>,
 }
 
 impl ChainBuilder {
@@ -57,6 +61,7 @@ impl ChainBuilder {
             stats: None,
             trace: None,
             metrics: None,
+            analytics: None,
         }
     }
 
@@ -71,6 +76,13 @@ impl ChainBuilder {
     #[must_use]
     pub fn metrics(mut self, metrics: Option<MetricsLayer>) -> Self {
         self.metrics = metrics;
+        self
+    }
+
+    /// Adds per-request analytics records (`None` is a no-op).
+    #[must_use]
+    pub fn analytics(mut self, analytics: Option<AnalyticsLayer>) -> Self {
+        self.analytics = analytics;
         self
     }
 
@@ -112,6 +124,7 @@ impl ChainBuilder {
             .option_layer(self.trace)
             .option_layer(self.metrics)
             .option_layer(self.stats)
+            .option_layer(self.analytics)
             .layer(SetContextLayer::new(self.ctx))
             .option_layer(self.auth)
             .option_layer(self.rate_limit)

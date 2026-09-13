@@ -17,6 +17,7 @@
 //! [`SessionContext`], and downstream layers (like [`ApiIdHeaderLayer`])
 //! read them back.
 
+pub mod analytics;
 pub mod api_id_header;
 pub mod auth;
 pub mod body;
@@ -30,11 +31,12 @@ pub mod spike;
 pub mod stats;
 pub mod trace;
 
+pub use analytics::{Analytics, AnalyticsHandle, AnalyticsLayer};
 pub use api_id_header::{ApiIdHeader, ApiIdHeaderLayer, API_ID_HEADER};
 pub use auth::{Auth, AuthLayer};
 pub use body::ProxyBody;
 pub use chain::ChainBuilder;
-pub use context::{ClientAddr, RequestContext, SessionContext};
+pub use context::{ClientAddr, RequestContext, SessionContext, UpstreamLatency};
 pub use metrics::{HttpMetrics, MetricsLayer};
 pub use rate_limit::{RateLimit, RateLimitLayer};
 pub use set_context::{SetContext, SetContextLayer};

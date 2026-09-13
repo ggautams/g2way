@@ -55,7 +55,7 @@ async fn spawn_gateway_with_storage(
     defs: Vec<ApiDefinition>,
     storage: g2_storage::SharedStorage,
 ) -> (SocketAddr, oneshot::Sender<()>) {
-    let table = RouteTable::build(defs, &Forwarder::new(), &storage, None, None, None)
+    let table = RouteTable::build(defs, &Forwarder::new(), &storage, None, None, None, None)
         .expect("route table");
     let gateway = Arc::new(Gateway::new(table));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))

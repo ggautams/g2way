@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use g2_core::config::AnalyticsSinkKind;
 use g2_core::GatewayConfig;
 use g2_proxy::{Forwarder, Gateway};
 use g2_storage::{MemoryStorage, RedisStorage, SharedStorage};
@@ -54,10 +55,22 @@ struct Cli {
     #[arg(long, env = "G2_OTLP_ENDPOINT")]
     otlp_endpoint: Option<String>,
 
+    /// Analytics sink for per-request records: `stdout`, `redis`, or
+    /// `otlp_logs` (overrides the config file). Without one, no analytics
+    /// records are produced.
+    #[arg(long, env = "G2_ANALYTICS_SINK")]
+    analytics_sink: Option<AnalyticsSinkKind>,
+
     /// Log output format: `json` (default) or `pretty`.
     #[arg(long, env = "G2_LOG_FORMAT", default_value = "json")]
     log_format: LogFormat,
 }
+
+/// Records buffered between the proxy path and the analytics worker. At
+/// ~500 bytes a record this bounds the buffer around 4 MB; when the worker
+/// falls further behind, records are dropped (counted), never blocking a
+/// request.
+const ANALYTICS_CHANNEL_CAPACITY: usize = 8192;
 
 fn main() -> ExitCode {
     match run(Cli::parse()) {
@@ -94,6 +107,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(otlp_endpoint) = cli.otlp_endpoint {
         config.otlp_endpoint = Some(otlp_endpoint);
+    }
+    if let Some(analytics_sink) = cli.analytics_sink {
+        config.analytics_sink = Some(analytics_sink);
     }
     config.validate()?;
 
@@ -145,6 +161,33 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             );
             Arc::new(g2_middleware::SpikeGuard::new(cfg))
         });
+        // Analytics: one process-wide worker drains a bounded channel into
+        // the configured sink; every route's analytics layer feeds the
+        // channel through a cheap-clone handle.
+        let sink: Option<Arc<dyn g2_telemetry::AnalyticsSink>> = match config.analytics_sink {
+            None => None,
+            Some(AnalyticsSinkKind::Stdout) => Some(Arc::new(g2_telemetry::StdoutJsonSink::new())),
+            Some(AnalyticsSinkKind::Redis) => Some(Arc::new(g2_telemetry::RedisListSink::new(
+                Arc::clone(&storage),
+            ))),
+            Some(AnalyticsSinkKind::OtlpLogs) => {
+                let cfg = otlp
+                    .as_ref()
+                    .expect("validate() guarantees otlp_endpoint for the otlp_logs sink");
+                Some(Arc::new(g2_telemetry::OtlpLogsSink::new(cfg)?))
+            }
+        };
+        let mut analytics = None;
+        let mut analytics_worker = None;
+        if let Some(sink) = sink {
+            tracing::info!(sink = sink.name(), "analytics records enabled");
+            let (handle, rx) = g2_middleware::AnalyticsHandle::channel(ANALYTICS_CHANNEL_CAPACITY);
+            let (stop_tx, stop_rx) = tokio::sync::watch::channel(());
+            let worker = tokio::spawn(g2_telemetry::analytics::run(rx, stop_rx, sink));
+            analytics = Some(handle);
+            analytics_worker = Some((stop_tx, worker));
+        }
+
         let stats = Arc::new(g2_middleware::StatsRegistry::new());
         // Both definition sources (files + storage, ADR-0002) are loaded
         // through the reload context, at startup and on every reload nudge.
@@ -156,6 +199,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             spike_guard,
             stats: Some(Arc::clone(&stats)),
             metrics,
+            analytics,
         };
         let gateway = Arc::new(Gateway::new(reload_ctx.build_table().await?));
         tracing::info!(apps_dir = %config.apps_dir.display(), "API definitions loaded");
@@ -219,6 +263,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 tokio::try_join!(proxy, admin)?;
             }
             None => proxy.await?,
+        }
+        // The listeners have drained: stop the analytics worker, which
+        // flushes queued records and shuts its sink down before we return.
+        if let Some((stop_tx, worker)) = analytics_worker {
+            let _ = stop_tx.send(());
+            let _ = worker.await;
         }
         Ok::<(), Box<dyn std::error::Error>>(())
     })?;
