@@ -142,6 +142,7 @@ pub(crate) fn apply_forwarded_headers(
     headers: &mut HeaderMap,
     client_ip: IpAddr,
     original_host: Option<&HeaderValue>,
+    tls: bool,
 ) {
     const XFF: HeaderName = HeaderName::from_static("x-forwarded-for");
     const XFH: HeaderName = HeaderName::from_static("x-forwarded-host");
@@ -161,9 +162,12 @@ pub(crate) fn apply_forwarded_headers(
         }
     }
     if !headers.contains_key(&XFP) {
-        // TLS termination lands in a later milestone; today the gateway
-        // itself only speaks plain HTTP to clients.
-        headers.insert(XFP, HeaderValue::from_static("http"));
+        // `tls` reports whether the gateway terminated TLS on this
+        // connection (from `ConnectionInfo`, stamped by the accept loop).
+        headers.insert(
+            XFP,
+            HeaderValue::from_static(if tls { "https" } else { "http" }),
+        );
     }
 }
 
@@ -176,13 +180,14 @@ pub(crate) fn prepare_upstream_headers(
     headers: &mut HeaderMap,
     target: &UpstreamTarget,
     client_ip: IpAddr,
+    tls: bool,
 ) {
     let original_host = headers.get(HOST).cloned();
     strip_hop_by_hop_headers(headers);
     if !target.preserve_host_header {
         headers.remove(HOST);
     }
-    apply_forwarded_headers(headers, client_ip, original_host.as_ref());
+    apply_forwarded_headers(headers, client_ip, original_host.as_ref(), tls);
 }
 
 #[cfg(test)]
@@ -319,7 +324,7 @@ mod tests {
         let ip: IpAddr = "10.0.0.9".parse().expect("ip");
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-for", HeaderValue::from_static("1.2.3.4"));
-        apply_forwarded_headers(&mut h, ip, None);
+        apply_forwarded_headers(&mut h, ip, None, false);
         assert_eq!(
             h.get("x-forwarded-for").expect("xff").as_bytes(),
             b"1.2.3.4, 10.0.0.9"
@@ -331,7 +336,7 @@ mod tests {
         let ip: IpAddr = "10.0.0.9".parse().expect("ip");
         let mut h = HeaderMap::new();
         let host = HeaderValue::from_static("api.example.com");
-        apply_forwarded_headers(&mut h, ip, Some(&host));
+        apply_forwarded_headers(&mut h, ip, Some(&host), false);
         assert_eq!(
             h.get("x-forwarded-host").expect("xfh").as_bytes(),
             b"api.example.com"
@@ -341,7 +346,18 @@ mod tests {
         // Pre-set values (from a trusted fronting proxy) are preserved.
         let mut h = HeaderMap::new();
         h.insert("x-forwarded-proto", HeaderValue::from_static("https"));
-        apply_forwarded_headers(&mut h, ip, Some(&host));
+        apply_forwarded_headers(&mut h, ip, Some(&host), false);
+        assert_eq!(
+            h.get("x-forwarded-proto").expect("xfp").as_bytes(),
+            b"https"
+        );
+    }
+
+    #[test]
+    fn forwarded_proto_reflects_terminated_tls() {
+        let ip: IpAddr = "10.0.0.9".parse().expect("ip");
+        let mut h = HeaderMap::new();
+        apply_forwarded_headers(&mut h, ip, None, true);
         assert_eq!(
             h.get("x-forwarded-proto").expect("xfp").as_bytes(),
             b"https"
@@ -355,7 +371,7 @@ mod tests {
         let r = route("/a/", "http://u.internal", true, false);
         let mut h = HeaderMap::new();
         h.insert(HOST, HeaderValue::from_static("public.example.com"));
-        prepare_upstream_headers(&mut h, &r, ip);
+        prepare_upstream_headers(&mut h, &r, ip, false);
         assert!(h.get(HOST).is_none(), "host dropped by default");
         // …but still recorded for the upstream's benefit.
         assert_eq!(
@@ -366,7 +382,7 @@ mod tests {
         let r = route("/a/", "http://u.internal", true, true);
         let mut h = HeaderMap::new();
         h.insert(HOST, HeaderValue::from_static("public.example.com"));
-        prepare_upstream_headers(&mut h, &r, ip);
+        prepare_upstream_headers(&mut h, &r, ip, false);
         assert_eq!(
             h.get(HOST).expect("host preserved").as_bytes(),
             b"public.example.com"

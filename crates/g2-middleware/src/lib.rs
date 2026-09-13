@@ -46,7 +46,9 @@ pub use auth::{Auth, AuthLayer};
 pub use body::ProxyBody;
 pub use cache::{Cache, CacheLayer, CACHE_STATUS_HEADER};
 pub use chain::ChainBuilder;
-pub use context::{AuthBypass, ClientAddr, RequestContext, SessionContext, UpstreamLatency};
+pub use context::{
+    AuthBypass, ClientAddr, ConnectionInfo, RequestContext, SessionContext, UpstreamLatency,
+};
 pub use cors::{Cors, CorsLayer};
 pub use ip_filter::{IpFilter, IpFilterLayer};
 pub use jwks::{JwksFetch, JwksFetchFuture, SharedJwksFetch};

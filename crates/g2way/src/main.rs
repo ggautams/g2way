@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
-use g2_core::config::AnalyticsSinkKind;
+use g2_core::config::{AnalyticsSinkKind, ClientCertMode};
 use g2_core::GatewayConfig;
 use g2_proxy::{Forwarder, Gateway};
 use g2_storage::{MemoryStorage, RedisStorage, SharedStorage};
@@ -60,6 +60,28 @@ struct Cli {
     /// records are produced.
     #[arg(long, env = "G2_ANALYTICS_SINK")]
     analytics_sink: Option<AnalyticsSinkKind>,
+
+    /// PEM file with the proxy listener's server certificate chain
+    /// (overrides the config file). Setting a certificate and key enables
+    /// TLS termination; without them the listener speaks plain HTTP.
+    #[arg(long, env = "G2_TLS_CERT")]
+    tls_cert: Option<PathBuf>,
+
+    /// PEM file with the proxy listener's private key (overrides the
+    /// config file).
+    #[arg(long, env = "G2_TLS_KEY")]
+    tls_key: Option<PathBuf>,
+
+    /// PEM bundle of CA certificates for verifying client certificates
+    /// (overrides the config file). Requires a client cert mode other than
+    /// `none`.
+    #[arg(long, env = "G2_TLS_CLIENT_CA")]
+    tls_client_ca: Option<PathBuf>,
+
+    /// What the TLS handshake demands from clients: `none`, `optional`, or
+    /// `required` (overrides the config file).
+    #[arg(long, env = "G2_TLS_CLIENT_CERT_MODE")]
+    tls_client_cert_mode: Option<ClientCertMode>,
 
     /// Log output format: `json` (default) or `pretty`.
     #[arg(long, env = "G2_LOG_FORMAT", default_value = "json")]
@@ -111,7 +133,37 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(analytics_sink) = cli.analytics_sink {
         config.analytics_sink = Some(analytics_sink);
     }
+    if cli.tls_cert.is_some() || cli.tls_key.is_some() || cli.tls_client_ca.is_some() {
+        let tls = config.tls.get_or_insert_with(Default::default);
+        if let Some(cert) = cli.tls_cert {
+            tls.cert_file = Some(cert);
+        }
+        if let Some(key) = cli.tls_key {
+            tls.key_file = Some(key);
+        }
+        if let Some(ca) = cli.tls_client_ca {
+            tls.client_ca_file = Some(ca);
+        }
+    }
+    if let Some(mode) = cli.tls_client_cert_mode {
+        // A mode flag alone (no cert/key anywhere) still creates the block,
+        // and validate() below then demands the cert and key.
+        config
+            .tls
+            .get_or_insert_with(Default::default)
+            .client_cert_mode = mode;
+    }
     config.validate()?;
+
+    // Certificates load before anything else starts: a gateway that cannot
+    // load its configured TLS material must fail fast, never fall back to
+    // a plaintext listener.
+    let tls_acceptor = match &config.tls {
+        Some(tls) => {
+            Some(g2way::tls::build_acceptor(tls).map_err(|e| -> Box<dyn std::error::Error> { e })?)
+        }
+        None => None,
+    };
 
     // The OTLP exporters batch on their own threads (no tokio dependency),
     // so telemetry is deliberately initialized before the runtime exists and
@@ -216,10 +268,17 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
+        if let (Some(_), Some(tls)) = (&tls_acceptor, &config.tls) {
+            tracing::info!(
+                client_cert_mode = ?tls.client_cert_mode,
+                "TLS termination enabled on the proxy listener"
+            );
+        }
         tracing::info!(
             listen_addr = %config.listen_addr,
             routes = gateway.route_count(),
             version = env!("CARGO_PKG_VERSION"),
+            tls = tls_acceptor.is_some(),
             "g2way listening"
         );
 
@@ -234,12 +293,18 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             let _ = rx.changed().await;
         };
 
-        let proxy = server::serve(
-            listener,
-            Arc::clone(&gateway),
-            wait_for_shutdown(shutdown_rx.clone()),
-            grace,
-        );
+        let proxy = {
+            let gateway = Arc::clone(&gateway);
+            let shutdown = wait_for_shutdown(shutdown_rx.clone());
+            async move {
+                match tls_acceptor {
+                    Some(acceptor) => {
+                        server::serve_tls(listener, gateway, acceptor, shutdown, grace).await
+                    }
+                    None => server::serve(listener, gateway, shutdown, grace).await,
+                }
+            }
+        };
         match &config.admin_listen_addr {
             Some(admin_addr) => {
                 let secret = config

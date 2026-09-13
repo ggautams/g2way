@@ -59,10 +59,20 @@ impl Gateway {
     /// streaming `Incoming` while tests inject synthetic bodies; the body is
     /// boxed into [`ProxyBody`] at the chain boundary.
     ///
+    /// `conn` carries the transport-level facts only the accept loop knows
+    /// (TLS terminated? verified client-cert fingerprint?); it is stamped
+    /// into request extensions next to the peer address. Plaintext callers
+    /// pass `ConnectionInfo::default()`.
+    ///
     /// Never returns an error: every failure is mapped to an HTTP error
     /// response (`404` no matching API; `502`/`504` and later `401`/`429`
     /// come from inside the chain).
-    pub async fn handle<B>(&self, req: Request<B>, remote_addr: SocketAddr) -> Response<ProxyBody>
+    pub async fn handle<B>(
+        &self,
+        req: Request<B>,
+        remote_addr: SocketAddr,
+        conn: g2_middleware::ConnectionInfo,
+    ) -> Response<ProxyBody>
     where
         B: Body<Data = Bytes> + Send + Sync + 'static,
         B::Error: Into<BoxError>,
@@ -86,6 +96,7 @@ impl Gateway {
         let mut req = req.map(ProxyBody::new);
         req.extensions_mut()
             .insert(g2_middleware::ClientAddr(remote_addr));
+        req.extensions_mut().insert(conn);
         match chain.oneshot(req).await {
             Ok(resp) => resp,
             Err(never) => match never {},
@@ -207,7 +218,9 @@ mod tests {
             &format!("http://{upstream}"),
         )]);
 
-        let resp = gw.handle(get("/echo/foo/bar?x=1"), CLIENT).await;
+        let resp = gw
+            .handle(get("/echo/foo/bar?x=1"), CLIENT, Default::default())
+            .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let host = resp.headers().get("x-echo-host").cloned().expect("host");
         let xff = resp.headers().get("x-echo-xff").cloned().expect("xff");
@@ -231,7 +244,7 @@ mod tests {
         let mut req = get("/echo/x");
         req.headers_mut()
             .insert(API_ID_HEADER, HeaderValue::from_static("spoofed"));
-        let resp = gw.handle(req, CLIENT).await;
+        let resp = gw.handle(req, CLIENT, Default::default()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(
             resp.headers()
@@ -249,7 +262,7 @@ mod tests {
         def.preserve_host_header = true;
         let gw = gateway_for(vec![def]);
 
-        let resp = gw.handle(get("/echo/x"), CLIENT).await;
+        let resp = gw.handle(get("/echo/x"), CLIENT, Default::default()).await;
         assert_eq!(
             resp.headers().get("x-echo-host").expect("host").as_bytes(),
             b"gw.example.com"
@@ -268,7 +281,7 @@ mod tests {
 
         let mut bodies = Vec::new();
         for _ in 0..4 {
-            let resp = gw.handle(get("/lb/x"), CLIENT).await;
+            let resp = gw.handle(get("/lb/x"), CLIENT, Default::default()).await;
             assert_eq!(resp.status(), StatusCode::OK);
             bodies.push(body_string(resp).await);
         }
@@ -311,7 +324,7 @@ mod tests {
         // Every request now lands on the live upstream — no 502s from the
         // rotation touching the dead address.
         for _ in 0..4 {
-            let resp = gw.handle(get("/hc/x"), CLIENT).await;
+            let resp = gw.handle(get("/hc/x"), CLIENT, Default::default()).await;
             assert_eq!(resp.status(), StatusCode::OK);
             assert_eq!(body_string(resp).await, "GET /x");
         }
@@ -320,7 +333,7 @@ mod tests {
     #[tokio::test]
     async fn unmatched_path_is_404_json() {
         let gw = gateway_for(vec![]);
-        let resp = gw.handle(get("/nope"), CLIENT).await;
+        let resp = gw.handle(get("/nope"), CLIENT, Default::default()).await;
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
         assert_eq!(
             resp.headers()
@@ -342,7 +355,7 @@ mod tests {
         drop(dead);
 
         let gw = gateway_for(vec![def_to("down", "/down/", &format!("http://{addr}"))]);
-        let resp = gw.handle(get("/down/x"), CLIENT).await;
+        let resp = gw.handle(get("/down/x"), CLIENT, Default::default()).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
 
@@ -369,7 +382,7 @@ mod tests {
         let mut def = def_to("slow", "/slow/", &format!("http://{addr}"));
         def.upstream_timeout_ms = 100;
         let gw = gateway_for(vec![def]);
-        let resp = gw.handle(get("/slow/x"), CLIENT).await;
+        let resp = gw.handle(get("/slow/x"), CLIENT, Default::default()).await;
         assert_eq!(resp.status(), StatusCode::GATEWAY_TIMEOUT);
     }
 
@@ -380,7 +393,7 @@ mod tests {
         let gw = gateway_for(vec![def_to("all", "/", &format!("http://{upstream}"))]);
 
         for path in ["/hello", "/ready"] {
-            let resp = gw.handle(get(path), CLIENT).await;
+            let resp = gw.handle(get(path), CLIENT, Default::default()).await;
             assert_eq!(resp.status(), StatusCode::OK);
             let body = body_string(resp).await;
             assert!(body.contains("\"status\":\"pass\""), "body: {body}");
@@ -393,7 +406,9 @@ mod tests {
         let gw = gateway_for(vec![]);
         assert_eq!(gw.route_count(), 0);
         assert_eq!(
-            gw.handle(get("/echo/x"), CLIENT).await.status(),
+            gw.handle(get("/echo/x"), CLIENT, Default::default())
+                .await
+                .status(),
             StatusCode::NOT_FOUND
         );
 
@@ -410,7 +425,9 @@ mod tests {
         gw.reload(table);
         assert_eq!(gw.route_count(), 1);
         assert_eq!(
-            gw.handle(get("/echo/x"), CLIENT).await.status(),
+            gw.handle(get("/echo/x"), CLIENT, Default::default())
+                .await
+                .status(),
             StatusCode::OK
         );
     }
@@ -439,21 +456,21 @@ mod tests {
         let gw = gateway_with_storage(vec![def], &storage);
 
         // Missing token → 401.
-        let resp = gw.handle(get("/sec/x"), CLIENT).await;
+        let resp = gw.handle(get("/sec/x"), CLIENT, Default::default()).await;
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
 
         // Wrong token → 403.
         let mut req = get("/sec/x");
         req.headers_mut()
             .insert("authorization", HeaderValue::from_static("wrong"));
-        let resp = gw.handle(req, CLIENT).await;
+        let resp = gw.handle(req, CLIENT, Default::default()).await;
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
         // Valid token → proxied upstream.
         let mut req = get("/sec/x");
         req.headers_mut()
             .insert("authorization", HeaderValue::from_static("Bearer s3cret"));
-        let resp = gw.handle(req, CLIENT).await;
+        let resp = gw.handle(req, CLIENT, Default::default()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(body_string(resp).await, "GET /x");
     }
@@ -487,7 +504,7 @@ mod tests {
         });
 
         let gw = gateway_for(vec![def_to("h", "/h/", &format!("http://{addr}"))]);
-        let resp = gw.handle(get("/h/x"), CLIENT).await;
+        let resp = gw.handle(get("/h/x"), CLIENT, Default::default()).await;
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(resp.headers().get("keep-alive").is_none());
         assert_eq!(

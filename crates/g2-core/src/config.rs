@@ -78,6 +78,70 @@ impl std::str::FromStr for AnalyticsSinkKind {
     }
 }
 
+/// How the TLS listener treats client certificates (mTLS).
+///
+/// This is the **transport-level** knob: it decides what the TLS handshake
+/// demands. Whether a presented certificate is *authorized* is a separate,
+/// per-API decision made by the `mtls` auth mode (see `docs/tls.md`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientCertMode {
+    /// Client certificates are neither requested nor accepted (plain TLS
+    /// termination). The default.
+    #[default]
+    None,
+    /// Clients are asked for a certificate; connections without one are
+    /// still accepted. APIs in `mtls` auth mode then reject certificate-less
+    /// requests with `401` while other APIs keep working.
+    Optional,
+    /// The handshake fails unless the client presents a certificate signed
+    /// by the configured `client_ca_file` bundle.
+    Required,
+}
+
+/// Error returned when parsing a [`ClientCertMode`] from a string fails.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown client cert mode `{0}`; expected `none`, `optional`, or `required`")]
+pub struct ParseClientCertModeError(String);
+
+impl std::str::FromStr for ClientCertMode {
+    type Err = ParseClientCertModeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "none" => Ok(Self::None),
+            "optional" => Ok(Self::Optional),
+            "required" => Ok(Self::Required),
+            other => Err(ParseClientCertModeError(other.to_owned())),
+        }
+    }
+}
+
+/// TLS termination settings for the proxy listener.
+///
+/// Absent from the config means the listener speaks plain HTTP. When
+/// present, `cert_file` and `key_file` are both required; the certificate
+/// files are read once at startup (rotation requires a restart — the
+/// process config is not hot-reloadable, see ADR-0003).
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TlsConfig {
+    /// PEM file holding the server certificate chain, leaf first.
+    pub cert_file: Option<PathBuf>,
+
+    /// PEM file holding the server private key (PKCS#8, PKCS#1, or SEC1).
+    pub key_file: Option<PathBuf>,
+
+    /// PEM bundle of CA certificates client certificates are verified
+    /// against. Required when `client_cert_mode` is not `none`; setting it
+    /// while `client_cert_mode` is `none` is a config error (it would be
+    /// silently ignored otherwise).
+    pub client_ca_file: Option<PathBuf>,
+
+    /// What the handshake demands from clients (see [`ClientCertMode`]).
+    pub client_cert_mode: ClientCertMode,
+}
+
 /// Process-level settings for a gateway node.
 ///
 /// Loaded from an optional YAML/JSON file, with individual fields
@@ -125,6 +189,10 @@ pub struct GatewayConfig {
     /// default — disables analytics records entirely (the observability
     /// spans/metrics knobs above are independent of this).
     pub analytics_sink: Option<AnalyticsSinkKind>,
+
+    /// TLS termination for the proxy listener. `None` — the default — means
+    /// the listener speaks plain HTTP (see [`TlsConfig`] and `docs/tls.md`).
+    pub tls: Option<TlsConfig>,
 }
 
 impl Default for GatewayConfig {
@@ -139,6 +207,7 @@ impl Default for GatewayConfig {
             spike_guard: None,
             otlp_endpoint: None,
             analytics_sink: None,
+            tls: None,
         }
     }
 }
@@ -219,6 +288,36 @@ impl GatewayConfig {
                 });
             }
             _ => {}
+        }
+        if let Some(tls) = &self.tls {
+            if tls.cert_file.is_none() || tls.key_file.is_none() {
+                return Err(Error::InvalidGatewayConfig {
+                    reason: "`tls` requires both `tls.cert_file` and `tls.key_file` (omit the \
+                             `tls` block entirely for a plain-HTTP listener)"
+                        .into(),
+                });
+            }
+            if tls.client_cert_mode != ClientCertMode::None && tls.client_ca_file.is_none() {
+                return Err(Error::InvalidGatewayConfig {
+                    reason: format!(
+                        "`tls.client_cert_mode: {}` requires `tls.client_ca_file` — there is \
+                         no CA to verify client certificates against",
+                        if tls.client_cert_mode == ClientCertMode::Optional {
+                            "optional"
+                        } else {
+                            "required"
+                        }
+                    ),
+                });
+            }
+            if tls.client_cert_mode == ClientCertMode::None && tls.client_ca_file.is_some() {
+                return Err(Error::InvalidGatewayConfig {
+                    reason: "`tls.client_ca_file` is set but `tls.client_cert_mode` is `none`; \
+                             the bundle would be silently ignored — set the mode to `optional` \
+                             or `required`, or drop the bundle"
+                        .into(),
+                });
+            }
         }
         Ok(())
     }
@@ -338,6 +437,102 @@ mod tests {
         cfg.redis_url = None;
         cfg.otlp_endpoint = None;
         cfg.validate().expect("stdout sink needs nothing");
+    }
+
+    #[test]
+    fn tls_block_requires_cert_and_key() {
+        let mut cfg = GatewayConfig {
+            tls: Some(TlsConfig::default()),
+            ..GatewayConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "empty tls block");
+
+        cfg.tls = Some(TlsConfig {
+            cert_file: Some("server.pem".into()),
+            ..TlsConfig::default()
+        });
+        assert!(cfg.validate().is_err(), "cert without key");
+
+        cfg.tls = Some(TlsConfig {
+            cert_file: Some("server.pem".into()),
+            key_file: Some("server-key.pem".into()),
+            ..TlsConfig::default()
+        });
+        cfg.validate().expect("cert + key is valid");
+    }
+
+    #[test]
+    fn client_cert_mode_and_ca_bundle_must_agree() {
+        let base = TlsConfig {
+            cert_file: Some("server.pem".into()),
+            key_file: Some("server-key.pem".into()),
+            ..TlsConfig::default()
+        };
+
+        let mut cfg = GatewayConfig {
+            tls: Some(TlsConfig {
+                client_cert_mode: ClientCertMode::Required,
+                ..base.clone()
+            }),
+            ..GatewayConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "required mode without a CA bundle");
+
+        cfg.tls = Some(TlsConfig {
+            client_ca_file: Some("ca.pem".into()),
+            ..base.clone()
+        });
+        assert!(
+            cfg.validate().is_err(),
+            "CA bundle with mode none is dead config"
+        );
+
+        for mode in [ClientCertMode::Optional, ClientCertMode::Required] {
+            cfg.tls = Some(TlsConfig {
+                client_ca_file: Some("ca.pem".into()),
+                client_cert_mode: mode,
+                ..base.clone()
+            });
+            cfg.validate()
+                .expect("CA bundle with a non-none mode is valid");
+        }
+    }
+
+    #[test]
+    fn tls_block_round_trips_through_yaml() {
+        let mut f = tempfile::NamedTempFile::new().expect("tempfile");
+        writeln!(
+            f,
+            "tls:\n  cert_file: server.pem\n  key_file: server-key.pem\n  \
+             client_ca_file: ca.pem\n  client_cert_mode: required"
+        )
+        .expect("write");
+        let cfg = GatewayConfig::from_file(f.path()).expect("load");
+        let tls = cfg.tls.expect("tls block parsed");
+        assert_eq!(tls.cert_file.as_deref(), Some(Path::new("server.pem")));
+        assert_eq!(tls.key_file.as_deref(), Some(Path::new("server-key.pem")));
+        assert_eq!(tls.client_ca_file.as_deref(), Some(Path::new("ca.pem")));
+        assert_eq!(tls.client_cert_mode, ClientCertMode::Required);
+        // Absent block stays None and validates.
+        assert_eq!(GatewayConfig::default().tls, None);
+    }
+
+    #[test]
+    fn client_cert_mode_parses_and_serializes() {
+        assert_eq!(
+            "required".parse::<ClientCertMode>().expect("required"),
+            ClientCertMode::Required
+        );
+        assert_eq!(
+            "None".parse::<ClientCertMode>().expect("case-insensitive"),
+            ClientCertMode::None
+        );
+        assert!("mandatory".parse::<ClientCertMode>().is_err());
+        // The serde form matches the FromStr form (config file vs CLI).
+        assert_eq!(
+            serde_yaml::to_string(&ClientCertMode::Optional).expect("yaml"),
+            "optional\n"
+        );
     }
 
     #[test]

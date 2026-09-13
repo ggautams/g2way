@@ -37,7 +37,7 @@ pub use api_definition::{
     ApiDefinition, AuthConfig, CacheConfig, CircuitBreakerConfig, HealthCheckConfig,
     JwtSigningMethod, DEFAULT_ORG_ID,
 };
-pub use config::{AnalyticsSinkKind, GatewayConfig, SpikeGuardConfig};
+pub use config::{AnalyticsSinkKind, ClientCertMode, GatewayConfig, SpikeGuardConfig, TlsConfig};
 pub use endpoints::{MockResponse, PathRule};
 pub use error::Error;
 pub use policy::Policy;

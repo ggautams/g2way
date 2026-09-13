@@ -381,6 +381,21 @@ pub enum AuthConfig {
         #[serde(default = "default_basic_auth_realm")]
         realm: String,
     },
+
+    /// Mutual-TLS auth: the client certificate the TLS handshake verified
+    /// is the credential.
+    ///
+    /// The certificate's SHA-256 fingerprint (see
+    /// [`session::cert_fingerprint_hex`](crate::session::cert_fingerprint_hex))
+    /// resolves — hashed, under an `mtls:` namespace — to a stored
+    /// [`KeySession`](crate::KeySession), provisioned via the admin key
+    /// CRUD as the raw key `mtls:{fingerprint}`. A certificate the CA
+    /// signed but nobody provisioned is rejected: transport-level
+    /// verification (the gateway's `tls.client_cert_mode`) and per-API
+    /// authorization are separate layers. Requires the gateway to
+    /// terminate TLS with `client_cert_mode: optional` or `required`; see
+    /// `docs/tls.md`.
+    Mtls {},
 }
 
 impl Default for AuthConfig {
@@ -404,6 +419,7 @@ impl AuthConfig {
             Self::AuthToken { .. } => "auth_token",
             Self::Jwt { .. } => "jwt",
             Self::BasicAuth { .. } => "basic_auth",
+            Self::Mtls {} => "mtls",
         }
     }
 
@@ -524,6 +540,10 @@ impl AuthConfig {
                 }
                 Ok(())
             }
+            // Whether the listener actually terminates TLS with client
+            // certs enabled is process-level config the definition cannot
+            // see; the auth layer rejects at request time instead.
+            Self::Mtls {} => Ok(()),
         }
     }
 }
@@ -967,6 +987,24 @@ mod tests {
         let def = parse(json);
         assert_eq!(def.auth, AuthConfig::Keyless);
         def.validate().expect("keyless definition is valid");
+    }
+
+    #[test]
+    fn mtls_mode_parses_and_round_trips() {
+        let json = r#"{
+            "api_id": "certs-only",
+            "name": "mTLS API",
+            "listen_path": "/m/",
+            "target_url": "http://m.internal",
+            "auth": { "mode": "mtls" }
+        }"#;
+        let def = parse(json);
+        assert_eq!(def.auth, AuthConfig::Mtls {});
+        assert_eq!(def.auth.mode_name(), "mtls");
+        def.validate().expect("mtls definition is valid");
+        // The serialized tag round-trips.
+        let out = serde_json::to_string(&def.auth).expect("serialize");
+        assert_eq!(out, r#"{"mode":"mtls"}"#);
     }
 
     #[test]

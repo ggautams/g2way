@@ -98,6 +98,28 @@ pub struct UpstreamLatency(pub std::time::Duration);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClientAddr(pub SocketAddr);
 
+/// Transport-level facts about the connection a request arrived on.
+///
+/// Built once per connection by the accept loop (which is the only place
+/// that knows whether TLS was terminated and what the handshake verified)
+/// and stamped onto every request by the gateway, next to [`ClientAddr`].
+/// The forwarding service reads `tls` for `X-Forwarded-Proto`; the auth
+/// layer's `mtls` mode reads `client_cert_fingerprint`. Plain data only —
+/// this crate stays TLS-library-free.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConnectionInfo {
+    /// True when the gateway terminated TLS on this connection.
+    pub tls: bool,
+
+    /// Hex SHA-256 fingerprint of the client certificate's DER encoding,
+    /// when the handshake verified one (see
+    /// [`g2_core::session::cert_fingerprint_hex`]). Always `None` on
+    /// plaintext connections; `None` under `client_cert_mode: optional`
+    /// when the client presented no certificate. Never derived from
+    /// anything a client sends inside the request.
+    pub client_cert_fingerprint: Option<Arc<str>>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

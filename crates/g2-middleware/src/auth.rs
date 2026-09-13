@@ -19,6 +19,14 @@
 //!   bcrypt-verified against. Verification runs on the blocking pool
 //!   (bcrypt costs ~100ms by design); per-user verification caching is a
 //!   possible later optimization, deliberately not built yet.
+//! - **`mtls`** — the client certificate verified by the TLS handshake is
+//!   the credential; the accept loop stamps its SHA-256 fingerprint into
+//!   the request's [`ConnectionInfo`](crate::ConnectionInfo) extension.
+//!   The fingerprint (hashed under an `mtls:` namespace, like basic auth's
+//!   usernames) resolves to a stored session — so a certificate the CA
+//!   signed but nobody provisioned is still rejected. Requires the gateway
+//!   listener to terminate TLS with `client_cert_mode: optional` or
+//!   `required` (see `docs/tls.md`).
 //!
 //! Stored sessions referencing a policy (`apply_policies`) get the
 //! policy's rate/quota/access applied before the access check — one extra
@@ -38,7 +46,10 @@
 //! - `401` — no token found in any configured carrier. For basic auth this
 //!   covers every "no parseable credential" case (missing header, wrong
 //!   scheme, bad base64/UTF-8, no `:`, empty username) and carries a
-//!   `WWW-Authenticate: Basic realm="…"` challenge.
+//!   `WWW-Authenticate: Basic realm="…"` challenge. For mtls: the
+//!   connection carried no verified client certificate (a plaintext
+//!   listener, or `client_cert_mode: optional` with a certificate-less
+//!   client).
 //! - `403` — token unknown or fails verification, wrong password, session
 //!   inactive/expired, the session does not grant this API, or its policy
 //!   is missing or inactive. One message for all of these: which one it
@@ -123,6 +134,10 @@ enum Mode {
         challenge: HeaderValue,
         storage: SharedStorage,
     },
+    /// `mtls`: resolve the handshake-verified client-certificate
+    /// fingerprint (from the request's `ConnectionInfo` extension) in
+    /// storage.
+    Mtls { storage: SharedStorage },
 }
 
 /// Where the JWT mode's verification keys come from.
@@ -139,6 +154,7 @@ impl std::fmt::Debug for AuthState {
             Mode::Token { .. } => "token",
             Mode::Jwt { .. } => "jwt",
             Mode::Basic { .. } => "basic",
+            Mode::Mtls { .. } => "mtls",
         };
         f.debug_struct("AuthState")
             .field("api_id", &self.api_id)
@@ -260,6 +276,7 @@ impl AuthLayer {
                     })?;
                 Mode::Basic { challenge, storage }
             }
+            AuthConfig::Mtls {} => Mode::Mtls { storage },
         };
         Ok(Some(Self {
             state: Arc::new(AuthState {
@@ -385,6 +402,21 @@ async fn authenticate(
         }
         Mode::Basic { challenge, storage } => {
             authenticate_basic(state, storage, challenge, req).await
+        }
+        Mode::Mtls { storage } => {
+            // The fingerprint only ever comes from the accept loop's
+            // ConnectionInfo — never from anything the client sends inside
+            // the request — so it is already handshake-verified.
+            let fingerprint = req
+                .extensions()
+                .get::<crate::ConnectionInfo>()
+                .and_then(|conn| conn.client_cert_fingerprint.clone())
+                .ok_or_else(|| {
+                    json_error(StatusCode::UNAUTHORIZED, "client certificate required")
+                })?;
+            // Namespaced like basic auth's `basic:{username}` so a raw API
+            // key can never collide with a certificate identity.
+            authenticate_stored_token(state, storage, &format!("mtls:{fingerprint}")).await
         }
     }
 }
@@ -878,6 +910,97 @@ mod tests {
                 .as_bytes(),
             b"mobile"
         );
+    }
+
+    /// A fingerprint as the accept loop would compute it (any hex string
+    /// works for the middleware; real digests are an accept-loop concern).
+    const FP: &str = "ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12cd34ef56ab12";
+
+    fn mtls_request(fingerprint: Option<&str>) -> Request<ProxyBody> {
+        let mut req = request("/x");
+        req.extensions_mut().insert(crate::ConnectionInfo {
+            tls: true,
+            client_cert_fingerprint: fingerprint.map(Into::into),
+        });
+        req
+    }
+
+    #[tokio::test]
+    async fn mtls_without_connection_info_is_401() {
+        // A plaintext listener never stamps ConnectionInfo at all.
+        let svc = service(&AuthConfig::Mtls {}, MemoryStorage::new());
+        let resp = svc.oneshot(request("/x")).await.expect("infallible");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mtls_without_client_cert_is_401() {
+        // `client_cert_mode: optional` admits certificate-less connections;
+        // an mtls-mode API must still turn them away.
+        let svc = service(&AuthConfig::Mtls {}, MemoryStorage::new());
+        let resp = svc.oneshot(mtls_request(None)).await.expect("infallible");
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn mtls_unprovisioned_cert_is_403() {
+        // CA-signed (the handshake passed) but nobody provisioned it.
+        let svc = service(&AuthConfig::Mtls {}, MemoryStorage::new());
+        let resp = svc
+            .oneshot(mtls_request(Some(FP)))
+            .await
+            .expect("infallible");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn mtls_provisioned_cert_passes_with_session_context() {
+        let storage = MemoryStorage::new();
+        let session = KeySession {
+            alias: Some("billing-service".into()),
+            ..KeySession::default()
+        };
+        seed(&storage, &format!("mtls:{FP}"), &session).await;
+
+        let svc = service(&AuthConfig::Mtls {}, storage);
+        let resp = svc
+            .oneshot(mtls_request(Some(FP)))
+            .await
+            .expect("infallible");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("x-echo-alias")
+                .expect("alias")
+                .as_bytes(),
+            b"billing-service"
+        );
+    }
+
+    #[tokio::test]
+    async fn mtls_inactive_or_misscoped_session_is_403() {
+        let storage = MemoryStorage::new();
+        let inactive = KeySession {
+            active: false,
+            ..KeySession::default()
+        };
+        seed(&storage, &format!("mtls:{FP}"), &inactive).await;
+        let resp = service(&AuthConfig::Mtls {}, storage.clone())
+            .oneshot(mtls_request(Some(FP)))
+            .await
+            .expect("infallible");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "inactive session");
+
+        let elsewhere = KeySession {
+            access: std::iter::once(("some-other-api".to_owned(), Default::default())).collect(),
+            ..KeySession::default()
+        };
+        seed(&storage, &format!("mtls:{FP}"), &elsewhere).await;
+        let resp = service(&AuthConfig::Mtls {}, storage)
+            .oneshot(mtls_request(Some(FP)))
+            .await
+            .expect("infallible");
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "ACL without this API");
     }
 
     #[tokio::test]

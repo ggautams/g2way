@@ -6,3 +6,4 @@
 
 pub mod reload;
 pub mod server;
+pub mod tls;

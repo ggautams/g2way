@@ -15,7 +15,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use g2_core::{ApiDefinition, Error};
-use g2_middleware::{ClientAddr, ProxyBody};
+use g2_middleware::{ClientAddr, ConnectionInfo, ProxyBody};
 use http::uri::{Authority, Scheme, Uri};
 use http::{Method, Request, Response, StatusCode, Version};
 use http_body::Body as _;
@@ -460,6 +460,12 @@ async fn forward(
         .extensions()
         .get::<ClientAddr>()
         .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |addr| addr.0.ip());
+    // Whether the gateway terminated TLS on this connection; drives the
+    // `X-Forwarded-Proto` value. Absent extension means a plaintext caller.
+    let tls = req
+        .extensions()
+        .get::<ConnectionInfo>()
+        .is_some_and(|conn| conn.tls);
 
     // Circuit open: shed the request without contacting the upstream. No
     // `UpstreamLatency` is stamped — there was no upstream leg.
@@ -477,7 +483,7 @@ async fn forward(
     // The upstream connection is negotiated by the client independently
     // of the client-facing protocol version.
     parts.version = Version::HTTP_11;
-    rewrite::prepare_upstream_headers(&mut parts.headers, target, client_ip);
+    rewrite::prepare_upstream_headers(&mut parts.headers, target, client_ip, tls);
     // Retrying is safe only when the attempt can be replayed: an idempotent
     // method (after any transform) whose body is already fully drained —
     // i.e. empty. All attempts share the one per-API timeout budget below.

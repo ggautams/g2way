@@ -823,9 +823,12 @@ dependencies = [
  "hyper",
  "hyper-util",
  "jsonwebtoken",
+ "rcgen",
+ "rustls",
  "serde_json",
  "tempfile",
  "tokio",
+ "tokio-rustls",
  "tracing",
 ]
 

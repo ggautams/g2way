@@ -261,6 +261,19 @@ pub fn hash_key(raw_key: &str) -> String {
     hex::encode(Sha256::digest(raw_key.as_bytes()))
 }
 
+/// Hex-encodes the SHA-256 fingerprint of a client certificate's DER
+/// encoding — the credential identity for the `mtls` auth mode.
+///
+/// A certificate is authorized by provisioning a [`KeySession`] under the
+/// raw key `mtls:{fingerprint}` (via the admin key CRUD, exactly like any
+/// other key); the auth middleware hashes that same string on lookup. The
+/// fingerprint matches `openssl x509 -outform DER | sha256sum` on the PEM
+/// certificate. See `docs/tls.md`.
+#[must_use]
+pub fn cert_fingerprint_hex(cert_der: &[u8]) -> String {
+    hex::encode(Sha256::digest(cert_der))
+}
+
 /// Builds the storage key for a session: `g2:{org_id}:apikey:{key_hash}`.
 ///
 /// `key_hash` is the output of [`hash_key`], not the raw credential.
@@ -298,6 +311,18 @@ pub fn quota_storage_key(org_id: &str, key_hash: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cert_fingerprint_is_hex_sha256_of_der() {
+        // sha256 of the three bytes 0x01 0x02 0x03, independently computed.
+        assert_eq!(
+            cert_fingerprint_hex(&[1, 2, 3]),
+            "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81"
+        );
+        // Same digest as hashing the equivalent &str would give hash_key —
+        // the two helpers must stay interchangeable for ASCII input.
+        assert_eq!(cert_fingerprint_hex(b"abc"), hash_key("abc"));
+    }
 
     #[test]
     fn default_session_is_unrestricted_and_valid() {

@@ -84,7 +84,7 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 
 ## M8+ — Extended parity (re-prioritize with the user)
 
-- [ ] TLS termination & mTLS client certificates
+- [x] TLS termination & mTLS client certificates (ADR-0003, `docs/tls.md`)
 - [ ] OAuth2/OIDC, HMAC signatures, per-endpoint rate limits
 - [ ] WebSocket/SSE passthrough; gRPC passthrough
 - [ ] Plugin system (WASM pre/post hooks — needs an ADR first)
@@ -746,3 +746,35 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   hs256/rs256), per-API custom CA for the JWKS endpoint (use
   `Forwarder::with_tls_config`). Next: M8+ extended parity —
   re-prioritize with the user first.
+- **2026-08-31 (16)** — M8 TLS termination + mTLS landed (ADR-0003,
+  `docs/tls.md` for operation). Config: `tls` block on `GatewayConfig`
+  (`cert_file`/`key_file`/`client_ca_file`/`client_cert_mode:
+  none|optional|required`) + `--tls-*`/`G2_TLS_*` mirrors; bad PEM fails
+  startup, never falls back to plaintext. Server: `g2way::tls`
+  builds the `tokio_rustls` acceptor (explicit `ring` provider via
+  `builder_with_provider` — no global install; ALPN h2+http/1.1);
+  `serve`/`serve_tls` share one accept loop, with the handshake moved
+  onto the connection's task under a 10s timeout. **Surprise:** hyper-util
+  0.1.20's `GracefulShutdown::watcher()` is what makes that work —
+  clone a `Watcher` per accept, `watcher.watch(conn)` post-handshake;
+  mid-handshake connections are deliberately not drained. mTLS auth:
+  new `ConnectionInfo { tls, client_cert_fingerprint }` extension
+  (g2-middleware stays TLS-free; `Gateway::handle` grew the param),
+  `AuthConfig::Mtls {}` resolves `mtls:{sha256(cert DER)}` through
+  `authenticate_stored_token` — so provisioning is the ordinary key CRUD
+  (`PUT /g2/keys/mtls:{fp}`, zero admin changes) and certs get full
+  session semantics (rate/quota/ACL/policy). CA-signed-but-unprovisioned
+  = 403 (transport vs authorization split). Also fixed: the hardcoded
+  `x-forwarded-proto: http` in rewrite.rs is now connection-truthful.
+  **Surprise:** rustls-pki-types 1.15 PEM file helpers need no new dep or
+  feature (`rustls::pki_types::pem::PemObject`). Tests: tls.rs +
+  config/auth unit tests, 7-case `tls_e2e.rs` with an rcgen-minted PKI
+  (CA, `localhost` server cert, good + rogue-CA clients) — no external
+  services. Verified live against local httpbin with openssl-generated
+  certs: termination 200 + `X-Forwarded-Proto: https`, `required`
+  no-cert handshake alert, unprovisioned 403, admin-provisioned 200,
+  ALPN h2, graceful drain. Deliberate limits (ADR-0003/doc): no cert
+  hot-reload (restart to rotate), admin listener plaintext, no SNI
+  multi-cert, no CRL/OCSP (revoke = delete the key), k8s manifests stay
+  plaintext (doc has the Secrets walkthrough). Next: rest of M8+ —
+  re-prioritize with the user.
