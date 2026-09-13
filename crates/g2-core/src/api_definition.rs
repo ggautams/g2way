@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 use crate::endpoints::{MockResponse, PathRule};
 use crate::security::{self, CorsConfig};
 use crate::transform::{self, HeaderTransforms, UrlRewriteRule};
+use crate::versioning::VersioningConfig;
 use crate::Error;
 
 /// The organization id used while g2way runs in single-organization mode.
@@ -381,6 +382,12 @@ pub struct ApiDefinition {
     /// chunked/streamed bodies, on the actual bytes read. Unset = no limit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_request_body_bytes: Option<u64>,
+
+    /// Optional API versioning: the request header or query parameter that
+    /// selects a version, and per-version overrides applied on top of this
+    /// definition (see [`VersioningConfig`]). Unset = unversioned.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub versioning: Option<VersioningConfig>,
 }
 
 /// Storage key holding one API definition: `g2:{org_id}:apidef:{api_id}`.
@@ -481,6 +488,11 @@ impl ApiDefinition {
             return Err(fail(
                 "`max_request_body_bytes` must be greater than zero (omit it for no limit)".into(),
             ));
+        }
+        // Last, so per-version effective definitions are validated only
+        // after the base fields have passed (errors then name the version).
+        if let Some(versioning) = &self.versioning {
+            versioning.validate(self)?;
         }
         Ok(())
     }
@@ -874,6 +886,38 @@ mod tests {
         let mut def = parse(minimal_json());
         def.max_request_body_bytes = Some(0);
         assert!(def.validate().is_err(), "zero size limit");
+    }
+
+    #[test]
+    fn versioning_parses_and_validates() {
+        let json = r#"{
+            "api_id": "v",
+            "name": "v",
+            "listen_path": "/v/",
+            "target_url": "http://v.internal",
+            "versioning": {
+                "default_version": "v1",
+                "versions": {
+                    "v1": {},
+                    "v2": {"target_url": "http://v2.internal"}
+                }
+            }
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        assert_eq!(def.versioning.as_ref().expect("set").versions.len(), 2);
+
+        // Optionals stay off the wire when unset (old records unaffected).
+        let bare = serde_json::to_string(&parse(minimal_json())).expect("serializes");
+        assert!(!bare.contains("versioning"), "`versioning` serialized");
+
+        // A broken version override fails the definition's own validation.
+        let mut def = parse(json);
+        if let Some(v) = &mut def.versioning {
+            v.versions.get_mut("v2").expect("v2").target_url = Some("not-a-url".into());
+        }
+        let err = def.validate().unwrap_err().to_string();
+        assert!(err.contains("version `v2`"), "got: {err}");
     }
 
     #[test]

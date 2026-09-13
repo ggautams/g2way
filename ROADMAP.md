@@ -73,7 +73,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] URL rewrite (regex) and method transform
 - [x] Mock responses; allow/block/ignore path lists
 - [x] CORS, IP allow/deny lists, request size limits
-- [ ] API versioning (header/param selection, per-version overrides)
+- [x] API versioning (header/param selection, per-version overrides)
 
 ## M7 — Resilience & upstream management
 
@@ -571,3 +571,30 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   types; zero runtime cost; a RUSTFLAGS env var would override it). Next:
   M6's last box — API versioning (header/param selection, per-version
   overrides).
+- **2026-08-31 (9)** — **M6 complete.** API versioning landed. Config in new
+  `g2-core::versioning`: `ApiDefinition.versioning: Option<VersioningConfig>`
+  — `location` header (default) or query_param, `key` (default
+  `x-api-version`), optional `default_version`, `versions: {name →
+  VersionOverrides}`. Overrides replace the base field **wholesale** (policy
+  semantics; `[]` clears a list, `Option` base fields can't be cleared per
+  version): `target_url`, `upstream_timeout_ms`,
+  `transform_headers`, `url_rewrites`, `transform_method`, the three path
+  lists, `mock_responses`, plus `expires_at` (unix secs, inclusive like
+  sessions). Validation builds every effective per-version definition and
+  re-validates it, prefixing errors with the version name. Runtime: each
+  version gets its own **full inner chain + forwarder target** built from
+  its effective definition; a `VersionDispatch` service (g2-middleware)
+  selects by trimmed header/param value, falls back to the default, and
+  403s no-version/unknown/expired. `ChainBuilder` split for
+  this: `build_outer` (trace→CORS + context stamp, shared across versions)
+  and `build_inner` (path-policy→api-id header, per version) alongside the
+  unchanged `build`; the split point is **below CORS**, so version 403s are
+  still counted/recorded/CORS-decorated, and **above path_policy**, since
+  path lists are per-version. Router grew a shared `inner_layers()` helper
+  (one place configures the inner half for both paths). New OpenAPI schemas
+  registered. e2e test drives default/override/expired/unknown through a
+  real gateway. Not done (deliberate): version-in-URL selection (first path
+  segment) and stripping the version data from the upstream request; per-version key ACLs wait for the
+  partitioned-policy refinement. Next milestone: M7 resilience — first box
+  TLS upstream support (hyper-rustls), which also unblocks the deferred M2
+  `jwks_url` task.

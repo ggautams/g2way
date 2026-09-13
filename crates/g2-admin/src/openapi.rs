@@ -72,6 +72,9 @@ impl Modify for SecurityAddon {
         g2_core::PathRule,
         g2_core::MockResponse,
         g2_core::CorsConfig,
+        g2_core::VersioningConfig,
+        g2_core::VersionOverrides,
+        g2_core::VersionLocation,
         g2_core::KeySession,
         g2_core::Policy,
         g2_core::session::RateLimit,
@@ -132,6 +135,8 @@ mod tests {
             "PathRule",
             "MockResponse",
             "CorsConfig",
+            "VersioningConfig",
+            "VersionOverrides",
         ] {
             assert!(schemas.contains_key(schema), "schema `{schema}` missing");
         }

@@ -30,6 +30,7 @@ pub mod policy;
 pub mod security;
 pub mod session;
 pub mod transform;
+pub mod versioning;
 
 pub use analytics::AnalyticsRecord;
 pub use api_definition::{ApiDefinition, AuthConfig, JwtSigningMethod, DEFAULT_ORG_ID};
@@ -40,3 +41,4 @@ pub use policy::Policy;
 pub use security::CorsConfig;
 pub use session::{BasicAuthData, KeySession};
 pub use transform::{HeaderTransform, HeaderTransforms, UrlRewriteRule};
+pub use versioning::{VersionLocation, VersionOverrides, VersioningConfig};

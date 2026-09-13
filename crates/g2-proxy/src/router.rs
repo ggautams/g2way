@@ -1,6 +1,7 @@
 //! Listen-path routing: mapping a request path to an API definition and its
 //! prebuilt middleware chain.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use g2_core::{ApiDefinition, Error};
@@ -8,11 +9,53 @@ use g2_middleware::{
     AnalyticsHandle, AnalyticsLayer, AuthLayer, ChainBuilder, ChainService, CorsLayer,
     HeaderTransformLayer, HttpMetrics, IpFilterLayer, MetricsLayer, MockResponseLayer,
     PathPolicyLayer, RateLimitLayer, RequestContext, RequestSizeLimitLayer, SpikeGuard, StatsLayer,
-    StatsRegistry, TraceLayer,
+    StatsRegistry, TraceLayer, VersionDispatch,
 };
 use g2_storage::SharedStorage;
 
 use crate::forward::{Forward, Forwarder, UpstreamTarget};
+
+/// Sets the per-version (inner) layers on `builder` from `def` — the one
+/// place the inner half of a chain is configured, shared by the unversioned
+/// [`ChainBuilder::build`] path and each version of a versioned API.
+fn inner_layers(
+    builder: ChainBuilder,
+    def: &ApiDefinition,
+    storage: &SharedStorage,
+    spike_guard: Option<&Arc<SpikeGuard>>,
+) -> Result<ChainBuilder, Error> {
+    let auth = AuthLayer::from_config(&def.auth, Arc::clone(storage), &def.api_id, &def.org_id)?;
+    // Keyless APIs carry no session, so there are no limits to read;
+    // every credentialed API gets the limiter (it is a no-op for
+    // sessions without rate/quota).
+    let rate_limit = auth.as_ref().map(|_| {
+        RateLimitLayer::new(
+            &def.api_id,
+            Arc::clone(storage),
+            spike_guard.map(Arc::clone),
+        )
+    });
+    let transform_headers = def
+        .transform_headers
+        .as_ref()
+        .map(|t| HeaderTransformLayer::from_config(t, &def.api_id))
+        .transpose()?;
+    let path_policy = PathPolicyLayer::from_config(
+        &def.allow_paths,
+        &def.block_paths,
+        &def.ignore_auth_paths,
+        &def.api_id,
+    )?;
+    let mock = MockResponseLayer::from_config(&def.mock_responses, &def.api_id)?;
+    let size_limit = def.max_request_body_bytes.map(RequestSizeLimitLayer::new);
+    Ok(builder
+        .path_policy(path_policy)
+        .size_limit(size_limit)
+        .auth(auth)
+        .rate_limit(rate_limit)
+        .transform_headers(transform_headers)
+        .mock(mock))
+}
 
 /// One routable API: a validated [`ApiDefinition`] plus everything
 /// precomputed at build time — upstream target parts and the composed
@@ -53,37 +96,12 @@ impl Route {
     ) -> Result<Self, Error> {
         let target = Arc::new(UpstreamTarget::build(&def)?);
         let ctx = RequestContext::new(def.api_id.clone(), def.org_id.clone());
-        let auth =
-            AuthLayer::from_config(&def.auth, Arc::clone(storage), &def.api_id, &def.org_id)?;
-        // Keyless APIs carry no session, so there are no limits to read;
-        // every credentialed API gets the limiter (it is a no-op for
-        // sessions without rate/quota).
-        let rate_limit = auth.as_ref().map(|_| {
-            RateLimitLayer::new(
-                &def.api_id,
-                Arc::clone(storage),
-                spike_guard.map(Arc::clone),
-            )
-        });
-        let transform_headers = def
-            .transform_headers
-            .as_ref()
-            .map(|t| HeaderTransformLayer::from_config(t, &def.api_id))
-            .transpose()?;
-        let path_policy = PathPolicyLayer::from_config(
-            &def.allow_paths,
-            &def.block_paths,
-            &def.ignore_auth_paths,
-            &def.api_id,
-        )?;
-        let mock = MockResponseLayer::from_config(&def.mock_responses, &def.api_id)?;
         let ip_filter = IpFilterLayer::from_config(&def.allow_ips, &def.block_ips, &def.api_id)?;
         let cors = def
             .cors
             .as_ref()
             .map(|c| CorsLayer::from_config(c, &def.api_id))
             .transpose()?;
-        let size_limit = def.max_request_body_bytes.map(RequestSizeLimitLayer::new);
         // Span names follow the OTel server-span convention (the route, not
         // the full path): the listen path, `/` for a catch-all route.
         let span_name = if target.listen_prefix.is_empty() {
@@ -91,20 +109,38 @@ impl Route {
         } else {
             target.listen_prefix.as_str()
         };
-        let chain = ChainBuilder::new(ctx.clone())
+        let outer = ChainBuilder::new(ctx.clone())
             .trace(Some(TraceLayer::new(ctx.clone(), span_name)))
             .metrics(metrics.map(|m| MetricsLayer::new(Arc::clone(m), &ctx, span_name)))
             .stats(stats.map(|r| StatsLayer::new(r.for_api(&def.api_id))))
             .analytics(analytics.map(|h| AnalyticsLayer::new(h.clone(), ctx.clone())))
             .ip_filter(ip_filter)
-            .cors(cors)
-            .path_policy(path_policy)
-            .size_limit(size_limit)
-            .auth(auth)
-            .rate_limit(rate_limit)
-            .transform_headers(transform_headers)
-            .mock(mock)
-            .build(Forward::new(forwarder, Arc::clone(&target)));
+            .cors(cors);
+        let chain = match &def.versioning {
+            None => inner_layers(outer, &def, storage, spike_guard)?
+                .build(Forward::new(forwarder, Arc::clone(&target))),
+            // A versioned API gets one inner chain per version — each built
+            // from the version's effective definition, with its own upstream
+            // target — behind a dispatcher wrapped in the shared outer stack.
+            Some(versioning) => {
+                let mut chains = HashMap::with_capacity(versioning.versions.len());
+                for name in versioning.versions.keys() {
+                    let vdef = versioning
+                        .apply(&def, name)
+                        .expect("apply() succeeds for every key of the versions map");
+                    let vtarget = Arc::new(UpstreamTarget::build(&vdef)?);
+                    let inner =
+                        inner_layers(ChainBuilder::new(ctx.clone()), &vdef, storage, spike_guard)?
+                            .build_inner(Forward::new(forwarder, vtarget));
+                    chains.insert(name.clone(), inner);
+                }
+                outer.build_outer(VersionDispatch::from_config(
+                    versioning,
+                    chains,
+                    &def.api_id,
+                )?)
+            }
+        };
         Ok(Self {
             listen_prefix: target.listen_prefix.clone(),
             def,
@@ -265,6 +301,32 @@ mod tests {
         let table = table(vec![d]).expect("build");
         assert!(table.match_path("/off/x").is_none());
         assert!(table.routes().is_empty());
+    }
+
+    #[test]
+    fn versioned_definition_builds_a_route() {
+        let mut d = def("versioned", "/v/", "http://v1.internal");
+        d.versioning = Some(
+            serde_json::from_str(
+                r#"{
+                    "default_version": "v1",
+                    "versions": {"v1": {}, "v2": {"target_url": "http://v2.internal"}}
+                }"#,
+            )
+            .expect("versioning JSON"),
+        );
+        let built = table(vec![d]).expect("build");
+        let route = built.match_path("/v/x").expect("route");
+        // The route's own target stays the base definition's.
+        assert_eq!(route.target.authority.as_str(), "v1.internal");
+
+        // A broken override fails the build like any invalid definition.
+        let mut d = def("versioned", "/v/", "http://v1.internal");
+        d.versioning = Some(
+            serde_json::from_str(r#"{"versions": {"v2": {"target_url": "nope"}}}"#)
+                .expect("versioning JSON"),
+        );
+        assert!(table(vec![d]).is_err());
     }
 
     #[test]

@@ -63,6 +63,13 @@ use crate::{ChainService, ProxyBody};
 ///     protected) and below the header transforms, so mock responses get
 ///     the API's response transforms like any upstream response.
 /// 14. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+///
+/// [`Self::build`] composes the full stack for an unversioned API. A
+/// versioned API splits the stack around its version dispatcher instead:
+/// [`Self::build_outer`] composes the shared, version-independent layers
+/// (items 1–7) around the dispatcher, and [`Self::build_inner`] composes
+/// the per-version layers (items 8–14) around each version's forwarder.
+/// The three methods must keep the ordering above consistent.
 #[derive(Debug, Clone)]
 pub struct ChainBuilder {
     ctx: RequestContext,
@@ -206,6 +213,58 @@ impl ChainBuilder {
             .layer(SetContextLayer::new(self.ctx))
             .option_layer(self.ip_filter)
             .option_layer(self.cors)
+            .option_layer(self.path_policy)
+            .option_layer(self.size_limit)
+            .option_layer(self.auth)
+            .option_layer(self.rate_limit)
+            .option_layer(self.transform_headers)
+            .option_layer(self.mock)
+            .layer(ApiIdHeaderLayer::new())
+            .service(forward);
+        BoxCloneSyncService::new(svc)
+    }
+
+    /// Composes only the shared, version-independent outer layers (trace →
+    /// CORS plus the context stamp) around `service` — for versioned APIs,
+    /// where `service` is the version dispatcher and the remaining layers
+    /// live in per-version chains built with [`Self::build_inner`]. Any
+    /// inner layers set on this builder are ignored.
+    pub fn build_outer<S>(self, service: S) -> ChainService
+    where
+        S: Service<Request<ProxyBody>, Response = Response<ProxyBody>, Error = Infallible>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        let svc = ServiceBuilder::new()
+            .option_layer(self.trace)
+            .option_layer(self.metrics)
+            .option_layer(self.stats)
+            .option_layer(self.analytics)
+            .layer(SetContextLayer::new(self.ctx))
+            .option_layer(self.ip_filter)
+            .option_layer(self.cors)
+            .service(service);
+        BoxCloneSyncService::new(svc)
+    }
+
+    /// Composes only the per-version inner layers (path policy → the api-id
+    /// header) around `forward` — one such chain per version of a versioned
+    /// API, dispatched to below a [`Self::build_outer`] stack. Any outer
+    /// layers set on this builder are ignored (the context stamp included:
+    /// the outer stack already applied it).
+    pub fn build_inner<S>(self, forward: S) -> ChainService
+    where
+        S: Service<Request<ProxyBody>, Response = Response<ProxyBody>, Error = Infallible>
+            + Clone
+            + Send
+            + Sync
+            + 'static,
+        S::Future: Send + 'static,
+    {
+        let svc = ServiceBuilder::new()
             .option_layer(self.path_policy)
             .option_layer(self.size_limit)
             .option_layer(self.auth)

@@ -36,6 +36,7 @@ pub mod spike;
 pub mod stats;
 pub mod trace;
 pub mod transform_headers;
+pub mod versioning;
 
 pub use analytics::{Analytics, AnalyticsHandle, AnalyticsLayer};
 pub use api_id_header::{ApiIdHeader, ApiIdHeaderLayer, API_ID_HEADER};
@@ -57,6 +58,7 @@ pub use spike::SpikeGuard;
 pub use stats::{ApiStats, ApiStatsSnapshot, StatsLayer, StatsRegistry};
 pub use trace::{Trace, TraceLayer};
 pub use transform_headers::{HeaderTransformLayer, HeaderTransformer};
+pub use versioning::VersionDispatch;
 
 /// Boxed error type used for proxied body streams.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;

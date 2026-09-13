@@ -211,6 +211,63 @@ async fn path_lists_and_mock_responses_end_to_end() {
 }
 
 #[tokio::test]
+async fn api_versioning_end_to_end() {
+    let upstream = spawn_echo_upstream().await;
+
+    // v1 (the default) proxies as-is; v2 overrides the upstream path via a
+    // rewrite; "retired" is expired and must be refused.
+    let mut def = api("/v/", &format!("http://{upstream}"));
+    def.versioning = Some(
+        serde_json::from_str(
+            r#"{
+                "default_version": "v1",
+                "versions": {
+                    "v1": {},
+                    "v2": {"url_rewrites": [{"pattern": "^/v/(.*)$", "rewrite": "/two/$1"}]},
+                    "retired": {"expires_at": 1}
+                }
+            }"#,
+        )
+        .expect("versioning JSON"),
+    );
+    def.validate().expect("valid definition");
+    let (gw, _stop) = spawn_gateway(vec![def]).await;
+
+    let get_version = |version: Option<&'static str>| async move {
+        let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+        let mut req = Request::get(format!("http://{gw}/v/widgets"));
+        if let Some(version) = version {
+            req = req.header("x-api-version", version);
+        }
+        let resp = client
+            .request(req.body(Empty::new()).expect("request"))
+            .await
+            .expect("response");
+        let status = resp.status();
+        let body = resp.collect().await.expect("body").to_bytes();
+        (status, String::from_utf8(body.to_vec()).expect("utf8"))
+    };
+
+    // No version named: the default (v1) serves, plain listen-path strip.
+    let (status, body) = get_version(None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "GET /widgets len=0");
+
+    // v2: its overriding rewrite decides the upstream path.
+    let (status, body) = get_version(Some("v2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "GET /two/widgets len=0");
+
+    // Expired and unknown versions are refused.
+    let (status, body) = get_version(Some("retired")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("expired"), "body: {body}");
+    let (status, body) = get_version(Some("v9")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("does not exist"), "body: {body}");
+}
+
+#[tokio::test]
 async fn cors_end_to_end() {
     let upstream = spawn_echo_upstream().await;
     let mut def = api("/cors/", &format!("http://{upstream}"));
