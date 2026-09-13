@@ -26,9 +26,8 @@ decisions: `docs/adr/`.
 - [x] k8s manifests: gateway ×2 replicas + go-httpbin upstream + smoke script
 - [x] User-verified: `make minikube-load k8s-deploy smoke` green on local minikube
 
-**Known M1 limitations** (fixed in later milestones): upstream `https://`
-targets are accepted by validation but fail at request time — the client has
-no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
+**Known M1 limitations**: upstream `https://` targets — fixed by the M7
+TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 
 ## M2 — Auth & key management
 
@@ -37,7 +36,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] Redis-backed `Storage` implementation (connection pool, `g2:{org}:...` schema) + `make redis-up` integration tests
 - [x] Auth: keyless mode (explicit) and auth-token mode (header/query param/cookie lookup → `KeySession`)
 - [x] Auth: JWT with static keys (HS256 secret / RS256 public-key PEM; claims → ephemeral session)
-- [ ] Auth: JWT `jwks_url` fetch + cache (needs an HTTPS fetch client — decide alongside the M7 TLS work)
+- [ ] Auth: JWT `jwks_url` fetch + cache (unblocked: rustls landed with the M7 TLS connector; still needs an HTTPS fetch client choice)
 - [x] Auth: basic auth
 - [x] Admin API skeleton (axum on separate port, `X-G2-Authorization` admin secret)
 - [x] Admin key CRUD: `POST/GET/PUT/DELETE /g2/keys[/{key}]`
@@ -77,7 +76,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 
 ## M7 — Resilience & upstream management
 
-- [ ] TLS upstream support (hyper-rustls connector) — removes the M1 https limitation
+- [x] TLS upstream support (hyper-rustls connector) — removes the M1 https limitation
 - [ ] Load balancing across multiple upstream targets (round-robin)
 - [ ] Upstream health checks with eviction
 - [ ] Circuit breaker per route; retries for idempotent methods
@@ -598,3 +597,22 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   partitioned-policy refinement. Next milestone: M7 resilience — first box
   TLS upstream support (hyper-rustls), which also unblocks the deferred M2
   `jwks_url` task.
+- **2026-08-31 (10)** — M7 TLS upstream support landed. `Forwarder`'s client
+  is now `Client<HttpsConnector<HttpConnector>>` (hyper-rustls 0.27,
+  `https_or_http` + `enable_http1`): one pooled client serves both schemes,
+  no signature changes anywhere — plain-http APIs are untouched. Crypto
+  provider is **ring** across the tree (workspace pins
+  `default-features = false` on rustls/hyper-rustls/tokio-rustls/rcgen)
+  because the default aws-lc-rs needs cmake, which the `rust:1-slim` Docker
+  build stage doesn't have. Roots: platform CA store (rustls-native-certs),
+  falling back to embedded webpki (Mozilla) roots with a warning —
+  distroless/cc carries `/etc/ssl/certs`, so the shipped image uses native.
+  New public `Forwarder::with_tls_config(rustls::ClientConfig)` for custom
+  CAs; it's also how tests inject trust: unit tests run a real tokio-rustls
+  upstream with an rcgen self-signed cert and prove trusted-root → 200
+  (body verified) and default forwarder → 502 (verification actually on).
+  Verified live: gateway proxied `/tlslive/` → `https://httpbingo.org`,
+  200 with query + XFF intact. The M2 `jwks_url` deferral is now unblocked
+  (rustls in tree; remaining decision is just the fetch client — reusing
+  the hyper client vs a one-shot request helper). Next: M7 load balancing
+  across multiple upstream targets (round-robin).

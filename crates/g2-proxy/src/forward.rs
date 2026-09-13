@@ -17,10 +17,15 @@ use g2_core::{ApiDefinition, Error};
 use g2_middleware::{ClientAddr, ProxyBody};
 use http::uri::{Authority, Scheme, Uri};
 use http::{Method, Request, Response, StatusCode, Version};
+use hyper_rustls::{ConfigBuilderExt as _, HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tower::Service;
+
+/// The pooled upstream client: TLS-capable, with plain `http://` requests
+/// bypassing TLS inside the connector (`https_or_http`).
+type UpstreamClient = Client<HttpsConnector<HttpConnector>, ProxyBody>;
 
 use crate::response::error_response;
 use crate::rewrite;
@@ -98,15 +103,44 @@ impl UpstreamTarget {
 /// survive config hot reloads.
 #[derive(Debug, Clone)]
 pub struct Forwarder {
-    client: Client<HttpConnector, ProxyBody>,
+    client: UpstreamClient,
 }
 
 impl Forwarder {
-    /// Creates a forwarder with a default pooled HTTP client.
+    /// Creates a forwarder with a default pooled client.
+    ///
+    /// `https://` upstreams are verified against the platform CA store; when
+    /// no usable platform store exists (some containers), the embedded
+    /// webpki (Mozilla) roots are used instead. To trust a private CA, build
+    /// the forwarder with [`Forwarder::with_tls_config`].
     #[must_use]
     pub fn new() -> Self {
+        let tls = match rustls::ClientConfig::builder().with_native_roots() {
+            Ok(builder) => builder.with_no_client_auth(),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "no usable platform CA store; https upstreams verify against embedded webpki roots"
+                );
+                rustls::ClientConfig::builder()
+                    .with_webpki_roots()
+                    .with_no_client_auth()
+            }
+        };
+        Self::with_tls_config(tls)
+    }
+
+    /// Creates a forwarder whose `https://` upstream connections use the
+    /// given rustls configuration (custom CA roots, for instance).
+    #[must_use]
+    pub fn with_tls_config(tls: rustls::ClientConfig) -> Self {
+        let connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http1()
+            .build();
         Self {
-            client: Client::builder(TokioExecutor::new()).build_http(),
+            client: Client::builder(TokioExecutor::new()).build(connector),
         }
     }
 }
@@ -124,7 +158,7 @@ impl Default for Forwarder {
 /// `502` and a timeout to `504` — keeping the chain's `Infallible` contract.
 #[derive(Debug, Clone)]
 pub(crate) struct Forward {
-    client: Client<HttpConnector, ProxyBody>,
+    client: UpstreamClient,
     target: Arc<UpstreamTarget>,
 }
 
@@ -157,7 +191,7 @@ impl Service<Request<ProxyBody>> for Forward {
 
 /// Forwards one rewritten request to the upstream of `target`.
 async fn forward(
-    client: &Client<HttpConnector, ProxyBody>,
+    client: &UpstreamClient,
     target: &UpstreamTarget,
     req: Request<ProxyBody>,
 ) -> Response<ProxyBody> {
@@ -234,12 +268,98 @@ async fn forward(
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, SocketAddr};
 
+    use http_body_util::BodyExt;
     use tokio::net::TcpListener;
     use tower::ServiceExt;
 
     use super::*;
+
+    /// Serves `"tls ok"` over HTTPS with a fresh self-signed `localhost`
+    /// cert; returns the bound address and a root store trusting that cert.
+    async fn spawn_tls_upstream() -> (SocketAddr, rustls::RootCertStore) {
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("self-signed cert");
+        let cert_der = certified.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der.clone()).expect("trust anchor");
+
+        let server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server config");
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return; // e.g. a client that rejects our cert
+                    };
+                    let service = hyper::service::service_fn(|_req| async {
+                        Ok::<_, Infallible>(Response::new(http_body_util::Full::new(
+                            bytes::Bytes::from_static(b"tls ok"),
+                        )))
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(tls), service)
+                        .await;
+                });
+            }
+        });
+        (addr, roots)
+    }
+
+    fn tls_target(addr: SocketAddr) -> Arc<UpstreamTarget> {
+        let def: ApiDefinition = serde_json::from_str(&format!(
+            r#"{{"api_id":"tls","name":"tls","listen_path":"/tls/","target_url":"https://localhost:{}"}}"#,
+            addr.port()
+        ))
+        .expect("def");
+        Arc::new(UpstreamTarget::build(&def).expect("target"))
+    }
+
+    #[tokio::test]
+    async fn https_upstream_with_trusted_root_proxies() {
+        let (addr, roots) = spawn_tls_upstream().await;
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let svc = Forward::new(&Forwarder::with_tls_config(tls), tls_target(addr));
+
+        let req = Request::builder()
+            .uri("/tls/x")
+            .body(ProxyBody::empty())
+            .expect("request");
+        let resp = svc.oneshot(req).await.expect("infallible");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        assert_eq!(&body[..], b"tls ok");
+    }
+
+    #[tokio::test]
+    async fn https_upstream_with_untrusted_cert_maps_to_502() {
+        let (addr, _roots) = spawn_tls_upstream().await;
+        // The default forwarder trusts only real CA roots, so the
+        // self-signed upstream must fail verification, not proxy.
+        let svc = Forward::new(&Forwarder::new(), tls_target(addr));
+
+        let req = Request::builder()
+            .uri("/tls/x")
+            .body(ProxyBody::empty())
+            .expect("request");
+        let resp = svc.oneshot(req).await.expect("infallible");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
 
     #[tokio::test]
     async fn unreachable_upstream_maps_to_502_not_error() {
