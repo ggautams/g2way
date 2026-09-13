@@ -41,6 +41,10 @@ fn default_identity_claim() -> String {
     DEFAULT_IDENTITY_CLAIM.to_owned()
 }
 
+/// Seconds between background JWKS re-fetches when a definition sets
+/// `jwks_url` without a `jwks_refresh_secs`.
+pub const DEFAULT_JWKS_REFRESH_SECS: u64 = 300;
+
 /// Realm the basic-auth mode advertises in `WWW-Authenticate` challenges
 /// when a definition does not name one.
 pub const DEFAULT_BASIC_AUTH_REALM: &str = "g2way";
@@ -327,8 +331,8 @@ pub enum AuthConfig {
     },
 
     /// JWT bearer auth: the token in `header` is verified against a static
-    /// key and its claims are turned into an ephemeral session (no storage
-    /// lookup). `jwks_url` fetching arrives in a later task.
+    /// key (or a key fetched from `jwks_url`) and its claims are turned into
+    /// an ephemeral session (no storage lookup).
     Jwt {
         /// Signature algorithm the tokens must use.
         signing_method: JwtSigningMethod,
@@ -340,6 +344,17 @@ pub enum AuthConfig {
         /// PEM-encoded RSA public key for [`JwtSigningMethod::Rs256`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         public_key_pem: Option<String>,
+
+        /// URL of a JWKS document (RFC 7517 key set) to fetch RS256
+        /// verification keys from; tokens must carry a `kid` matching a key
+        /// in the set. Mutually exclusive with `public_key_pem`; rs256 only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        jwks_url: Option<String>,
+
+        /// Seconds between background JWKS re-fetches. Defaults to
+        /// [`DEFAULT_JWKS_REFRESH_SECS`]; only valid alongside `jwks_url`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        jwks_refresh_secs: Option<u64>,
 
         /// Request header carrying the JWT (a `Bearer ` prefix is stripped).
         #[serde(default = "default_auth_header")]
@@ -422,6 +437,8 @@ impl AuthConfig {
                 signing_method,
                 secret,
                 public_key_pem,
+                jwks_url,
+                jwks_refresh_secs,
                 header,
                 identity_claim,
             } => {
@@ -432,6 +449,24 @@ impl AuthConfig {
                 }
                 if identity_claim.trim().is_empty() {
                     return Err(fail("`auth.identity_claim` must not be empty".into()));
+                }
+                if jwks_refresh_secs.is_some() && jwks_url.is_none() {
+                    return Err(fail(
+                        "`auth.jwks_refresh_secs` requires `auth.jwks_url`".into(),
+                    ));
+                }
+                if jwks_refresh_secs.is_some_and(|s| s == 0) {
+                    return Err(fail("`auth.jwks_refresh_secs` must be at least 1".into()));
+                }
+                if let Some(url) = jwks_url {
+                    let uri = url.parse::<http::Uri>().ok().filter(|u| {
+                        matches!(u.scheme_str(), Some("http" | "https")) && u.authority().is_some()
+                    });
+                    if uri.is_none() {
+                        return Err(fail(format!(
+                            "`auth.jwks_url` is not a valid http(s) URL: `{url}`"
+                        )));
+                    }
                 }
                 // Exactly the key material matching the algorithm must be
                 // present; a mismatched field is a config typo worth failing.
@@ -445,14 +480,22 @@ impl AuthConfig {
                                 "`auth.public_key_pem` is not used with hs256; remove it".into(),
                             ));
                         }
+                        if jwks_url.is_some() {
+                            return Err(fail(
+                                "`auth.jwks_url` is not used with hs256; remove it".into(),
+                            ));
+                        }
                     }
                     JwtSigningMethod::Rs256 => {
-                        if public_key_pem
+                        let has_pem = public_key_pem
                             .as_deref()
-                            .is_none_or(|s| s.trim().is_empty())
-                        {
+                            .is_some_and(|s| !s.trim().is_empty());
+                        let has_jwks = jwks_url.as_deref().is_some_and(|s| !s.trim().is_empty());
+                        if has_pem == has_jwks {
                             return Err(fail(
-                                "rs256 requires a non-empty `auth.public_key_pem`".into(),
+                                "rs256 requires exactly one of `auth.public_key_pem` or \
+                                 `auth.jwks_url`"
+                                    .into(),
                             ));
                         }
                         if secret.is_some() {
@@ -974,6 +1017,8 @@ mod tests {
             signing_method: JwtSigningMethod::Hs256,
             secret: Some("shhh".into()),
             public_key_pem: None,
+            jwks_url: None,
+            jwks_refresh_secs: None,
             header: DEFAULT_AUTH_HEADER.into(),
             identity_claim: "sub".into(),
         };
@@ -984,6 +1029,8 @@ mod tests {
             signing_method: JwtSigningMethod::Hs256,
             secret: None,
             public_key_pem: None,
+            jwks_url: None,
+            jwks_refresh_secs: None,
             header: DEFAULT_AUTH_HEADER.into(),
             identity_claim: "sub".into(),
         };
@@ -992,6 +1039,8 @@ mod tests {
             signing_method: JwtSigningMethod::Hs256,
             secret: Some("shhh".into()),
             public_key_pem: Some("-----BEGIN PUBLIC KEY-----".into()),
+            jwks_url: None,
+            jwks_refresh_secs: None,
             header: DEFAULT_AUTH_HEADER.into(),
             identity_claim: "sub".into(),
         };
@@ -1002,6 +1051,8 @@ mod tests {
             signing_method: JwtSigningMethod::Rs256,
             secret: None,
             public_key_pem: Some("-----BEGIN PUBLIC KEY-----".into()),
+            jwks_url: None,
+            jwks_refresh_secs: None,
             header: DEFAULT_AUTH_HEADER.into(),
             identity_claim: "sub".into(),
         };
@@ -1010,10 +1061,123 @@ mod tests {
             signing_method: JwtSigningMethod::Rs256,
             secret: Some("shhh".into()),
             public_key_pem: Some("-----BEGIN PUBLIC KEY-----".into()),
+            jwks_url: None,
+            jwks_refresh_secs: None,
             header: DEFAULT_AUTH_HEADER.into(),
             identity_claim: "sub".into(),
         };
         assert!(def.validate().is_err());
+    }
+
+    #[test]
+    fn jwt_auth_validates_jwks_url_combinations() {
+        let mut def = parse(minimal_json());
+        let jwt = |signing_method,
+                   secret: Option<&str>,
+                   public_key_pem: Option<&str>,
+                   jwks_url: Option<&str>,
+                   jwks_refresh_secs| AuthConfig::Jwt {
+            signing_method,
+            secret: secret.map(Into::into),
+            public_key_pem: public_key_pem.map(Into::into),
+            jwks_url: jwks_url.map(Into::into),
+            jwks_refresh_secs,
+            header: DEFAULT_AUTH_HEADER.into(),
+            identity_claim: "sub".into(),
+        };
+
+        // rs256 with only a jwks_url: valid, with or without a refresh interval.
+        def.auth = jwt(
+            JwtSigningMethod::Rs256,
+            None,
+            None,
+            Some("https://idp.internal/jwks.json"),
+            None,
+        );
+        def.validate().expect("rs256 with jwks_url is valid");
+        def.auth = jwt(
+            JwtSigningMethod::Rs256,
+            None,
+            None,
+            Some("http://idp.internal/jwks.json"),
+            Some(60),
+        );
+        def.validate()
+            .expect("plain-http jwks_url with interval is valid");
+
+        // rs256 with both key sources, or neither: invalid.
+        def.auth = jwt(
+            JwtSigningMethod::Rs256,
+            None,
+            Some("-----BEGIN PUBLIC KEY-----"),
+            Some("https://idp.internal/jwks.json"),
+            None,
+        );
+        assert!(def.validate().is_err());
+        def.auth = jwt(JwtSigningMethod::Rs256, None, None, None, None);
+        assert!(def.validate().is_err());
+
+        // hs256 rejects jwks fields.
+        def.auth = jwt(
+            JwtSigningMethod::Hs256,
+            Some("shhh"),
+            None,
+            Some("https://idp.internal/jwks.json"),
+            None,
+        );
+        assert!(def.validate().is_err());
+
+        // Malformed URL, refresh interval without a URL, zero interval.
+        def.auth = jwt(JwtSigningMethod::Rs256, None, None, Some("not a url"), None);
+        assert!(def.validate().is_err());
+        def.auth = jwt(
+            JwtSigningMethod::Rs256,
+            None,
+            Some("-----BEGIN PUBLIC KEY-----"),
+            None,
+            Some(60),
+        );
+        assert!(def.validate().is_err());
+        def.auth = jwt(
+            JwtSigningMethod::Rs256,
+            None,
+            None,
+            Some("https://idp.internal/jwks.json"),
+            Some(0),
+        );
+        assert!(def.validate().is_err());
+    }
+
+    #[test]
+    fn jwt_jwks_config_round_trips_through_json() {
+        let json = r#"{
+            "api_id": "j",
+            "name": "j",
+            "listen_path": "/j/",
+            "target_url": "http://j.internal",
+            "auth": {
+                "mode": "jwt",
+                "signing_method": "rs256",
+                "jwks_url": "https://idp.internal/jwks.json",
+                "jwks_refresh_secs": 120
+            }
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        let serialized = serde_json::to_string(&def).expect("serializes");
+        let back: ApiDefinition = serde_json::from_str(&serialized).expect("parses back");
+        assert_eq!(back.auth, def.auth);
+        match def.auth {
+            AuthConfig::Jwt {
+                jwks_url,
+                jwks_refresh_secs,
+                ..
+            } => {
+                assert_eq!(jwks_url.as_deref(), Some("https://idp.internal/jwks.json"));
+                assert_eq!(jwks_refresh_secs, Some(120));
+            }
+            other => panic!("expected jwt auth, got {other:?}"),
+        }
     }
 
     #[test]

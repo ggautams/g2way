@@ -273,6 +273,57 @@ impl Default for Forwarder {
     }
 }
 
+/// Longest a JWKS document fetch may take before it is abandoned.
+const JWKS_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Largest JWKS response body accepted (real key sets are a few KB).
+const MAX_JWKS_BYTES: usize = 1024 * 1024;
+
+/// [`JwksFetch`] implementation over the shared upstream client: JWKS
+/// documents are fetched through the same connection pool and TLS
+/// configuration as proxied traffic and health probes.
+pub(crate) struct HttpJwksFetch {
+    client: UpstreamClient,
+}
+
+impl HttpJwksFetch {
+    /// A fetcher borrowing `forwarder`'s pooled client.
+    pub(crate) fn new(forwarder: &Forwarder) -> Self {
+        Self {
+            client: forwarder.client().clone(),
+        }
+    }
+}
+
+impl g2_middleware::JwksFetch for HttpJwksFetch {
+    fn fetch(&self, url: &str) -> g2_middleware::JwksFetchFuture {
+        let client = self.client.clone();
+        let url = url.to_owned();
+        Box::pin(async move {
+            let uri: Uri = url
+                .parse()
+                .map_err(|e| format!("invalid JWKS URL `{url}`: {e}"))?;
+            let req = Request::builder()
+                .method(Method::GET)
+                .uri(uri)
+                .body(ProxyBody::empty())
+                .map_err(|e| format!("could not build JWKS request: {e}"))?;
+            let resp = tokio::time::timeout(JWKS_FETCH_TIMEOUT, client.request(req))
+                .await
+                .map_err(|_| format!("JWKS fetch timed out after {JWKS_FETCH_TIMEOUT:?}"))?
+                .map_err(|e| format!("JWKS fetch failed: {e}"))?;
+            if !resp.status().is_success() {
+                return Err(format!("JWKS endpoint answered {}", resp.status()));
+            }
+            let body = http_body_util::Limited::new(resp.into_body(), MAX_JWKS_BYTES);
+            let collected = http_body_util::BodyExt::collect(body)
+                .await
+                .map_err(|e| format!("reading JWKS body failed: {e}"))?;
+            Ok(collected.to_bytes())
+        })
+    }
+}
+
 /// The innermost chain service of one route: rewrites the request for the
 /// route's upstream and proxies it.
 ///
@@ -939,5 +990,82 @@ mod tests {
             .expect("request");
         let resp = svc.oneshot(req).await.expect("infallible");
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// Serves every request with the given status and body.
+    async fn spawn_fixed_upstream(status: StatusCode, body: bytes::Bytes) -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |_req| {
+                        let body = body.clone();
+                        async move {
+                            let mut resp = Response::new(http_body_util::Full::new(body));
+                            *resp.status_mut() = status;
+                            Ok::<_, Infallible>(resp)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn jwks_fetch_returns_the_body_on_success() {
+        let addr =
+            spawn_fixed_upstream(StatusCode::OK, bytes::Bytes::from_static(b"{\"keys\":[]}")).await;
+        let fetch = HttpJwksFetch::new(&Forwarder::new());
+        let body = g2_middleware::JwksFetch::fetch(&fetch, &format!("http://{addr}/jwks.json"))
+            .await
+            .expect("fetch succeeds");
+        assert_eq!(&body[..], b"{\"keys\":[]}");
+    }
+
+    #[tokio::test]
+    async fn jwks_fetch_rejects_non_success_and_unreachable() {
+        let addr = spawn_fixed_upstream(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            bytes::Bytes::from_static(b"oops"),
+        )
+        .await;
+        let fetch = HttpJwksFetch::new(&Forwarder::new());
+        let err = g2_middleware::JwksFetch::fetch(&fetch, &format!("http://{addr}/jwks.json"))
+            .await
+            .expect_err("500 is an error");
+        assert!(err.contains("500"), "error names the status: {err}");
+
+        // Bind-then-drop for a dead port.
+        let dead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let dead_addr = dead.local_addr().expect("addr");
+        drop(dead);
+        let err = g2_middleware::JwksFetch::fetch(&fetch, &format!("http://{dead_addr}/jwks.json"))
+            .await
+            .expect_err("unreachable is an error");
+        assert!(err.contains("fetch failed"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn jwks_fetch_rejects_oversized_bodies() {
+        let addr = spawn_fixed_upstream(
+            StatusCode::OK,
+            bytes::Bytes::from(vec![b'x'; MAX_JWKS_BYTES + 1]),
+        )
+        .await;
+        let fetch = HttpJwksFetch::new(&Forwarder::new());
+        let err = g2_middleware::JwksFetch::fetch(&fetch, &format!("http://{addr}/jwks.json"))
+            .await
+            .expect_err("oversized body is an error");
+        assert!(err.contains("body"), "{err}");
     }
 }

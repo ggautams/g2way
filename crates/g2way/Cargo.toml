@@ -25,6 +25,7 @@ tracing.workspace = true
 base64.workspace = true
 tempfile.workspace = true
 bcrypt.workspace = true
+jsonwebtoken.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 http-body-util.workspace = true

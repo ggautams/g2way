@@ -698,3 +698,141 @@ async fn shuts_down_on_signal_and_refuses_new_connections() {
     let refused = tokio::net::TcpStream::connect(gw).await;
     assert!(refused.is_err(), "gateway still accepting after shutdown");
 }
+
+#[tokio::test]
+async fn jwt_jwks_end_to_end() {
+    use std::sync::Mutex;
+
+    // Same throwaway keypair as g2-middleware's JWT unit tests.
+    const TEST_RSA_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC9vQS0xUUdaCmm
+2MuakxbnoUGSCzeKns0F3C3x7I/CSuPV1ckdPIGfOoveNs+mSHI6Z5MwR4SvJcxu
+wJZz8dmd9UXHLhr/R2MpOA5cLMdS7ZyVfKrUC0blvWuJ9Un8M2ONmtx97L6c9k07
+1HD9MX9NVJlsKKOhF7hvuL+C5Wc8dUsE8TjnHkZ4pCQcHB5eY1BEzHXA0uZqTgsy
+4+YfqQ9cT4O+XPVlnPPGuyNe94F/NGqDH0ogfQjc9AEqPVsrOoyejY/oBHmwhSrf
+7d8lDzTN6M2KR9L6mZUKUafCKdxw9cfyI/RQRpQq0SK6aeN4/LOiCpvliI+U6Lfd
+2MsWr7T/AgMBAAECggEAB5UVKhA0Gd++wl8pi8zS/oCwOSDfoFeGQ/SvlVppyE7r
+2fDIL7XqTC2vxzqTg8ajYfgfpq9E+ybci5SArrN8idZyampKQ+dbbBtEX6Sedo7u
+Uf8AaKbmt2mhcYru4PhAwzjsFNAwMd+Z6Ikt1sByoOl/lBXvrBFhmn1ckeOPA5hu
+j6n2AZyG/nePtFU0y9gi1FTDECM8B2dliQyCzU7LvjpCCbRD0EiKYP7ZpUzIHC65
+9WR6RRC3onLe28CueTD3QvAvYsP4QeeiI5wDpvYmLQvowGovRbiAVOHDRqG08gtY
+cZSpyVuKmyi6kkRL19wbsTxdyH+elP6Chg1SUowP2QKBgQD/V/SCRSeGV8RrC2AR
+rTtujEu73sTOY4kMaDz6LqVk9O3SbqL0ZG1fHP+bah+rA/4LjHbPozbH8d1DXrNc
+cVOHoYnVsWp4NWvv7n5OnVUVxr7arbvsX+dDPlcdMQTRyaAV0zL0SmHQN3jqPzb4
+BuEqlH6eCzYCngHRi7la3G0X5QKBgQC+OeM7zmL+yPHjG2XS6yBjF6adDrJK/PQE
+g+DmfD7lPtEAMnh2cXZ7ADdpcdHu0uha2LRvyCZq1e0SMBFzWd8ny7TQTxn0ZR24
+6mIMxO+sWfKLtN4J/37/Qrt6mHo4hXxbIg8SAaiOgxkaLhbbAkobWM51NySaAKru
+Fez21p5DEwKBgG1No1cYb0Ds1SHVbrxiYWyDFfBH/gszRHlRLbkSuq4qwpsvzQW8
+76ylZy2KEiBMxzT+XeWoQkz41fR+11ydDlqi5bPaDG+Evr2oY90XMFLwDsbhU+5t
+Zzu7teLDFwMOwj5VeBxmstREyrfLc6Zcm4p0onbY6bfZF4Ixw5iHfxOZAoGAEwGN
+pqgUVAiXwm02W0CK19vBFegmAEAN0XWrvtujHRyNnUttpcfoYpm+75Yjt4zzEkCc
+pp6E2B/PtAWBeNj95uf/hOCiYzzHH3arnUL//2RtS3AizzTr520vdixN6d/McP6S
+KuZnhPWsSGVaez9bUCgrWKLN0WVHrsoaBv+iiGkCgYEA+y+XusCUErqu/bqzzEYj
+Oih8/7hU7lA0CEIx65jqY15F5Q2QDXv/s6j0JKdcWtSkdqq6w/yEbp/AHE8uamLo
+OXYCPHHq5blRvGxnz1qnmVPHyVEYVjdboJiavY1gbwtK+wCBPS85htaRuFxFb9LD
+NO+F4qDaW22QCAuvcoMJMDE=
+-----END PRIVATE KEY-----";
+    const TEST_RSA_N: &str = "vb0EtMVFHWgpptjLmpMW56FBkgs3ip7NBdwt8eyPwkrj1dXJHTyBnzqL3jbPpkhyOmeTMEeEryXMbsCWc_HZnfVFxy4a_0djKTgOXCzHUu2clXyq1AtG5b1rifVJ_DNjjZrcfey-nPZNO9Rw_TF_TVSZbCijoRe4b7i_guVnPHVLBPE45x5GeKQkHBweXmNQRMx1wNLmak4LMuPmH6kPXE-Dvlz1ZZzzxrsjXveBfzRqgx9KIH0I3PQBKj1bKzqMno2P6AR5sIUq3-3fJQ80zejNikfS-pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq-0_w";
+
+    fn jwks_json(kid: &str) -> String {
+        format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"{kid}","alg":"RS256","use":"sig","n":"{TEST_RSA_N}","e":"AQAB"}}]}}"#
+        )
+    }
+
+    fn rs256_token(kid: &str) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(kid.into());
+        let exp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs()
+            + 3600;
+        jsonwebtoken::encode(
+            &header,
+            &serde_json::json!({"sub": "dana", "exp": exp}),
+            &jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes())
+                .expect("private key"),
+        )
+        .expect("encode")
+    }
+
+    // A JWKS endpoint whose served key set can be swapped mid-test.
+    let payload = Arc::new(Mutex::new(jwks_json("k1")));
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind jwks");
+    let jwks_addr = listener.local_addr().expect("jwks addr");
+    let served = Arc::clone(&payload);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let served = Arc::clone(&served);
+            tokio::spawn(async move {
+                let service = service_fn(move |_req| {
+                    let body = served.lock().expect("payload").clone();
+                    async move {
+                        Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(
+                            body,
+                        ))))
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    let upstream = spawn_echo_upstream().await;
+    // 1s refresh so the rotation below is picked up by the periodic fetch.
+    let def = serde_json::from_str::<ApiDefinition>(&format!(
+        r#"{{"api_id":"jwks","name":"jwks","listen_path":"/jwks/",
+            "target_url":"http://{upstream}",
+            "auth":{{"mode":"jwt","signing_method":"rs256",
+                     "jwks_url":"http://{jwks_addr}/jwks.json",
+                     "jwks_refresh_secs":1}}}}"#
+    ))
+    .expect("definition");
+    let (gw, _stop) = spawn_gateway(vec![def]).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let get_with_token = |token: String| {
+        let client = client.clone();
+        let url = format!("http://{gw}/jwks/x");
+        async move {
+            let req = Request::get(url)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Empty::<Bytes>::new())
+                .expect("request");
+            client.request(req).await.expect("response").status()
+        }
+    };
+
+    // No token → 401.
+    let (status, _) = http_get(&format!("http://{gw}/jwks/x")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Token signed with the key the JWKS serves → proxied.
+    assert_eq!(get_with_token(rs256_token("k1")).await, StatusCode::OK);
+
+    // Garbage kid → the shared no-oracle 403.
+    assert_eq!(
+        get_with_token(rs256_token("ghost")).await,
+        StatusCode::FORBIDDEN
+    );
+
+    // Key rotation: the endpoint now serves k2; the 1s periodic refresh
+    // picks it up (the on-miss path alone is cooldown-limited).
+    *payload.lock().expect("payload") = jwks_json("k2");
+    let token = rs256_token("k2");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if get_with_token(token.clone()).await == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    })
+    .await
+    .expect("rotated key is picked up by the periodic refresh");
+}

@@ -36,7 +36,7 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 - [x] Redis-backed `Storage` implementation (connection pool, `g2:{org}:...` schema) + `make redis-up` integration tests
 - [x] Auth: keyless mode (explicit) and auth-token mode (header/query param/cookie lookup → `KeySession`)
 - [x] Auth: JWT with static keys (HS256 secret / RS256 public-key PEM; claims → ephemeral session)
-- [ ] Auth: JWT `jwks_url` fetch + cache (unblocked: rustls landed with the M7 TLS connector; still needs an HTTPS fetch client choice)
+- [x] Auth: JWT `jwks_url` fetch + cache (client: the proxy's shared hyper-rustls client behind a `JwksFetch` trait; pod-local ArcSwap cache, periodic + on-miss refresh, stale-on-error)
 - [x] Auth: basic auth
 - [x] Admin API skeleton (axum on separate port, `X-G2-Authorization` admin secret)
 - [x] Admin key CRUD: `POST/GET/PUT/DELETE /g2/keys[/{key}]`
@@ -720,3 +720,29 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   M8+ extended parity — re-prioritize with the user first; the deferred
   M2 `jwks_url` box is also still open (TLS landed; needs a fetch-client
   choice).
+- **2026-08-31 (15)** — **M2 fully complete.** The deferred `jwks_url` box
+  landed. Fetch-client decision (the one the TLS entry left open): the
+  proxy's shared hyper-rustls client, consumed through a new
+  `JwksFetch`/`SharedJwksFetch` trait in g2-middleware (same inversion as
+  `SharedStorage` — g2-middleware stays HTTP/TLS-free) and implemented by
+  `HttpJwksFetch` in g2-proxy over `Forwarder::client()` (10s timeout, 1 MiB
+  body cap via `Limited`). Config: `jwks_url` + optional `jwks_refresh_secs`
+  (default 300) on the `Jwt` variant; rs256-only, exactly one of
+  `public_key_pem`/`jwks_url`. Runtime: `g2_middleware::jwks::JwksCache` —
+  pod-local `ArcSwap<HashMap<kid, DecodingKey>>` (lock-free reads per
+  ADR-0001), background refresher copying the health-checker lifecycle
+  (Weak, self-exits on table swap; eager first fetch), on-miss refetch for
+  unknown kids behind a CAS-gated 10s cooldown, stale-on-error (a
+  *successful* empty set is authoritative — that's revocation). Tokens
+  must carry a `kid` (no try-all-keys; confusion-attack surface) and the
+  per-layer RS256 `Validation` keeps HS256 alg-confusion dead.
+  `AuthLayer::from_config` grew an `Option<SharedJwksFetch>` parameter;
+  `RouteTable::build`'s signature is unchanged. Tests: fake-fetcher unit
+  tests (rotation, cooldown, stale-on-error, no-kid, alg confusion), real
+  TCP fetcher tests (500/oversized/dead port), a router test proving the
+  1s periodic loop fetches and stops after table drop, and a
+  `jwt_jwks_end_to_end` e2e (401/200/403 + rotation via periodic refresh).
+  Not done (deliberate): non-RSA JWKS keys (gateway only speaks
+  hs256/rs256), per-API custom CA for the JWKS endpoint (use
+  `Forwarder::with_tls_config`). Next: M8+ extended parity —
+  re-prioritize with the user first.

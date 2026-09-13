@@ -717,6 +717,7 @@ dependencies = [
 name = "g2-middleware"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
  "async-trait",
  "base64",
  "bcrypt",
@@ -821,6 +822,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "jsonwebtoken",
  "serde_json",
  "tempfile",
  "tokio",

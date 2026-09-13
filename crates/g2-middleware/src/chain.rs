@@ -405,9 +405,10 @@ mod tests {
         // Token auth with an empty store: any authenticated request fails,
         // so a 200 proves auth was bypassed.
         let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
-        let auth = AuthLayer::from_config(&AuthConfig::default(), storage, "users-api", "acme")
-            .expect("valid")
-            .expect("token mode");
+        let auth =
+            AuthLayer::from_config(&AuthConfig::default(), storage, "users-api", "acme", None)
+                .expect("valid")
+                .expect("token mode");
         let path_policy = PathPolicyLayer::from_config(
             &[],
             &[rule("^/blocked$")],
@@ -475,6 +476,7 @@ mod tests {
             storage,
             "users-api",
             "acme",
+            None,
         )
         .expect("valid")
         .expect("token mode");
@@ -534,6 +536,7 @@ mod tests {
             storage,
             "users-api",
             "acme",
+            None,
         )
         .expect("valid")
         .expect("token mode");

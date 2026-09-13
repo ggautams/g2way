@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use g2_core::{ApiDefinition, Error};
+use g2_middleware::SharedJwksFetch;
 use g2_middleware::{
     AnalyticsHandle, AnalyticsLayer, AuthLayer, CacheLayer, ChainBuilder, ChainService, CorsLayer,
     HeaderTransformLayer, HttpMetrics, IpFilterLayer, MetricsLayer, MockResponseLayer,
@@ -13,7 +14,7 @@ use g2_middleware::{
 };
 use g2_storage::SharedStorage;
 
-use crate::forward::{Forward, Forwarder, UpstreamTarget};
+use crate::forward::{Forward, Forwarder, HttpJwksFetch, UpstreamTarget};
 
 /// Sets the per-version (inner) layers on `builder` from `def` — the one
 /// place the inner half of a chain is configured, shared by the unversioned
@@ -27,10 +28,17 @@ fn inner_layers(
     builder: ChainBuilder,
     def: &ApiDefinition,
     storage: &SharedStorage,
+    jwks_fetch: &SharedJwksFetch,
     spike_guard: Option<&Arc<SpikeGuard>>,
     cache_scope: &str,
 ) -> Result<ChainBuilder, Error> {
-    let auth = AuthLayer::from_config(&def.auth, Arc::clone(storage), &def.api_id, &def.org_id)?;
+    let auth = AuthLayer::from_config(
+        &def.auth,
+        Arc::clone(storage),
+        &def.api_id,
+        &def.org_id,
+        Some(Arc::clone(jwks_fetch)),
+    )?;
     // Keyless APIs carry no session, so there are no limits to read;
     // every credentialed API gets the limiter (it is a no-op for
     // sessions without rate/quota).
@@ -106,6 +114,9 @@ impl Route {
         analytics: Option<&AnalyticsHandle>,
     ) -> Result<Self, Error> {
         let target = Arc::new(UpstreamTarget::build(&def)?);
+        // Shared by every version's auth layer; JWKS documents ride the same
+        // pooled client as proxied traffic and health probes.
+        let jwks_fetch: SharedJwksFetch = Arc::new(HttpJwksFetch::new(forwarder));
         let ctx = RequestContext::new(def.api_id.clone(), def.org_id.clone());
         let ip_filter = IpFilterLayer::from_config(&def.allow_ips, &def.block_ips, &def.api_id)?;
         let cors = def
@@ -132,7 +143,7 @@ impl Route {
                 if let Some(health) = &def.health_check {
                     crate::health::spawn_checker(forwarder, &target, health);
                 }
-                inner_layers(outer, &def, storage, spike_guard, &def.api_id)?
+                inner_layers(outer, &def, storage, &jwks_fetch, spike_guard, &def.api_id)?
                     .build(Forward::new(forwarder, Arc::clone(&target)))
             }
             // A versioned API gets one inner chain per version — each built
@@ -153,6 +164,7 @@ impl Route {
                         ChainBuilder::new(ctx.clone()),
                         &vdef,
                         storage,
+                        &jwks_fetch,
                         spike_guard,
                         &cache_scope,
                     )?
@@ -280,6 +292,80 @@ mod tests {
     fn table(defs: Vec<ApiDefinition>) -> Result<RouteTable, Error> {
         let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
         RouteTable::build(defs, &Forwarder::new(), &storage, None, None, None, None)
+    }
+
+    #[tokio::test]
+    async fn jwks_route_refreshes_periodically_and_stops_after_drop() {
+        use std::convert::Infallible;
+        use std::net::Ipv4Addr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        // A JWKS endpoint counting how often it is fetched.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let counted = Arc::clone(&hits);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let counted = Arc::clone(&counted);
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |_req| {
+                        counted.fetch_add(1, Ordering::Relaxed);
+                        async move {
+                            Ok::<_, Infallible>(http::Response::new(http_body_util::Full::new(
+                                bytes::Bytes::from_static(b"{\"keys\":[]}"),
+                            )))
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        let def: ApiDefinition = serde_json::from_str(&format!(
+            r#"{{"api_id":"jwks","name":"jwks","listen_path":"/jwks/",
+                "target_url":"http://unused.internal",
+                "auth":{{"mode":"jwt","signing_method":"rs256",
+                         "jwks_url":"http://{addr}/jwks.json",
+                         "jwks_refresh_secs":1}}}}"#
+        ))
+        .expect("def");
+        let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let table = RouteTable::build(
+            vec![def],
+            &Forwarder::new(),
+            &storage,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect("build");
+
+        // Eager fetch plus at least one 1s periodic tick.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while hits.load(Ordering::Relaxed) < 2 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("background refresh keeps fetching");
+
+        // Dropping the table (a config reload) reaps the refresher.
+        drop(table);
+        tokio::time::sleep(Duration::from_millis(200)).await; // drain in-flight
+        let settled = hits.load(Ordering::Relaxed);
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(
+            hits.load(Ordering::Relaxed),
+            settled,
+            "no fetches after the owning table is dropped"
+        );
     }
 
     #[test]

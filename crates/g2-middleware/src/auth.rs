@@ -8,10 +8,11 @@
 //!   looked up in [`Storage`](g2_storage::Storage) under
 //!   `g2:{org_id}:apikey:{hash}`.
 //! - **`jwt`** — the bearer token in the configured header is verified
-//!   against a static key (HS256 secret or RS256 public key) and its claims
-//!   are turned into an ephemeral session: no storage lookup, `expires_at`
-//!   from `exp`, alias from the identity claim, access restricted to this
-//!   API.
+//!   against a static key (HS256 secret or RS256 public key) or, with
+//!   `jwks_url`, against a key set fetched from the identity provider and
+//!   cached pod-locally (see [`jwks`](crate::jwks)). Its claims are turned
+//!   into an ephemeral session: no storage lookup, `expires_at` from `exp`,
+//!   alias from the identity claim, access restricted to this API.
 //! - **`basic_auth`** — RFC 7617 `Authorization: Basic base64(user:pass)`.
 //!   The username (hashed under a `basic:` namespace) resolves to a stored
 //!   session whose `basic_auth.password_hash` the presented password is
@@ -55,9 +56,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine as _;
+use g2_core::api_definition::DEFAULT_JWKS_REFRESH_SECS;
 use g2_core::policy::policy_storage_key;
 use g2_core::session::{hash_key, session_storage_key};
 use g2_core::{AuthConfig, Error, JwtSigningMethod, KeySession, Policy};
@@ -68,6 +70,7 @@ use jsonwebtoken::{Algorithm, DecodingKey, Validation};
 use tower::{Layer, Service};
 
 use crate::context::SessionContext;
+use crate::jwks::{JwksCache, SharedJwksFetch};
 use crate::response::json_error;
 use crate::ProxyBody;
 
@@ -104,11 +107,11 @@ enum Mode {
         cookie: Option<String>,
         storage: SharedStorage,
     },
-    /// `jwt`: verify the bearer token against a static key.
+    /// `jwt`: verify the bearer token against the configured key source.
     Jwt {
         /// Header carrying the JWT.
         header: HeaderName,
-        decoding_key: Box<DecodingKey>,
+        keys: JwtKeys,
         validation: Box<Validation>,
         /// Claim used as the caller identity.
         identity_claim: String,
@@ -120,6 +123,14 @@ enum Mode {
         challenge: HeaderValue,
         storage: SharedStorage,
     },
+}
+
+/// Where the JWT mode's verification keys come from.
+enum JwtKeys {
+    /// A single key fixed at config-load time (HS256 secret or RS256 PEM).
+    Static(Box<DecodingKey>),
+    /// Keys fetched from `jwks_url`, selected per token by `kid`.
+    Jwks(Arc<JwksCache>),
 }
 
 impl std::fmt::Debug for AuthState {
@@ -146,15 +157,21 @@ pub struct AuthLayer {
 impl AuthLayer {
     /// Builds the layer for `cfg`, or `None` when the API is keyless.
     ///
+    /// `jwks_fetcher` supplies the HTTP client used when the JWT mode sets
+    /// `jwks_url`; the proxy passes its shared upstream client, and callers
+    /// building configs that never use JWKS may pass `None`.
+    ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidApiDefinition`] if the configured header name
-    /// is invalid (normally caught earlier by definition validation).
+    /// is invalid (normally caught earlier by definition validation), or if
+    /// `jwks_url` is set while `jwks_fetcher` is `None`.
     pub fn from_config(
         cfg: &AuthConfig,
         storage: SharedStorage,
         api_id: &str,
         org_id: &str,
+        jwks_fetcher: Option<SharedJwksFetch>,
     ) -> Result<Option<Self>, Error> {
         let invalid = |reason: String| Error::InvalidApiDefinition {
             api: api_id.to_owned(),
@@ -184,27 +201,44 @@ impl AuthLayer {
                 signing_method,
                 secret,
                 public_key_pem,
+                jwks_url,
+                jwks_refresh_secs,
                 header,
                 identity_claim,
             } => {
-                let (algorithm, decoding_key) = match signing_method {
-                    JwtSigningMethod::Hs256 => {
+                let (algorithm, keys) = match (signing_method, jwks_url) {
+                    (JwtSigningMethod::Hs256, _) => {
                         let secret = secret
                             .as_deref()
                             .ok_or_else(|| invalid("hs256 requires `auth.secret`".into()))?;
                         (
                             Algorithm::HS256,
-                            DecodingKey::from_secret(secret.as_bytes()),
+                            JwtKeys::Static(Box::new(DecodingKey::from_secret(secret.as_bytes()))),
                         )
                     }
-                    JwtSigningMethod::Rs256 => {
+                    (JwtSigningMethod::Rs256, None) => {
                         let pem = public_key_pem.as_deref().ok_or_else(|| {
                             invalid("rs256 requires `auth.public_key_pem`".into())
                         })?;
                         let key = DecodingKey::from_rsa_pem(pem.as_bytes()).map_err(|e| {
                             invalid(format!("`auth.public_key_pem` is not a valid RSA PEM: {e}"))
                         })?;
-                        (Algorithm::RS256, key)
+                        (Algorithm::RS256, JwtKeys::Static(Box::new(key)))
+                    }
+                    (JwtSigningMethod::Rs256, Some(url)) => {
+                        let fetcher = jwks_fetcher.ok_or_else(|| {
+                            invalid(
+                                "`auth.jwks_url` is set but no JWKS fetcher is available".into(),
+                            )
+                        })?;
+                        let cache = Arc::new(JwksCache::new(api_id, url.clone(), fetcher));
+                        let interval = Duration::from_secs(
+                            jwks_refresh_secs.unwrap_or(DEFAULT_JWKS_REFRESH_SECS),
+                        );
+                        // The route's AuthState Arc keeps the cache alive; a
+                        // config reload drops it and the task self-exits.
+                        JwksCache::spawn_refresher(&cache, interval);
+                        (Algorithm::RS256, JwtKeys::Jwks(cache))
                     }
                 };
                 // `exp` is required and validated (with the library's default
@@ -212,7 +246,7 @@ impl AuthLayer {
                 let validation = Validation::new(algorithm);
                 Mode::Jwt {
                     header: parse_header(header)?,
-                    decoding_key: Box::new(decoding_key),
+                    keys,
                     validation: Box::new(validation),
                     identity_claim: identity_claim.clone(),
                 }
@@ -332,14 +366,22 @@ async fn authenticate(
         }
         Mode::Jwt {
             header,
-            decoding_key,
+            keys,
             validation,
             identity_claim,
         } => {
             let token = extract_token(header, None, None, req).ok_or_else(|| {
                 json_error(StatusCode::UNAUTHORIZED, "authorization field missing")
             })?;
-            authenticate_jwt(state, decoding_key, validation, identity_claim, &token)
+            match keys {
+                JwtKeys::Static(key) => {
+                    authenticate_jwt(state, key, validation, identity_claim, &token)
+                }
+                JwtKeys::Jwks(cache) => {
+                    let key = resolve_jwks_key(state, cache, &token).await?;
+                    authenticate_jwt(state, &key, validation, identity_claim, &token)
+                }
+            }
         }
         Mode::Basic { challenge, storage } => {
             authenticate_basic(state, storage, challenge, req).await
@@ -544,6 +586,33 @@ async fn resolve_policy(
     Ok(session)
 }
 
+/// `jwt` mode with `jwks_url`: resolve the token's `kid` to a cached JWKS
+/// key, refetching (cooldown-gated) on an unknown kid.
+///
+/// Every failure — unparseable header, missing `kid`, no matching key even
+/// after a refetch — is the shared no-oracle 403.
+async fn resolve_jwks_key(
+    state: &AuthState,
+    cache: &JwksCache,
+    token: &str,
+) -> Result<DecodingKey, Response<ProxyBody>> {
+    let header = jsonwebtoken::decode_header(token).map_err(|e| {
+        tracing::debug!(api_id = %state.api_id, error = %e, "JWT header unparseable");
+        json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG)
+    })?;
+    let Some(kid) = header.kid else {
+        tracing::debug!(
+            api_id = %state.api_id,
+            "JWT has no kid; jwks mode requires one"
+        );
+        return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+    };
+    cache.key_for(&kid).await.ok_or_else(|| {
+        tracing::debug!(api_id = %state.api_id, kid, "no JWKS key matches the token's kid");
+        json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG)
+    })
+}
+
 /// `jwt` mode: verify the token and synthesize an ephemeral session from
 /// its claims. No storage involved.
 // The large Err is a rejection Response built once on the cold path; boxing
@@ -746,7 +815,7 @@ mod tests {
     }
 
     fn service(cfg: &AuthConfig, storage: MemoryStorage) -> crate::ChainService {
-        let layer = AuthLayer::from_config(cfg, Arc::new(storage), API, ORG)
+        let layer = AuthLayer::from_config(cfg, Arc::new(storage), API, ORG, None)
             .expect("valid cfg")
             .expect("token mode");
         crate::ChainService::new(layer.layer(tower::service_fn(require_session)))
@@ -763,6 +832,7 @@ mod tests {
             Arc::new(MemoryStorage::new()),
             API,
             ORG,
+            None,
         )
         .expect("ok");
         assert!(layer.is_none());
@@ -1149,6 +1219,8 @@ zejNikfS+pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq+0
                 signing_method: g2_core::JwtSigningMethod::Hs256,
                 secret: Some(SECRET.into()),
                 public_key_pem: None,
+                jwks_url: None,
+                jwks_refresh_secs: None,
                 header: "Authorization".into(),
                 identity_claim: "sub".into(),
             }
@@ -1244,6 +1316,8 @@ zejNikfS+pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq+0
                 signing_method: g2_core::JwtSigningMethod::Rs256,
                 secret: None,
                 public_key_pem: Some(TEST_RSA_PUBLIC_PEM.into()),
+                jwks_url: None,
+                jwks_refresh_secs: None,
                 header: "Authorization".into(),
                 identity_claim: "sub".into(),
             };
@@ -1270,11 +1344,231 @@ zejNikfS+pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq+0
                 signing_method: g2_core::JwtSigningMethod::Rs256,
                 secret: None,
                 public_key_pem: Some("not a pem".into()),
+                jwks_url: None,
+                jwks_refresh_secs: None,
                 header: "Authorization".into(),
                 identity_claim: "sub".into(),
             };
-            let err = AuthLayer::from_config(&cfg, Arc::new(MemoryStorage::new()), API, ORG);
+            let err = AuthLayer::from_config(&cfg, Arc::new(MemoryStorage::new()), API, ORG, None);
             assert!(err.is_err());
+        }
+
+        mod jwks {
+            use super::*;
+            use crate::jwks::test_support::FakeFetch;
+
+            /// Base64url modulus of [`TEST_RSA_PUBLIC_PEM`]; pasted once and
+            /// drift-guarded by `jwk_material_matches_the_test_rsa_pem`.
+            const TEST_RSA_N: &str = "vb0EtMVFHWgpptjLmpMW56FBkgs3ip7NBdwt8eyPwkrj1dXJHTyBnzqL3jbPpkhyOmeTMEeEryXMbsCWc_HZnfVFxy4a_0djKTgOXCzHUu2clXyq1AtG5b1rifVJ_DNjjZrcfey-nPZNO9Rw_TF_TVSZbCijoRe4b7i_guVnPHVLBPE45x5GeKQkHBweXmNQRMx1wNLmak4LMuPmH6kPXE-Dvlz1ZZzzxrsjXveBfzRqgx9KIH0I3PQBKj1bKzqMno2P6AR5sIUq3-3fJQ80zejNikfS-pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq-0_w";
+
+            fn jwks_json(kid: &str) -> String {
+                format!(
+                    r#"{{"keys":[{{"kty":"RSA","kid":"{kid}","alg":"RS256","use":"sig","n":"{TEST_RSA_N}","e":"AQAB"}}]}}"#
+                )
+            }
+
+            fn rs256_token(kid: &str, claims: &serde_json::Value) -> String {
+                let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+                header.kid = Some(kid.into());
+                encode(
+                    &header,
+                    claims,
+                    &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes())
+                        .expect("private key"),
+                )
+                .expect("encode rs256")
+            }
+
+            fn cache(fetch: &Arc<FakeFetch>) -> Arc<JwksCache> {
+                Arc::new(JwksCache::new(
+                    API,
+                    "http://idp.internal/jwks.json".into(),
+                    Arc::clone(fetch) as SharedJwksFetch,
+                ))
+            }
+
+            /// Builds a JWKS-mode service directly around `cache`, bypassing
+            /// `from_config` so tests never race the background refresher:
+            /// every fetch happens through the deterministic on-miss path.
+            fn jwks_service(cache: &Arc<JwksCache>) -> crate::ChainService {
+                let layer = AuthLayer {
+                    state: Arc::new(AuthState {
+                        api_id: API.into(),
+                        org_id: ORG.into(),
+                        mode: Mode::Jwt {
+                            header: HeaderName::from_static("authorization"),
+                            keys: JwtKeys::Jwks(Arc::clone(cache)),
+                            validation: Box::new(Validation::new(Algorithm::RS256)),
+                            identity_claim: "sub".into(),
+                        },
+                    }),
+                };
+                crate::ChainService::new(layer.layer(tower::service_fn(require_session)))
+            }
+
+            async fn call_jwks(cache: &Arc<JwksCache>, token: &str) -> Response<ProxyBody> {
+                let mut req = request("/x");
+                req.headers_mut().insert(
+                    "authorization",
+                    format!("Bearer {token}").parse().expect("value"),
+                );
+                jwks_service(cache).oneshot(req).await.expect("infallible")
+            }
+
+            fn claims() -> serde_json::Value {
+                serde_json::json!({"sub": "carol", "exp": future_exp()})
+            }
+
+            #[test]
+            fn jwk_material_matches_the_test_rsa_pem() {
+                let set: jsonwebtoken::jwk::JwkSet =
+                    serde_json::from_str(&jwks_json("k1")).expect("valid JWKS");
+                let jwk = set.find("k1").expect("k1 present");
+                let key = DecodingKey::from_jwk(jwk).expect("usable key");
+                let token = rs256_token("k1", &claims());
+                jsonwebtoken::decode::<serde_json::Value>(
+                    &token,
+                    &key,
+                    &Validation::new(Algorithm::RS256),
+                )
+                .expect("the pasted JWK matches TEST_RSA_PUBLIC_PEM");
+            }
+
+            #[tokio::test]
+            async fn jwks_config_verifies_tokens_through_from_config() {
+                let fetch = FakeFetch::new(Ok(&jwks_json("k1")));
+                let cfg = AuthConfig::Jwt {
+                    signing_method: g2_core::JwtSigningMethod::Rs256,
+                    secret: None,
+                    public_key_pem: None,
+                    jwks_url: Some("http://idp.internal/jwks.json".into()),
+                    jwks_refresh_secs: None,
+                    header: "Authorization".into(),
+                    identity_claim: "sub".into(),
+                };
+                let layer = AuthLayer::from_config(
+                    &cfg,
+                    Arc::new(MemoryStorage::new()),
+                    API,
+                    ORG,
+                    Some(Arc::clone(&fetch) as SharedJwksFetch),
+                )
+                .expect("valid cfg")
+                .expect("jwt mode");
+                let svc = crate::ChainService::new(layer.layer(tower::service_fn(require_session)));
+                let mut req = request("/x");
+                req.headers_mut().insert(
+                    "authorization",
+                    format!("Bearer {}", rs256_token("k1", &claims()))
+                        .parse()
+                        .expect("value"),
+                );
+                let resp = svc.oneshot(req).await.expect("infallible");
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert_eq!(
+                    resp.headers()
+                        .get("x-echo-alias")
+                        .expect("alias")
+                        .as_bytes(),
+                    b"carol"
+                );
+            }
+
+            #[tokio::test]
+            async fn rotated_kid_is_picked_up_by_a_refetch() {
+                let fetch = FakeFetch::new(Ok(&jwks_json("k1")));
+                let cache = cache(&fetch);
+                let resp = call_jwks(&cache, &rs256_token("k1", &claims())).await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert_eq!(fetch.calls(), 1);
+
+                // The IdP rotates to k2; the next unknown-kid miss refetches.
+                fetch.set_body(Ok(&jwks_json("k2")));
+                cache.reset_miss_cooldown();
+                let resp = call_jwks(&cache, &rs256_token("k2", &claims())).await;
+                assert_eq!(resp.status(), StatusCode::OK);
+                assert_eq!(fetch.calls(), 2);
+            }
+
+            #[tokio::test]
+            async fn unknown_kid_is_403_and_the_cooldown_limits_refetches() {
+                let fetch = FakeFetch::new(Ok(&jwks_json("k1")));
+                let cache = cache(&fetch);
+                let resp = call_jwks(&cache, &rs256_token("ghost", &claims())).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+                assert_eq!(fetch.calls(), 1, "the miss refetched once");
+
+                // A second garbage kid inside the cooldown costs no fetch.
+                let resp = call_jwks(&cache, &rs256_token("ghost2", &claims())).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+                assert_eq!(fetch.calls(), 1, "cooldown holds");
+            }
+
+            #[tokio::test]
+            async fn unreachable_jwks_endpoint_is_403_until_it_recovers() {
+                let fetch = FakeFetch::new(Err("connection refused"));
+                let cache = cache(&fetch);
+                let token = rs256_token("k1", &claims());
+                let resp = call_jwks(&cache, &token).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+                fetch.set_body(Ok(&jwks_json("k1")));
+                cache.reset_miss_cooldown();
+                let resp = call_jwks(&cache, &token).await;
+                assert_eq!(resp.status(), StatusCode::OK);
+            }
+
+            #[tokio::test]
+            async fn token_without_kid_is_403_without_fetching() {
+                let fetch = FakeFetch::new(Ok(&jwks_json("k1")));
+                let cache = cache(&fetch);
+                let token = encode(
+                    &Header::new(jsonwebtoken::Algorithm::RS256),
+                    &claims(),
+                    &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes())
+                        .expect("private key"),
+                )
+                .expect("encode");
+                let resp = call_jwks(&cache, &token).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+                assert_eq!(fetch.calls(), 0, "no kid, no lookup, no fetch");
+            }
+
+            #[tokio::test]
+            async fn hs256_token_with_matching_kid_is_rejected() {
+                // Alg confusion: even when the kid resolves to a key, the
+                // layer's RS256-only validation rejects an HS256 signature.
+                let fetch = FakeFetch::new(Ok(&jwks_json("k1")));
+                let cache = cache(&fetch);
+                let header = Header {
+                    kid: Some("k1".into()),
+                    ..Header::default()
+                };
+                let token = encode(
+                    &header,
+                    &claims(),
+                    &EncodingKey::from_secret(SECRET.as_bytes()),
+                )
+                .expect("encode hs256");
+                let resp = call_jwks(&cache, &token).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+            }
+
+            #[test]
+            fn jwks_url_without_a_fetcher_fails_layer_construction() {
+                let cfg = AuthConfig::Jwt {
+                    signing_method: g2_core::JwtSigningMethod::Rs256,
+                    secret: None,
+                    public_key_pem: None,
+                    jwks_url: Some("http://idp.internal/jwks.json".into()),
+                    jwks_refresh_secs: None,
+                    header: "Authorization".into(),
+                    identity_claim: "sub".into(),
+                };
+                let err =
+                    AuthLayer::from_config(&cfg, Arc::new(MemoryStorage::new()), API, ORG, None);
+                assert!(err.is_err());
+            }
         }
     }
 
