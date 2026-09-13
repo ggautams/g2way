@@ -39,6 +39,13 @@ spec:
     metadata:
       labels:
         app: g2way
+      # Convention-based discovery for a cluster Prometheus configured with
+      # the standard pod-annotation scrape job. /metrics is unauthenticated
+      # on the admin listener (scrapers can't send custom headers).
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9696"
+        prometheus.io/path: /metrics
     spec:
       # Slightly longer than the gateway's default 30s drain grace.
       terminationGracePeriodSeconds: 45
@@ -61,6 +68,12 @@ spec:
               # Dev/minikube-only secret; use a real Secret object in any
               # environment that matters.
               value: g2-smoke-admin-secret
+            - name: G2_OTLP_ENDPOINT
+              # Traces + metrics + (with the sink below) analytics-as-logs
+              # all push here; see otel-collector.yaml.
+              value: http://otel-collector.g2way.svc.cluster.local:4318
+            - name: G2_ANALYTICS_SINK
+              value: otlp_logs
           ports:
             - name: proxy
               containerPort: 8080

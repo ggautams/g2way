@@ -33,6 +33,7 @@ wait_for() {
 say "waiting for deployments to be ready"
 kubectl -n "$NS" rollout status deploy/redis --timeout=120s
 kubectl -n "$NS" rollout status deploy/httpbin --timeout=120s
+kubectl -n "$NS" rollout status deploy/otel-collector --timeout=120s
 kubectl -n "$NS" rollout status deploy/g2way --timeout=120s
 
 say "port-forwarding service/g2way to localhost:$LOCAL_PORT"
@@ -115,4 +116,90 @@ CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
   "http://localhost:$ADMIN_PORT/g2/keys/$KEY")
 [ "$CODE" = "200" ] || fail "admin key DELETE returned $CODE"
 
-printf '\nSMOKE OK — gateway is proxying end to end and replicas share rate limits.\n'
+# --- Dashboard & Prometheus (pod A's admin listener) ----------------------
+
+say "checking the dashboard endpoints"
+NODE=$(curl -sf -H "X-G2-Authorization: $ADMIN_SECRET" \
+  "http://localhost:$ADMIN_PORT/g2/node")
+echo "$NODE" | grep -q '"httpbin-limited"' \
+  || fail "/g2/node does not list the httpbin-limited API"
+STATS=$(curl -sf -H "X-G2-Authorization: $ADMIN_SECRET" \
+  "http://localhost:$ADMIN_PORT/g2/stats")
+# Pod A served at least the tokenless 401 and rate-limit requests 1/3/5.
+echo "$STATS" | grep -q '"httpbin-limited"' \
+  || fail "/g2/stats has no counters for httpbin-limited"
+
+say "checking the Prometheus endpoint (no admin secret)"
+curl -sf "http://localhost:$ADMIN_PORT/metrics" \
+  | grep -q 'http_server_request_duration_seconds' \
+  || fail "/metrics is missing the request-duration histogram"
+
+# --- Hot reload -----------------------------------------------------------
+# A definition created via the admin API must go live on BOTH pods after a
+# single POST /g2/reload (Redis pub/sub fan-out), with no restarts. The
+# listen path is unique per run so a leftover def from a failed prior run
+# can't satisfy the pre-reload 404 check; the fixed api_id means PUT simply
+# overwrites such a leftover.
+
+say "creating an API definition via the admin API"
+RELOAD_PATH="/reload-smoke-$RANDOM/"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X PUT \
+  -H "X-G2-Authorization: $ADMIN_SECRET" \
+  -H 'Content-Type: application/json' \
+  -d "{\"api_id\":\"smoke-reload\",\"name\":\"reload smoke\",
+       \"listen_path\":\"$RELOAD_PATH\",
+       \"target_url\":\"http://httpbin.g2way.svc.cluster.local:8080\",
+       \"auth\":{\"mode\":\"keyless\"}}" \
+  "http://localhost:$ADMIN_PORT/g2/apis/smoke-reload")
+[ "$CODE" = "200" ] || fail "admin API def PUT returned $CODE"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' \
+  "http://localhost:$POD_A_PORT${RELOAD_PATH}get")
+[ "$CODE" = "404" ] || fail "expected 404 before reload, got $CODE"
+
+say "broadcasting /g2/reload and waiting for both pods"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H "X-G2-Authorization: $ADMIN_SECRET" "http://localhost:$ADMIN_PORT/g2/reload")
+[ "$CODE" = "200" ] || fail "POST /g2/reload returned $CODE"
+both_pods_return() {
+  local want=$1 code
+  for port in "$POD_A_PORT" "$POD_B_PORT"; do
+    code=$(curl -s -o /dev/null -w '%{http_code}' \
+      "http://localhost:$port${RELOAD_PATH}get")
+    [ "$code" = "$want" ] || return 1
+  done
+}
+reload_settled() {
+  for _ in $(seq 1 30); do
+    both_pods_return "$1" && return 0
+    sleep 0.5
+  done
+  return 1
+}
+reload_settled 200 || fail "reloaded API is not serving on both pods"
+
+say "deleting the definition and reloading again"
+CODE=$(curl -s -o /dev/null -w '%{http_code}' -X DELETE \
+  -H "X-G2-Authorization: $ADMIN_SECRET" \
+  "http://localhost:$ADMIN_PORT/g2/apis/smoke-reload")
+[ "$CODE" = "200" ] || fail "admin API def DELETE returned $CODE"
+curl -s -o /dev/null -X POST \
+  -H "X-G2-Authorization: $ADMIN_SECRET" "http://localhost:$ADMIN_PORT/g2/reload"
+reload_settled 404 || fail "deleted API is still routed after reload"
+
+# --- Telemetry reaches the collector --------------------------------------
+# The debug exporter logs one summary line per batch; the gateway's batch
+# span processor flushes every ~5s, so poll for a bit.
+
+say "checking the otel-collector received traces"
+TRACES_OK=
+for _ in $(seq 1 30); do
+  if kubectl -n "$NS" logs deploy/otel-collector --since=10m 2>/dev/null \
+    | grep -qiE 'TracesExporter|resource spans'; then
+    TRACES_OK=1
+    break
+  fi
+  sleep 1
+done
+[ -n "$TRACES_OK" ] || fail "otel-collector logs show no trace batches"
+
+printf '\nSMOKE OK — proxying, shared rate limits, dashboard, hot reload, and telemetry all verified.\n'

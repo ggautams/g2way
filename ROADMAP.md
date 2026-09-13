@@ -65,7 +65,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 - [x] OTLP trace export (opentelemetry-otlp) with per-request spans (api_id, key alias, status, upstream latency)
 - [x] OTLP metrics + Prometheus `/metrics` endpoint
 - [x] `AnalyticsSink` trait + per-request analytics records; stdout-JSON, Redis-list, and OTLP-logs sinks
-- [ ] deploy/k8s: otel-collector example; document Datadog exporter wiring
+- [x] deploy/k8s: otel-collector example; document Datadog exporter wiring
 
 ## M6 — Traffic middleware
 
@@ -473,3 +473,21 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   checkbox (otel-collector example + Datadog wiring docs), which should
   also pick up the deferred k8s smoke gaps (reload/dashboard assertions,
   Prometheus scrape annotations).
+- **2026-08-31 (4)** — **M5 complete** (minus the M2 `jwks_url` deferral,
+  which waits on M7 TLS). Deploy checkbox landed: `deploy/k8s/
+  otel-collector.yaml` (contrib 0.115.1 image — the core distribution has
+  no datadog exporter — OTLP HTTP 4318, debug exporter on all three
+  pipelines, Datadog blocks present-but-commented); gateway Deployment
+  gained `G2_OTLP_ENDPOINT` → collector, `G2_ANALYTICS_SINK=otlp_logs`,
+  and `prometheus.io/*` pod annotations; `docs/observability.md`
+  documents the knobs + two Datadog paths (collector datadog exporter /
+  DD Agent OTLP ingest). smoke.sh picked up every deferred gap: dashboard
+  (`/g2/node` + `/g2/stats`), unauthenticated `/metrics` histogram,
+  full hot-reload round-trip (admin PUT def → 404 → `/g2/reload` → 200 on
+  **both** pods → DELETE → reload → 404; unique listen path per run,
+  fixed api_id so PUT self-heals leftovers), and traces arriving in
+  collector logs (polls ~30s; metrics ride a 60s push period so smoke
+  only asserts traces). **Verified green on minikube end to end**, and
+  all three signals (Traces/Metrics/Logs) confirmed in collector logs
+  manually. Next: M6 traffic middleware, first box: header transforms
+  (add/remove, request and response).

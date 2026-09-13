@@ -1,0 +1,117 @@
+# Example OpenTelemetry Collector for the g2way telemetry pipeline.
+#
+# The gateway pushes OTLP over HTTP/protobuf (traces to /v1/traces, metrics
+# to /v1/metrics, analytics records as logs to /v1/logs) to the endpoint in
+# G2_OTLP_ENDPOINT (see gateway.yaml). This example receives all three and
+# prints them via the `debug` exporter so `kubectl logs deploy/otel-collector`
+# shows telemetry arriving — swap `debug` for a real backend exporter in the
+# pipelines below. Datadog wiring is documented in docs/observability.md and
+# sketched in the comments in the ConfigMap.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: otel-collector-config
+  namespace: g2way
+data:
+  config.yaml: |
+    receivers:
+      otlp:
+        protocols:
+          http:
+            endpoint: 0.0.0.0:4318
+
+    processors:
+      batch: {}
+
+    exporters:
+      debug:
+        # `normal` prints one summary line per batch; use `detailed` to dump
+        # every span/metric/log record while debugging.
+        verbosity: normal
+      # -- Datadog (requires the -contrib image, which this example uses) --
+      # Create the secret first:
+      #   kubectl -n g2way create secret generic datadog --from-literal=api-key=<DD_API_KEY>
+      # then uncomment this exporter, the DD_API_KEY env var in the
+      # Deployment below, and swap `debug` for `datadog` in the pipelines.
+      # See docs/observability.md for details.
+      #
+      # datadog:
+      #   api:
+      #     key: ${env:DD_API_KEY}
+      #     site: datadoghq.com   # or datadoghq.eu, us3.datadoghq.com, ...
+
+    service:
+      pipelines:
+        traces:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+        metrics:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+        logs:
+          receivers: [otlp]
+          processors: [batch]
+          exporters: [debug]
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: otel-collector
+  namespace: g2way
+  labels:
+    app: otel-collector
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: otel-collector
+  template:
+    metadata:
+      labels:
+        app: otel-collector
+    spec:
+      containers:
+        - name: otel-collector
+          # The -contrib distribution: the core image has no datadog exporter.
+          image: otel/opentelemetry-collector-contrib:0.115.1
+          args:
+            - --config=/etc/otel/config.yaml
+          # Uncomment (with the secret and exporter above) for Datadog:
+          # env:
+          #   - name: DD_API_KEY
+          #     valueFrom:
+          #       secretKeyRef:
+          #         name: datadog
+          #         key: api-key
+          ports:
+            - name: otlp-http
+              containerPort: 4318
+          volumeMounts:
+            - name: config
+              mountPath: /etc/otel
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+      volumes:
+        - name: config
+          configMap:
+            name: otel-collector-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: otel-collector
+  namespace: g2way
+spec:
+  selector:
+    app: otel-collector
+  ports:
+    - name: otlp-http
+      port: 4318
+      targetPort: otlp-http
