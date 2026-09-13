@@ -12,6 +12,7 @@ use crate::auth::AuthLayer;
 use crate::cache::CacheLayer;
 use crate::context::RequestContext;
 use crate::cors::CorsLayer;
+use crate::graphql::GraphQlLayer;
 use crate::ip_filter::IpFilterLayer;
 use crate::metrics::MetricsLayer;
 use crate::mock::MockResponseLayer;
@@ -55,27 +56,34 @@ use crate::{ChainService, ProxyBody};
 /// 10. [`AuthLayer`] — token auth (absent for keyless APIs).
 /// 11. [`RateLimitLayer`] — session rate/quota enforcement (absent for
 ///     keyless APIs, which have no session to read limits from).
-/// 12. [`HeaderTransformLayer`] — per-API header add/remove on requests and
+/// 12. [`GraphQlLayer`] — GraphQL protections, playground, and persisted
+///     queries (absent when unconfigured). Below auth/rate-limit so the
+///     per-key grants are resolved, the playground stays credentialed, and
+///     rejected requests buy no parse work; above the header transforms so
+///     GraphQL rejections stay untransformed and the persisted-query
+///     rewrite happens before request transforms see the upstream-bound
+///     request.
+/// 13. [`HeaderTransformLayer`] — per-API header add/remove on requests and
 ///     responses (absent when unconfigured). Below auth/rate-limit so
 ///     gateway rejections are not transformed; above [`ApiIdHeaderLayer`] so
 ///     a transform can never spoof the anti-spoof api-id header.
-/// 13. [`MockResponseLayer`] — gateway-answered mock responses (absent when
+/// 14. [`MockResponseLayer`] — gateway-answered mock responses (absent when
 ///     unconfigured). Below auth/rate-limit (mocks on a protected API stay
 ///     protected) and below the header transforms, so mock responses get
 ///     the API's response transforms like any upstream response.
-/// 14. [`CacheLayer`] — shared response caching for safe requests (absent
+/// 15. [`CacheLayer`] — shared response caching for safe requests (absent
 ///     when unconfigured). Below auth/rate-limit so cache hits still
 ///     require credentials and consume rate, below the header transforms so
 ///     the stored copy is the raw upstream response (transforms re-apply
 ///     live on every hit), and below mocks so mock responses — already
 ///     gateway-local — are never cached.
-/// 15. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+/// 16. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
 ///
 /// [`Self::build`] composes the full stack for an unversioned API. A
 /// versioned API splits the stack around its version dispatcher instead:
 /// [`Self::build_outer`] composes the shared, version-independent layers
 /// (items 1–7) around the dispatcher, and [`Self::build_inner`] composes
-/// the per-version layers (items 8–15) around each version's forwarder.
+/// the per-version layers (items 8–16) around each version's forwarder.
 /// The three methods must keep the ordering above consistent.
 #[derive(Debug, Clone)]
 pub struct ChainBuilder {
@@ -90,6 +98,7 @@ pub struct ChainBuilder {
     cors: Option<CorsLayer>,
     path_policy: Option<PathPolicyLayer>,
     size_limit: Option<RequestSizeLimitLayer>,
+    graphql: Option<GraphQlLayer>,
     transform_headers: Option<HeaderTransformLayer>,
     mock: Option<MockResponseLayer>,
     cache: Option<CacheLayer>,
@@ -111,6 +120,7 @@ impl ChainBuilder {
             cors: None,
             path_policy: None,
             size_limit: None,
+            graphql: None,
             transform_headers: None,
             mock: None,
             cache: None,
@@ -188,6 +198,14 @@ impl ChainBuilder {
         self
     }
 
+    /// Adds GraphQL protections, playground, and persisted queries (`None`
+    /// is a no-op).
+    #[must_use]
+    pub fn graphql(mut self, graphql: Option<GraphQlLayer>) -> Self {
+        self.graphql = graphql;
+        self
+    }
+
     /// Adds header add/remove transforms (`None` is a no-op).
     #[must_use]
     pub fn transform_headers(mut self, transform_headers: Option<HeaderTransformLayer>) -> Self {
@@ -233,6 +251,7 @@ impl ChainBuilder {
             .option_layer(self.size_limit)
             .option_layer(self.auth)
             .option_layer(self.rate_limit)
+            .option_layer(self.graphql)
             .option_layer(self.transform_headers)
             .option_layer(self.mock)
             .option_layer(self.cache)
@@ -286,6 +305,7 @@ impl ChainBuilder {
             .option_layer(self.size_limit)
             .option_layer(self.auth)
             .option_layer(self.rate_limit)
+            .option_layer(self.graphql)
             .option_layer(self.transform_headers)
             .option_layer(self.mock)
             .option_layer(self.cache)
@@ -578,6 +598,55 @@ mod tests {
                 .as_bytes(),
             b"https://app.example.com"
         );
+    }
+
+    #[tokio::test]
+    async fn graphql_sits_below_auth() {
+        use std::sync::Arc;
+
+        use g2_storage::SharedStorage;
+
+        use crate::graphql::GraphQlLayer;
+
+        // Token auth with an empty store: every request without a valid key
+        // is rejected — proving the GraphQL layer (which would answer 400
+        // for this junk body) never ran.
+        let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let auth = AuthLayer::from_config(
+            &g2_core::AuthConfig::default(),
+            storage,
+            "users-api",
+            "acme",
+            None,
+        )
+        .expect("valid")
+        .expect("token mode");
+        let def: g2_core::ApiDefinition = serde_json::from_str(
+            r#"{
+                "api_id": "users-api",
+                "name": "users-api",
+                "listen_path": "/gql/",
+                "target_url": "http://gql.internal",
+                "graphql": { "schema": "type Query { hello: String }" }
+            }"#,
+        )
+        .expect("valid definition");
+        let graphql = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def)
+            .expect("compiles")
+            .expect("enabled");
+
+        let chain = ChainBuilder::new(RequestContext::new("users-api", "acme"))
+            .auth(Some(auth))
+            .graphql(Some(graphql))
+            .build(tower::service_fn(echo_forward));
+
+        let req = Request::builder()
+            .method(http::Method::POST)
+            .uri("/gql")
+            .body(body("not graphql"))
+            .expect("request");
+        let resp = chain.oneshot(req).await.expect("infallible");
+        assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]

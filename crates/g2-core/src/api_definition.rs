@@ -4,6 +4,7 @@ use http::Uri;
 use serde::{Deserialize, Serialize};
 
 use crate::endpoints::{MockResponse, PathRule};
+use crate::graphql::GraphQlConfig;
 use crate::security::{self, CorsConfig};
 use crate::transform::{self, HeaderTransforms, UrlRewriteRule};
 use crate::versioning::VersioningConfig;
@@ -724,6 +725,14 @@ pub struct ApiDefinition {
     /// definition (see [`VersioningConfig`]). Unset = unversioned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub versioning: Option<VersioningConfig>,
+
+    /// Optional GraphQL settings: present, the API is treated as a GraphQL
+    /// API — requests are parsed, validated against the configured schema,
+    /// and policed (depth limits, introspection control, per-key field
+    /// permissions) before being proxied (see [`GraphQlConfig`]).
+    /// Unset = plain HTTP proxying.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql: Option<GraphQlConfig>,
 }
 
 /// Serde helper: keeps default-zero counters off the wire.
@@ -871,6 +880,9 @@ impl ApiDefinition {
         }
         if let Some(cache) = &self.cache {
             cache.validate(&self.api_id)?;
+        }
+        if let Some(graphql) = &self.graphql {
+            graphql.validate(&self.api_id)?;
         }
         // Last, so per-version effective definitions are validated only
         // after the base fields have passed (errors then name the version).
@@ -1620,6 +1632,38 @@ mod tests {
         }
         let err = def.validate().unwrap_err().to_string();
         assert!(err.contains("version `v2`"), "got: {err}");
+    }
+
+    #[test]
+    fn graphql_config_parses_and_validates() {
+        let json = r#"{
+            "api_id": "gql",
+            "name": "gql",
+            "listen_path": "/gql/",
+            "target_url": "http://gql.internal/graphql",
+            "graphql": {
+                "schema": "type Query { hello: String }",
+                "max_query_depth": 4
+            }
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        let gql = def.graphql.as_ref().expect("set");
+        assert!(gql.enabled && gql.introspection_enabled);
+        assert_eq!(gql.max_query_depth, Some(4));
+
+        // Optionals stay off the wire when unset (old records unaffected).
+        let bare = serde_json::to_string(&parse(minimal_json())).expect("serializes");
+        assert!(!bare.contains("graphql"), "`graphql` serialized when unset");
+
+        // A broken schema fails validation, naming the API.
+        let mut def = parse(json);
+        def.graphql.as_mut().expect("set").schema = "type Query {".into();
+        let err = def.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("gql") && err.contains("graphql.schema"),
+            "got: {err}"
+        );
     }
 
     #[test]

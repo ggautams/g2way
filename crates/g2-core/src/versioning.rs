@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api_definition::{CacheConfig, CircuitBreakerConfig, HealthCheckConfig};
 use crate::endpoints::{MockResponse, PathRule};
+use crate::graphql::GraphQlConfig;
 use crate::transform::{HeaderTransforms, UrlRewriteRule};
 use crate::{ApiDefinition, Error};
 
@@ -142,6 +143,11 @@ pub struct VersionOverrides {
     /// caches under its own scope, so versions never share entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache: Option<CacheConfig>,
+
+    /// Replacement GraphQL settings for this version (schema, protections,
+    /// playground, persisted queries — replaced wholesale).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graphql: Option<GraphQlConfig>,
 }
 
 impl VersioningConfig {
@@ -269,6 +275,9 @@ impl VersioningConfig {
         }
         if let Some(v) = &overrides.cache {
             def.cache = Some(v.clone());
+        }
+        if let Some(v) = &overrides.graphql {
+            def.graphql = Some(v.clone());
         }
         Some(def)
     }
@@ -507,6 +516,38 @@ mod tests {
 
         // A broken override fails validation naming the version.
         let cfg = versioning(r#"{"versions": {"v2": {"cache": {"ttl_secs": 0}}}}"#);
+        let err = cfg.validate(&base).unwrap_err().to_string();
+        assert!(err.contains("version `v2`"), "got: {err}");
+    }
+
+    #[test]
+    fn graphql_override_replaces_the_base_settings() {
+        let mut base = base();
+        base.graphql = Some(
+            serde_json::from_str(r#"{"schema": "type Query { a: String }"}"#).expect("gql JSON"),
+        );
+
+        let cfg = versioning(
+            r#"{"versions": {
+                "v1": {},
+                "v2": {"graphql": {"schema": "type Query { b: String }", "max_query_depth": 3}}
+            }}"#,
+        );
+        cfg.validate(&base).expect("valid");
+        let v1 = cfg.apply(&base, "v1").expect("configured");
+        assert!(v1
+            .graphql
+            .as_ref()
+            .expect("inherited")
+            .schema
+            .contains("a: String"));
+        let v2 = cfg.apply(&base, "v2").expect("configured");
+        let gql = v2.graphql.as_ref().expect("overridden");
+        assert!(gql.schema.contains("b: String"));
+        assert_eq!(gql.max_query_depth, Some(3));
+
+        // A broken override fails validation naming the version.
+        let cfg = versioning(r#"{"versions": {"v2": {"graphql": {"schema": "type Query {"}}}}"#);
         let err = cfg.validate(&base).unwrap_err().to_string();
         assert!(err.contains("version `v2`"), "got: {err}");
     }

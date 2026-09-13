@@ -25,6 +25,7 @@ pub mod cache;
 pub mod chain;
 pub mod context;
 pub mod cors;
+pub mod graphql;
 pub mod ip_filter;
 pub mod jwks;
 pub mod metrics;
@@ -50,6 +51,7 @@ pub use context::{
     AuthBypass, ClientAddr, ConnectionInfo, RequestContext, SessionContext, UpstreamLatency,
 };
 pub use cors::{Cors, CorsLayer};
+pub use graphql::{GraphQl, GraphQlLayer};
 pub use ip_filter::{IpFilter, IpFilterLayer};
 pub use jwks::{JwksFetch, JwksFetchFuture, SharedJwksFetch};
 pub use metrics::{HttpMetrics, MetricsLayer};

@@ -1,0 +1,20 @@
+{
+  "api_id": "countries",
+  "name": "Countries GraphQL (proxy mode)",
+  "listen_path": "/countries/",
+  "target_url": "https://countries.trevorblades.com/graphql",
+  "auth": { "mode": "keyless" },
+  "graphql": {
+    "schema": "type Query { countries: [Country!]! country(code: ID!): Country } type Country { code: ID! name: String! capital: String currency: String phone: String! }",
+    "max_query_depth": 6,
+    "playground": {},
+    "persisted_queries": [
+      {
+        "method": "GET",
+        "path": "/country/{code}",
+        "operation": "query C($code: ID!) { country(code: $code) { name capital } }",
+        "variables": { "code": "$path.code" }
+      }
+    ]
+  }
+}

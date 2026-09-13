@@ -37,6 +37,9 @@ bytes = "1"
 tower = { version = "0.5", features = ["util"] }
 axum = "0.8"
 
+# GraphQL (schema/query parsing and spec validation — ADR-0004)
+apollo-compiler = "1"
+
 # Data / config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

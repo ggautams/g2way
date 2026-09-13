@@ -25,6 +25,7 @@ pub mod api_definition;
 pub mod config;
 pub mod endpoints;
 mod error;
+pub mod graphql;
 pub mod loader;
 pub mod policy;
 pub mod security;
@@ -40,6 +41,7 @@ pub use api_definition::{
 pub use config::{AnalyticsSinkKind, ClientCertMode, GatewayConfig, SpikeGuardConfig, TlsConfig};
 pub use endpoints::{MockResponse, PathRule};
 pub use error::Error;
+pub use graphql::{GraphQlConfig, GraphQlExecutionMode, PersistedQuery, PlaygroundConfig};
 pub use policy::Policy;
 pub use security::CorsConfig;
 pub use session::{BasicAuthData, KeySession};

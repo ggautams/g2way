@@ -67,14 +67,78 @@ pub struct BasicAuthData {
     pub password_hash: String,
 }
 
+/// One GraphQL type and the fields of it a grant refers to.
+///
+/// Used by the allow/block lists of [`ApiAccess`]. A `fields` entry of
+/// `"*"` refers to every field of the type, current and future
+/// (non-recursive — it does not cascade into nested types).
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeFields {
+    /// The GraphQL type name (e.g. `Query`, `User`).
+    pub name: String,
+
+    /// Field names of the type; `"*"` means every field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub fields: Vec<String>,
+}
+
 /// Access granted to a single API.
 ///
-/// Today an entry's presence in [`KeySession::access`] is the whole grant;
-/// per-API rate/quota overrides arrive with policies (milestone M4), which is
-/// why this is a struct rather than a bare set membership.
+/// An entry's presence in [`KeySession::access`] is the base grant; the
+/// fields below add per-key GraphQL restrictions, enforced by the GraphQL
+/// middleware on GraphQL-configured APIs
+/// and ignored everywhere else. An empty `{}` entry — every pre-M9 record —
+/// grants unrestricted access.
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ApiAccess {}
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApiAccess {
+    /// GraphQL field allow list. When non-empty, the key may select **only**
+    /// the listed (type, field) pairs — and the block list is ignored (the
+    /// allow list wins). Empty = no allow-list restriction.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_types: Vec<TypeFields>,
+
+    /// GraphQL field block list: selecting a listed (type, field) pair is
+    /// rejected with `400`. Consulted only while `allowed_types` is empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub restricted_types: Vec<TypeFields>,
+
+    /// Disables GraphQL introspection (`__schema` / `__type`) for this key
+    /// on this API, even when the API itself allows it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disable_introspection: bool,
+
+    /// Per-key GraphQL depth limit override. `Some(n > 0)` replaces the
+    /// API's `graphql.max_query_depth` (even with a larger value);
+    /// `Some(-1)` (or any non-positive value) lifts the limit entirely
+    /// (`-1`); `None` inherits the API's limit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_query_depth: Option<i64>,
+}
+
+impl ApiAccess {
+    fn validate(&self, fail: &impl Fn(&str) -> Error) -> Result<(), Error> {
+        for (list, entries) in [
+            ("allowed_types", &self.allowed_types),
+            ("restricted_types", &self.restricted_types),
+        ] {
+            for entry in entries {
+                if entry.name.trim().is_empty() {
+                    return Err(fail(&format!(
+                        "`access.{list}` entries must have a non-empty type name"
+                    )));
+                }
+                if entry.fields.iter().any(|f| f.trim().is_empty()) {
+                    return Err(fail(&format!(
+                        "`access.{list}` field names must not be empty (use \"*\" for all)"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
 
 /// The state attached to one API key.
 ///
@@ -194,10 +258,11 @@ impl KeySession {
                 return Err(fail("`quota.renewal_rate_secs` must be greater than zero"));
             }
         }
-        for api_id in self.access.keys() {
+        for (api_id, grant) in &self.access {
             if api_id.trim().is_empty() {
                 return Err(fail("`access` keys (api_id) must not be empty"));
             }
+            grant.validate(&fail)?;
         }
         if let Some(basic) = &self.basic_auth {
             if basic.password_hash.trim().is_empty() {
@@ -506,6 +571,63 @@ mod tests {
             ..KeySession::default()
         };
         assert!(session.validate().is_err());
+    }
+
+    #[test]
+    fn graphql_grants_round_trip_and_old_records_still_parse() {
+        // Pre-M9 records carry empty `{}` grants — they must keep parsing
+        // and mean "unrestricted".
+        let session: KeySession =
+            serde_json::from_str(r#"{"access": {"httpbin": {}}}"#).expect("old record parses");
+        let grant = &session.access["httpbin"];
+        assert_eq!(grant, &ApiAccess::default());
+        assert!(!grant.disable_introspection && grant.max_query_depth.is_none());
+        session.validate().expect("valid");
+
+        let session: KeySession = serde_json::from_str(
+            r#"{"access": {"gql": {
+                "allowed_types": [{"name": "Query", "fields": ["*"]}],
+                "restricted_types": [{"name": "User", "fields": ["email"]}],
+                "disable_introspection": true,
+                "max_query_depth": -1
+            }}}"#,
+        )
+        .expect("parses");
+        session.validate().expect("valid");
+        let json = serde_json::to_string(&session).expect("serializes");
+        let back: KeySession = serde_json::from_str(&json).expect("deserializes");
+        assert_eq!(back, session);
+
+        // Default grants stay off the wire (old records keep their shape).
+        let bare = serde_json::to_string(&KeySession {
+            access: BTreeMap::from([("httpbin".to_owned(), ApiAccess::default())]),
+            ..KeySession::default()
+        })
+        .expect("serializes");
+        for field in [
+            "allowed_types",
+            "restricted_types",
+            "disable_introspection",
+            "max_query_depth",
+        ] {
+            assert!(!bare.contains(field), "`{field}` serialized when default");
+        }
+    }
+
+    #[test]
+    fn graphql_grant_entries_are_validated() {
+        let grant = |json: &str| -> KeySession {
+            serde_json::from_str(&format!(r#"{{"access": {{"gql": {json}}}}}"#)).expect("parses")
+        };
+        for (label, json) in [
+            ("empty type name", r#"{"allowed_types": [{"name": " "}]}"#),
+            (
+                "empty field name",
+                r#"{"restricted_types": [{"name": "User", "fields": [""]}]}"#,
+            ),
+        ] {
+            assert!(grant(json).validate().is_err(), "{label} accepted");
+        }
     }
 
     #[test]

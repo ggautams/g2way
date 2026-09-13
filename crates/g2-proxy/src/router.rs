@@ -8,9 +8,9 @@ use g2_core::{ApiDefinition, Error};
 use g2_middleware::SharedJwksFetch;
 use g2_middleware::{
     AnalyticsHandle, AnalyticsLayer, AuthLayer, CacheLayer, ChainBuilder, ChainService, CorsLayer,
-    HeaderTransformLayer, HttpMetrics, IpFilterLayer, MetricsLayer, MockResponseLayer,
-    PathPolicyLayer, RateLimitLayer, RequestContext, RequestSizeLimitLayer, SpikeGuard, StatsLayer,
-    StatsRegistry, TraceLayer, VersionDispatch,
+    GraphQlLayer, HeaderTransformLayer, HttpMetrics, IpFilterLayer, MetricsLayer,
+    MockResponseLayer, PathPolicyLayer, RateLimitLayer, RequestContext, RequestSizeLimitLayer,
+    SpikeGuard, StatsLayer, StatsRegistry, TraceLayer, VersionDispatch,
 };
 use g2_storage::SharedStorage;
 
@@ -62,6 +62,12 @@ fn inner_layers(
     )?;
     let mock = MockResponseLayer::from_config(&def.mock_responses, &def.api_id)?;
     let size_limit = def.max_request_body_bytes.map(RequestSizeLimitLayer::new);
+    let graphql = def
+        .graphql
+        .as_ref()
+        .map(|g| GraphQlLayer::from_config(g, def))
+        .transpose()?
+        .flatten();
     let cache = def
         .cache
         .as_ref()
@@ -71,6 +77,7 @@ fn inner_layers(
         .size_limit(size_limit)
         .auth(auth)
         .rate_limit(rate_limit)
+        .graphql(graphql)
         .transform_headers(transform_headers)
         .mock(mock)
         .cache(cache))

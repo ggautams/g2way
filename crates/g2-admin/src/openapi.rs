@@ -78,11 +78,16 @@ impl Modify for SecurityAddon {
         g2_core::VersioningConfig,
         g2_core::VersionOverrides,
         g2_core::VersionLocation,
+        g2_core::GraphQlConfig,
+        g2_core::GraphQlExecutionMode,
+        g2_core::PlaygroundConfig,
+        g2_core::PersistedQuery,
         g2_core::KeySession,
         g2_core::Policy,
         g2_core::session::RateLimit,
         g2_core::session::Quota,
         g2_core::session::ApiAccess,
+        g2_core::session::TypeFields,
         g2_core::session::BasicAuthData,
     )),
     modifiers(&SecurityAddon),
@@ -143,6 +148,11 @@ mod tests {
             "CacheConfig",
             "VersioningConfig",
             "VersionOverrides",
+            "GraphQlConfig",
+            "GraphQlExecutionMode",
+            "PlaygroundConfig",
+            "PersistedQuery",
+            "TypeFields",
         ] {
             assert!(schemas.contains_key(schema), "schema `{schema}` missing");
         }

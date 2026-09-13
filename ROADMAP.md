@@ -90,6 +90,26 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 - [ ] Plugin system (WASM pre/post hooks — needs an ADR first)
 - [ ] Service discovery; request/response body transforms
 
+## M9 — GraphQL
+
+- [x] GraphQL proxy mode + protections: per-API `graphql` block (SDL schema in the
+      definition), request parse/validation against the schema, depth limits,
+      introspection control, per-key field permissions (`allowed_types`/
+      `restricted_types`) and key-level depth/introspection overrides
+      (ADR-0004, `docs/graphql.md`)
+- [x] GraphQL playground served per API (behind the API's auth chain)
+- [x] Persisted GraphQL-as-REST endpoints (method/path → operation, variable
+      substitution from headers and path params)
+- [ ] Schema sync from upstream introspection (admin-triggered + periodic)
+- [ ] GraphQL subscriptions over WebSocket (blocked on the M8+ WebSocket
+      passthrough box)
+- [ ] Universal Data Graph: gateway-executed stitching of REST/GraphQL upstreams
+      (needs an execution-engine ADR)
+- [ ] Federation: supergraph/subgraph support
+- [ ] GraphQL-aware response caching
+- [ ] Stretch: query complexity/cost limits; automatic persisted
+      queries (APQ)
+
 ---
 
 ## Progress log
@@ -778,3 +798,37 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   multi-cert, no CRL/OCSP (revoke = delete the key), k8s manifests stay
   plaintext (doc has the Secrets walkthrough). Next: rest of M8+ —
   re-prioritize with the user.
+- **2026-08-31 (17)** — M9 GraphQL opened (full box list) and its
+  first slice landed: proxy mode + the whole protection suite (ADR-0004,
+  `docs/graphql.md`, `examples/apis/graphql.json`). Config: `graphql` block on
+  `ApiDefinition` (`schema` SDL required, `introspection_enabled`,
+  `max_query_depth`, `playground.path`, `persisted_queries[]`), per-version
+  overridable; per-key grants landed in the previously-empty `ApiAccess`
+  (`allowed_types`/`restricted_types` with `"*"` + allow-wins,
+  `disable_introspection`, `max_query_depth` where `-1` lifts) — **`ApiAccess`
+  lost `Copy`**, policies inherit for free. Crate: `apollo-compiler` 1.x
+  (pure Rust; schema compiled at route-build, per-request
+  `ExecutableDocument::parse_and_validate`, typed selection sets carry the
+  parent type for `field: X is restricted on type: Y`). New `GraphQlLayer`
+  (chain slot 12, between rate-limit and header transforms; the ordering doc
+  in `chain.rs` is renumbered) also serves the GraphiQL playground
+  (pinned jsdelivr assets, behind auth) and rewrites persisted
+  GraphQL-as-REST endpoints (`{param}` path regexes + pre-parsed operations
+  precompiled; `$path.`/`$header.` variable substitution). **First layer to
+  buffer a request body**: bounded `Limited` collect (cap =
+  `max_request_body_bytes` else 1 MiB), exact bytes re-emitted; the
+  size-limit layer's `RequestTooLarge` now surfaces in this collect and is
+  mapped to 413 here; forwarder retry gate deliberately unchanged (ADR-0004).
+  Error shapes are mixed by design (403 `{"error":…}` for depth and
+  introspection, 400 `{"errors":[…]}` for validation/field perms);
+  pure-introspection documents bypass depth checks. **Surprise:** `cargo test -p g2-middleware`
+  alone never compiled (pre-existing: `tokio/test-util` for cache.rs's
+  paused-clock test only arrives via workspace feature unification) — use
+  `cargo test --workspace`, which is what `make check` runs. Tests: ~30 new
+  (g2-core config/session/versioning, layer unit tests incl. size-limit
+  interplay + chain-position, 7-case `graphql_e2e.rs` with a fake GraphQL
+  upstream; openapi registration test extended). Deliberately not done
+  (unchecked M9 boxes): introspection schema sync, subscriptions (needs the
+  M8+ WebSocket box first), UDG/federation, GraphQL-aware caching, APQ,
+  batching (a JSON-array envelope is rejected). Next: the remaining M8+/M9
+  boxes — re-prioritize with the user.
