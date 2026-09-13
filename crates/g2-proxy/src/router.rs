@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{
-    AnalyticsHandle, AnalyticsLayer, AuthLayer, ChainBuilder, ChainService, HttpMetrics,
-    MetricsLayer, RateLimitLayer, RequestContext, SpikeGuard, StatsLayer, StatsRegistry,
-    TraceLayer,
+    AnalyticsHandle, AnalyticsLayer, AuthLayer, ChainBuilder, ChainService, HeaderTransformLayer,
+    HttpMetrics, MetricsLayer, RateLimitLayer, RequestContext, SpikeGuard, StatsLayer,
+    StatsRegistry, TraceLayer,
 };
 use g2_storage::SharedStorage;
 
@@ -64,6 +64,11 @@ impl Route {
                 spike_guard.map(Arc::clone),
             )
         });
+        let transform_headers = def
+            .transform_headers
+            .as_ref()
+            .map(|t| HeaderTransformLayer::from_config(t, &def.api_id))
+            .transpose()?;
         // Span names follow the OTel server-span convention (the route, not
         // the full path): the listen path, `/` for a catch-all route.
         let span_name = if target.listen_prefix.is_empty() {
@@ -78,6 +83,7 @@ impl Route {
             .analytics(analytics.map(|h| AnalyticsLayer::new(h.clone(), ctx.clone())))
             .auth(auth)
             .rate_limit(rate_limit)
+            .transform_headers(transform_headers)
             .build(Forward::new(forwarder, Arc::clone(&target)));
         Ok(Self {
             listen_prefix: target.listen_prefix.clone(),

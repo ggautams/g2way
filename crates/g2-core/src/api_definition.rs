@@ -3,6 +3,7 @@
 use http::Uri;
 use serde::{Deserialize, Serialize};
 
+use crate::transform::HeaderTransforms;
 use crate::Error;
 
 /// The organization id used while g2way runs in single-organization mode.
@@ -310,6 +311,11 @@ pub struct ApiDefinition {
     /// `Authorization` header; keyless must be requested explicitly.
     #[serde(default)]
     pub auth: AuthConfig,
+
+    /// Optional header add/remove transforms applied to this API's
+    /// upstream-bound requests and client-bound responses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform_headers: Option<HeaderTransforms>,
 }
 
 /// Storage key holding one API definition: `g2:{org_id}:apidef:{api_id}`.
@@ -380,6 +386,9 @@ impl ApiDefinition {
             return Err(fail("`target_url` must include a host".into()));
         }
         self.auth.validate(&self.api_id)?;
+        if let Some(transforms) = &self.transform_headers {
+            transforms.validate(&self.api_id)?;
+        }
         Ok(())
     }
 

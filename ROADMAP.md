@@ -69,7 +69,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 
 ## M6 — Traffic middleware
 
-- [ ] Header transforms (add/remove, request and response)
+- [x] Header transforms (add/remove, request and response)
 - [ ] URL rewrite (regex) and method transform
 - [ ] Mock responses; allow/block/ignore path lists
 - [ ] CORS, IP allow/deny lists, request size limits
@@ -491,3 +491,17 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   all three signals (Traces/Metrics/Logs) confirmed in collector logs
   manually. Next: M6 traffic middleware, first box: header transforms
   (add/remove, request and response).
+- **2026-08-31 (5)** — M6 header transforms landed. `ApiDefinition` grew
+  `transform_headers: Option<HeaderTransforms>` (new `g2-core::transform`
+  module: `{request, response}` × `{add: map, remove: list}`; remove runs
+  before add, add **replaces** existing values; validation rejects bad
+  names/values and hop-by-hop headers in `add` — removing them stays
+  allowed). Runtime is `HeaderTransformLayer` (g2-middleware): string
+  config precompiled to `HeaderName`/`HeaderValue` at route-build time
+  (hot path only does Bytes-cheap remove/insert). Chain position: **below
+  auth/rate-limit** (gateway 401/403/429 rejections untransformed by
+  design; forwarder 502/504 do get response transforms) and **above**
+  `ApiIdHeaderLayer`, so a transform can never spoof `x-g2-api-id`
+  (tested). New schemas registered in the OpenAPI doc. All unit-level
+  (chain + layer tests); no e2e/smoke change. Next: M6 URL rewrite
+  (regex) and method transform.

@@ -27,6 +27,7 @@ mod error;
 pub mod loader;
 pub mod policy;
 pub mod session;
+pub mod transform;
 
 pub use analytics::AnalyticsRecord;
 pub use api_definition::{ApiDefinition, AuthConfig, JwtSigningMethod, DEFAULT_ORG_ID};
@@ -34,3 +35,4 @@ pub use config::{AnalyticsSinkKind, GatewayConfig, SpikeGuardConfig};
 pub use error::Error;
 pub use policy::Policy;
 pub use session::{BasicAuthData, KeySession};
+pub use transform::{HeaderTransform, HeaderTransforms};

@@ -15,6 +15,7 @@ use crate::rate_limit::RateLimitLayer;
 use crate::set_context::SetContextLayer;
 use crate::stats::StatsLayer;
 use crate::trace::TraceLayer;
+use crate::transform_headers::HeaderTransformLayer;
 use crate::{ChainService, ProxyBody};
 
 /// Builds the middleware chain for one API.
@@ -36,9 +37,13 @@ use crate::{ChainService, ProxyBody};
 /// 6. [`AuthLayer`] — token auth (absent for keyless APIs).
 /// 7. [`RateLimitLayer`] — session rate/quota enforcement (absent for
 ///    keyless APIs, which have no session to read limits from).
-/// 8. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+/// 8. [`HeaderTransformLayer`] — per-API header add/remove on requests and
+///    responses (absent when unconfigured). Below auth/rate-limit so
+///    gateway rejections are not transformed; above [`ApiIdHeaderLayer`] so
+///    a transform can never spoof the anti-spoof api-id header.
+/// 9. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
 ///
-/// Transform layers slot in here as later M6 tasks land.
+/// Further transform layers slot in here as later M6 tasks land.
 #[derive(Debug, Clone)]
 pub struct ChainBuilder {
     ctx: RequestContext,
@@ -48,6 +53,7 @@ pub struct ChainBuilder {
     trace: Option<TraceLayer>,
     metrics: Option<MetricsLayer>,
     analytics: Option<AnalyticsLayer>,
+    transform_headers: Option<HeaderTransformLayer>,
 }
 
 impl ChainBuilder {
@@ -62,6 +68,7 @@ impl ChainBuilder {
             trace: None,
             metrics: None,
             analytics: None,
+            transform_headers: None,
         }
     }
 
@@ -108,6 +115,13 @@ impl ChainBuilder {
         self
     }
 
+    /// Adds header add/remove transforms (`None` is a no-op).
+    #[must_use]
+    pub fn transform_headers(mut self, transform_headers: Option<HeaderTransformLayer>) -> Self {
+        self.transform_headers = transform_headers;
+        self
+    }
+
     /// Wraps `forward` — the innermost service that actually proxies to the
     /// upstream — with this chain's layers, returning the boxed, cloneable
     /// service stored on a route.
@@ -128,6 +142,7 @@ impl ChainBuilder {
             .layer(SetContextLayer::new(self.ctx))
             .option_layer(self.auth)
             .option_layer(self.rate_limit)
+            .option_layer(self.transform_headers)
             .layer(ApiIdHeaderLayer::new())
             .service(forward);
         BoxCloneSyncService::new(svc)
@@ -190,6 +205,40 @@ mod tests {
                 .expect("org id")
                 .as_bytes(),
             b"acme"
+        );
+    }
+
+    #[tokio::test]
+    async fn transform_layer_applies_but_cannot_spoof_api_id() {
+        let transforms: g2_core::HeaderTransforms = serde_json::from_str(
+            r#"{
+                "request": {"add": {"X-G2-Api-Id": "spoofed", "X-Env": "prod"}},
+                "response": {"add": {"X-Gateway": "g2way"}}
+            }"#,
+        )
+        .expect("valid transform JSON");
+        let chain = ChainBuilder::new(RequestContext::new("users-api", "acme"))
+            .transform_headers(Some(
+                HeaderTransformLayer::from_config(&transforms, "users-api").expect("compiles"),
+            ))
+            .build(tower::service_fn(echo_forward));
+
+        let resp = chain
+            .oneshot(Request::new(body("")))
+            .await
+            .expect("infallible");
+        // The anti-spoof stamp runs inside the transform layer and wins.
+        assert_eq!(
+            resp.headers()
+                .get("x-echo-api-id")
+                .expect("api id")
+                .as_bytes(),
+            b"users-api"
+        );
+        // Response transform applied on the way out.
+        assert_eq!(
+            resp.headers().get("x-gateway").expect("added").as_bytes(),
+            b"g2way"
         );
     }
 
