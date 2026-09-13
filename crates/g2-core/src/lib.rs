@@ -35,4 +35,4 @@ pub use config::{AnalyticsSinkKind, GatewayConfig, SpikeGuardConfig};
 pub use error::Error;
 pub use policy::Policy;
 pub use session::{BasicAuthData, KeySession};
-pub use transform::{HeaderTransform, HeaderTransforms};
+pub use transform::{HeaderTransform, HeaderTransforms, UrlRewriteRule};

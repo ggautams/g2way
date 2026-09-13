@@ -70,7 +70,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 ## M6 — Traffic middleware
 
 - [x] Header transforms (add/remove, request and response)
-- [ ] URL rewrite (regex) and method transform
+- [x] URL rewrite (regex) and method transform
 - [ ] Mock responses; allow/block/ignore path lists
 - [ ] CORS, IP allow/deny lists, request size limits
 - [ ] API versioning (header/param selection, per-version overrides)
@@ -505,3 +505,23 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   (tested). New schemas registered in the OpenAPI doc. All unit-level
   (chain + layer tests); no e2e/smoke change. Next: M6 URL rewrite
   (regex) and method transform.
+- **2026-08-31 (6)** — M6 URL rewrite + method transform landed. Config in
+  `g2-core::transform`: `ApiDefinition.url_rewrites: Vec<UrlRewriteRule>`
+  (`{pattern, rewrite}`, first match wins) and `transform_method:
+  Option<String>` (standard methods minus CONNECT, case-insensitive).
+  **Not a tower layer** — deliberately implemented in the forwarder
+  (`g2-proxy::rewrite`, which already owns all upstream-URL computation):
+  a layer above the forwarder would fight the listen-path strip that
+  happens inside it. Semantics: pattern is regex-searched (unanchored)
+  against the **full client path** (listen path included);
+  the expansion (`$1`/`${name}` via `Captures::expand`) replaces the
+  strip step and is joined onto the target base path like a stripped
+  tail; it may carry its own query, which precedes the client's
+  (`?rw&client`). Regexes compile once at route build
+  (`UpstreamTarget::build` — no route-table signature change), so the
+  hot path only runs prebuilt automata (regex crate = linear-time, no
+  ReDoS). Method override swaps the verb at forward time only: client-
+  facing telemetry/analytics keep reporting the original method, body
+  forwarded unchanged. New workspace dep `regex` (g2-core validation +
+  g2-proxy). e2e test drives both through a real gateway. Next: M6 mock
+  responses; allow/block/ignore path lists.

@@ -16,7 +16,7 @@ use std::time::Duration;
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{ClientAddr, ProxyBody};
 use http::uri::{Authority, Scheme, Uri};
-use http::{Request, Response, StatusCode, Version};
+use http::{Method, Request, Response, StatusCode, Version};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -45,6 +45,10 @@ pub struct UpstreamTarget {
     pub preserve_host_header: bool,
     /// Per-API upstream timeout.
     pub timeout: Duration,
+    /// URL rewrite rules with precompiled patterns, tried in order.
+    pub(crate) rewrites: Vec<rewrite::CompiledRewrite>,
+    /// Method override applied to the upstream-bound request.
+    pub(crate) method_override: Option<Method>,
 }
 
 impl UpstreamTarget {
@@ -54,6 +58,23 @@ impl UpstreamTarget {
         let target = def.target_uri();
         let scheme = target.scheme().expect("validated scheme").clone();
         let authority = target.authority().expect("validated authority").clone();
+        let rewrites = def
+            .url_rewrites
+            .iter()
+            .map(|rule| rewrite::CompiledRewrite::compile(rule, &def.api_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        let method_override = def
+            .transform_method
+            .as_deref()
+            .map(|m| {
+                Method::from_bytes(m.to_ascii_uppercase().as_bytes()).map_err(|_| {
+                    Error::InvalidApiDefinition {
+                        api: def.api_id.clone(),
+                        reason: format!("`transform_method` is not a valid method: `{m}`"),
+                    }
+                })
+            })
+            .transpose()?;
         Ok(Self {
             api_id: def.api_id.clone(),
             listen_prefix: def.listen_path.trim_end_matches('/').to_owned(),
@@ -63,6 +84,8 @@ impl UpstreamTarget {
             strip_listen_path: def.strip_listen_path,
             preserve_host_header: def.preserve_host_header,
             timeout: Duration::from_millis(def.upstream_timeout_ms),
+            rewrites,
+            method_override,
         })
     }
 }
@@ -163,6 +186,9 @@ async fn forward(
         }
     };
     parts.uri = upstream_uri;
+    if let Some(method) = &target.method_override {
+        parts.method = method.clone();
+    }
     // The upstream connection is negotiated by the client independently
     // of the client-facing protocol version.
     parts.version = Version::HTTP_11;

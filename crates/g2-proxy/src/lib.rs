@@ -12,7 +12,8 @@
 //!    `g2-middleware`, composed once at table-build time (never per request);
 //!    the gateway clones the boxed chain and drives it with `oneshot`.
 //! 3. **Forwarding** — the chain's innermost service (the `forward` module)
-//!    strips the listen path, joins the upstream base path, removes
+//!    maps the path (regex URL rewrites first, else listen-path strip plus
+//!    upstream base-path join), applies any method transform, removes
 //!    hop-by-hop headers, adds `X-Forwarded-*`, and streams the request to
 //!    the upstream through a shared pooled hyper client ([`Forwarder`]),
 //!    enforcing the per-API upstream timeout.

@@ -68,6 +68,7 @@ impl Modify for SecurityAddon {
         g2_core::JwtSigningMethod,
         g2_core::HeaderTransforms,
         g2_core::HeaderTransform,
+        g2_core::UrlRewriteRule,
         g2_core::KeySession,
         g2_core::Policy,
         g2_core::session::RateLimit,

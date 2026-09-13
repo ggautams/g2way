@@ -146,6 +146,28 @@ async fn proxies_post_bodies_end_to_end() {
 }
 
 #[tokio::test]
+async fn url_rewrite_and_method_transform_reach_the_upstream() {
+    let upstream = spawn_echo_upstream().await;
+    let mut def = api("/svc/", &format!("http://{upstream}"));
+    def.url_rewrites = vec![g2_core::UrlRewriteRule {
+        pattern: r"^/svc/widgets/(\d+)$".into(),
+        rewrite: "/rewritten/$1".into(),
+    }];
+    def.transform_method = Some("POST".into());
+    let (gw, _stop) = spawn_gateway(vec![def]).await;
+
+    // Matching request: rewritten path, transformed method, query kept.
+    let (status, body) = http_get(&format!("http://{gw}/svc/widgets/42?limit=5")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "POST /rewritten/42?limit=5 len=0");
+
+    // Non-matching path: normal listen-path strip, method still transformed.
+    let (status, body) = http_get(&format!("http://{gw}/svc/other")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "POST /other len=0");
+}
+
+#[tokio::test]
 async fn serves_health_and_404_end_to_end() {
     let (gw, _stop) = spawn_gateway(vec![]).await;
 

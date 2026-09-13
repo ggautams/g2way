@@ -1,11 +1,48 @@
-//! Pure request-rewriting helpers: path mapping, hop-by-hop header removal,
-//! and `X-Forwarded-*` header injection.
+//! Pure request-rewriting helpers: path mapping (regex URL rewrites and
+//! listen-path strip/join), hop-by-hop header removal, and `X-Forwarded-*`
+//! header injection.
 
 use std::net::IpAddr;
 
+use g2_core::transform::UrlRewriteRule;
+use g2_core::Error;
 use http::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST};
+use regex::Regex;
 
 use crate::forward::UpstreamTarget;
+
+/// One URL rewrite rule with its pattern compiled at route-build time
+/// (ADR-0001 hot-path rule: no per-request regex parsing).
+#[derive(Debug, Clone)]
+pub(crate) struct CompiledRewrite {
+    pattern: Regex,
+    rewrite: String,
+}
+
+impl CompiledRewrite {
+    /// Compiles `rule`'s pattern; `api_id` names the API in errors.
+    ///
+    /// Definitions are validated before routes are built, so a failure here
+    /// indicates a validation gap — surfaced loudly rather than panicking.
+    pub(crate) fn compile(rule: &UrlRewriteRule, api_id: &str) -> Result<Self, Error> {
+        let pattern = Regex::new(&rule.pattern).map_err(|err| Error::InvalidApiDefinition {
+            api: api_id.to_owned(),
+            reason: format!("invalid `url_rewrites` pattern `{}`: {err}", rule.pattern),
+        })?;
+        Ok(Self {
+            pattern,
+            rewrite: rule.rewrite.clone(),
+        })
+    }
+
+    /// Expands the rewrite template if `path` matches, else `None`.
+    fn apply(&self, path: &str) -> Option<String> {
+        let caps = self.pattern.captures(path)?;
+        let mut expanded = String::with_capacity(self.rewrite.len());
+        caps.expand(&self.rewrite, &mut expanded);
+        Some(expanded)
+    }
+}
 
 /// Headers that are connection-local per RFC 9110 §7.6.1 and must not be
 /// forwarded by an intermediary.
@@ -22,27 +59,38 @@ const HOP_BY_HOP: [&str; 8] = [
 
 /// Computes the upstream `path?query` for a request matched to `target`.
 ///
-/// With `strip_listen_path` (the default) the listen-path prefix is removed
-/// and the remainder is appended to the upstream base path; otherwise the
-/// full original path is appended. The query string is always forwarded
-/// untouched.
+/// The target's URL rewrite rules are tried first, in order, against the
+/// full client path; the first match's expansion replaces the listen-path
+/// strip as the upstream tail (any query it carries comes before the
+/// client's). Otherwise, with `strip_listen_path` (the default) the
+/// listen-path prefix is removed and the remainder is appended to the
+/// upstream base path; without it the full original path is appended. The
+/// client's query string is always forwarded untouched.
 pub(crate) fn upstream_path_and_query(
     target: &UpstreamTarget,
     req_path: &str,
     query: Option<&str>,
 ) -> String {
-    let tail = if target.strip_listen_path {
-        // `Route::matches()` guaranteed the prefix is present.
-        req_path
-            .strip_prefix(target.listen_prefix.as_str())
-            .unwrap_or(req_path)
-    } else {
-        req_path
+    let query = query.filter(|q| !q.is_empty());
+    let rewritten = target.rewrites.iter().find_map(|r| r.apply(req_path));
+    let (tail, rewrite_query) = match &rewritten {
+        Some(expanded) => match expanded.split_once('?') {
+            Some((path, q)) => (path, (!q.is_empty()).then_some(q)),
+            None => (expanded.as_str(), None),
+        },
+        None if target.strip_listen_path => (
+            // `Route::matches()` guaranteed the prefix is present.
+            req_path
+                .strip_prefix(target.listen_prefix.as_str())
+                .unwrap_or(req_path),
+            None,
+        ),
+        None => (req_path, None),
     };
 
     let mut path = join_paths(&target.base_path, tail);
-    if let Some(q) = query {
-        path.push('?');
+    for (i, q) in rewrite_query.iter().chain(query.iter()).enumerate() {
+        path.push(if i == 0 { '?' } else { '&' });
         path.push_str(q);
     }
     path
@@ -195,6 +243,68 @@ mod tests {
             "/any/thing"
         );
         assert_eq!(upstream_path_and_query(&r, "/", None), "/");
+    }
+
+    fn route_with_rewrites(target_url: &str, rules: &str) -> UpstreamTarget {
+        let def: ApiDefinition = serde_json::from_str(&format!(
+            r#"{{"api_id":"t","name":"t","listen_path":"/users/","target_url":"{target_url}",
+                 "url_rewrites":{rules}}}"#
+        ))
+        .expect("def");
+        UpstreamTarget::build(&def).expect("target")
+    }
+
+    #[test]
+    fn url_rewrite_replaces_strip_and_joins_base_path() {
+        let r = route_with_rewrites(
+            "http://u.internal/api/v1",
+            r#"[{"pattern": "^/users/(\\d+)/profile$", "rewrite": "/profiles/$1"}]"#,
+        );
+        assert_eq!(
+            upstream_path_and_query(&r, "/users/42/profile", None),
+            "/api/v1/profiles/42"
+        );
+        // Non-matching paths keep the normal strip/join.
+        assert_eq!(upstream_path_and_query(&r, "/users/42", None), "/api/v1/42");
+    }
+
+    #[test]
+    fn first_matching_rewrite_rule_wins() {
+        let r = route_with_rewrites(
+            "http://u.internal",
+            r#"[{"pattern": "^/users/me$", "rewrite": "/self"},
+                {"pattern": "^/users/(\\w+)$", "rewrite": "/accounts/$1"}]"#,
+        );
+        assert_eq!(upstream_path_and_query(&r, "/users/me", None), "/self");
+        assert_eq!(
+            upstream_path_and_query(&r, "/users/bob", None),
+            "/accounts/bob"
+        );
+    }
+
+    #[test]
+    fn rewrite_query_precedes_the_clients() {
+        let r = route_with_rewrites(
+            "http://u.internal",
+            r#"[{"pattern": "^/users/legacy$", "rewrite": "/v2/users?compat=1"}]"#,
+        );
+        assert_eq!(
+            upstream_path_and_query(&r, "/users/legacy", Some("limit=5")),
+            "/v2/users?compat=1&limit=5"
+        );
+        assert_eq!(
+            upstream_path_and_query(&r, "/users/legacy", None),
+            "/v2/users?compat=1"
+        );
+    }
+
+    #[test]
+    fn rewrite_with_named_groups_expands() {
+        let r = route_with_rewrites(
+            "http://u.internal",
+            r#"[{"pattern": "^/users/(?<id>\\d+)$", "rewrite": "/people/${id}"}]"#,
+        );
+        assert_eq!(upstream_path_and_query(&r, "/users/7", None), "/people/7");
     }
 
     #[test]

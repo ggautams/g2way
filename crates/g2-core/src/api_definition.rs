@@ -3,7 +3,7 @@
 use http::Uri;
 use serde::{Deserialize, Serialize};
 
-use crate::transform::HeaderTransforms;
+use crate::transform::{self, HeaderTransforms, UrlRewriteRule};
 use crate::Error;
 
 /// The organization id used while g2way runs in single-organization mode.
@@ -316,6 +316,20 @@ pub struct ApiDefinition {
     /// upstream-bound requests and client-bound responses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform_headers: Option<HeaderTransforms>,
+
+    /// Regex URL rewrite rules, tried in order against the full client
+    /// request path; the first match decides the upstream path (see
+    /// [`UrlRewriteRule`]). Requests matching no rule follow the normal
+    /// listen-path strip/join.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub url_rewrites: Vec<UrlRewriteRule>,
+
+    /// Optional HTTP method override for upstream-bound requests (e.g.
+    /// `"POST"`, case-insensitive; `CONNECT` is not allowed). The body and
+    /// headers are forwarded unchanged, and gateway responses still describe
+    /// the client's original method.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform_method: Option<String>,
 }
 
 /// Storage key holding one API definition: `g2:{org_id}:apidef:{api_id}`.
@@ -388,6 +402,12 @@ impl ApiDefinition {
         self.auth.validate(&self.api_id)?;
         if let Some(transforms) = &self.transform_headers {
             transforms.validate(&self.api_id)?;
+        }
+        for (index, rule) in self.url_rewrites.iter().enumerate() {
+            rule.validate(&self.api_id, index)?;
+        }
+        if let Some(method) = &self.transform_method {
+            transform::validate_transform_method(method, &self.api_id)?;
         }
         Ok(())
     }
@@ -653,6 +673,42 @@ mod tests {
             def.auth = AuthConfig::BasicAuth { realm: bad.into() };
             assert!(def.validate().is_err(), "expected realm `{bad:?}` rejected");
         }
+    }
+
+    #[test]
+    fn url_rewrites_and_transform_method_parse_and_validate() {
+        let json = r#"{
+            "api_id": "u",
+            "name": "u",
+            "listen_path": "/u/",
+            "target_url": "http://u.internal",
+            "url_rewrites": [
+                {"pattern": "^/u/(\\d+)$", "rewrite": "/people/$1"}
+            ],
+            "transform_method": "POST"
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        assert_eq!(def.url_rewrites.len(), 1);
+        assert_eq!(def.transform_method.as_deref(), Some("POST"));
+
+        // Optionals stay off the wire when unset (old records unaffected).
+        let bare = serde_json::to_string(&parse(minimal_json())).expect("serializes");
+        assert!(!bare.contains("url_rewrites") && !bare.contains("transform_method"));
+    }
+
+    #[test]
+    fn invalid_url_rewrites_and_methods_are_rejected() {
+        let mut def = parse(minimal_json());
+        def.url_rewrites = vec![super::UrlRewriteRule {
+            pattern: "(".into(),
+            rewrite: "/x".into(),
+        }];
+        assert!(def.validate().is_err());
+
+        let mut def = parse(minimal_json());
+        def.transform_method = Some("CONNECT".into());
+        assert!(def.validate().is_err());
     }
 
     #[test]
