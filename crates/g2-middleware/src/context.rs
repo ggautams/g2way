@@ -71,6 +71,16 @@ impl SessionContext {
     }
 }
 
+/// Marker: this request's path matched an `ignore_auth_paths` rule.
+///
+/// Inserted into request extensions by the path-policy layer (which runs
+/// above auth); the auth layer sees it and forwards the request without
+/// authenticating — so no [`SessionContext`] is stamped, and the rate-limit
+/// layer (which needs a session) passes it through too. Never derived from
+/// anything a client sends: extensions only ever come from gateway layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthBypass;
+
 /// Time one request spent on its upstream round trip.
 ///
 /// Inserted into **response** extensions by the forwarding service (on

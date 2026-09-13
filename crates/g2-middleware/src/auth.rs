@@ -279,6 +279,17 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
+        // An `ignore_auth_paths` match (stamped by the path-policy layer
+        // above) forwards without authenticating: no SessionContext, so the
+        // rate-limit layer below passes the request through untouched too.
+        if req
+            .extensions()
+            .get::<crate::context::AuthBypass>()
+            .is_some()
+        {
+            return Box::pin(async move { inner.call(req).await });
+        }
+
         Box::pin(async move {
             match authenticate(&state, &req).await {
                 Ok(session_ctx) => {

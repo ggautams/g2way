@@ -71,7 +71,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 
 - [x] Header transforms (add/remove, request and response)
 - [x] URL rewrite (regex) and method transform
-- [ ] Mock responses; allow/block/ignore path lists
+- [x] Mock responses; allow/block/ignore path lists
 - [ ] CORS, IP allow/deny lists, request size limits
 - [ ] API versioning (header/param selection, per-version overrides)
 
@@ -525,3 +525,24 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   forwarded unchanged. New workspace dep `regex` (g2-core validation +
   g2-proxy). e2e test drives both through a real gateway. Next: M6 mock
   responses; allow/block/ignore path lists.
+- **2026-08-31 (7)** — M6 path lists + mock responses landed. Config in new
+  `g2-core::endpoints`: `ApiDefinition.{allow,block,ignore_auth}_paths:
+  Vec<PathRule{pattern, methods}>` and `mock_responses: Vec<MockResponse
+  {pattern, methods, status=200, body, headers}>` — patterns regex-searched
+  against the full client path like `url_rewrites`; empty `methods` = all;
+  mock headers reject hop-by-hop, no content-type implied. Runtime is two
+  layers: `PathPolicyLayer` **above auth** (block → 403; non-empty allow
+  list → 403 for non-matches, one shared no-oracle message; ignore match
+  stamps a new `AuthBypass` request extension that auth honors — no session,
+  so rate limiting skips too) and `MockResponseLayer` **below
+  auth/rate-limit/header-transforms** (protected API ⇒ protected mocks,
+  consuming rate; mock responses get response transforms; first match wins;
+  precompiled regex/StatusCode/HeaderValue/Bytes). **Deliberate deviation
+  from the obvious order:** block beats ignore — a blocked
+  path stays blocked even if also ignored/allowed, and ignored paths must
+  still pass the allow list (ignore = skip auth only, not access control).
+  Both layers `from_config → Ok(None)` when unconfigured (chain unchanged
+  for existing APIs). New OpenAPI schemas registered + asserted; e2e test
+  drives ignored-mock/blocked/still-authed paths through a real gateway.
+  g2-middleware gained the `regex` workspace dep. Next: M6 CORS, IP
+  allow/deny lists, request size limits.

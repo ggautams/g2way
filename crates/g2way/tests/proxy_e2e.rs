@@ -168,6 +168,49 @@ async fn url_rewrite_and_method_transform_reach_the_upstream() {
 }
 
 #[tokio::test]
+async fn path_lists_and_mock_responses_end_to_end() {
+    let upstream = spawn_echo_upstream().await;
+
+    // A protected API (default token auth, empty key store) where one path
+    // is ignored (public) and mocked, and one path is blocked outright.
+    let mut def = serde_json::from_str::<ApiDefinition>(&format!(
+        r#"{{"api_id":"pl","name":"pl","listen_path":"/pl/","target_url":"http://{upstream}"}}"#
+    ))
+    .expect("definition");
+    def.block_paths = vec![g2_core::PathRule {
+        pattern: "^/pl/internal/".into(),
+        methods: vec![],
+    }];
+    def.ignore_auth_paths = vec![g2_core::PathRule {
+        pattern: "^/pl/status$".into(),
+        methods: vec![],
+    }];
+    def.mock_responses = vec![g2_core::MockResponse {
+        pattern: "^/pl/status$".into(),
+        methods: vec!["GET".into()],
+        status: 200,
+        body: r#"{"status":"up"}"#.into(),
+        headers: [("Content-Type".to_owned(), "application/json".to_owned())].into(),
+    }];
+    def.validate().expect("valid definition");
+    let (gw, _stop) = spawn_gateway(vec![def]).await;
+
+    // Ignored + mocked path: answered by the gateway, no credentials needed.
+    let (status, body) = http_get(&format!("http://{gw}/pl/status")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, r#"{"status":"up"}"#);
+
+    // Blocked path: 403 before auth (not 401).
+    let (status, body) = http_get(&format!("http://{gw}/pl/internal/x")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("forbidden"), "body: {body}");
+
+    // Every other path still requires credentials.
+    let (status, _) = http_get(&format!("http://{gw}/pl/widgets")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn serves_health_and_404_end_to_end() {
     let (gw, _stop) = spawn_gateway(vec![]).await;
 

@@ -11,6 +11,8 @@ use crate::api_id_header::ApiIdHeaderLayer;
 use crate::auth::AuthLayer;
 use crate::context::RequestContext;
 use crate::metrics::MetricsLayer;
+use crate::mock::MockResponseLayer;
+use crate::path_policy::PathPolicyLayer;
 use crate::rate_limit::RateLimitLayer;
 use crate::set_context::SetContextLayer;
 use crate::stats::StatsLayer;
@@ -34,14 +36,21 @@ use crate::{ChainService, ProxyBody};
 /// 4. [`AnalyticsLayer`] — per-request analytics records (above auth for
 ///    the same reason; absent when no analytics sink is configured).
 /// 5. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
-/// 6. [`AuthLayer`] — token auth (absent for keyless APIs).
-/// 7. [`RateLimitLayer`] — session rate/quota enforcement (absent for
+/// 6. [`PathPolicyLayer`] — allow/block/ignore path lists (absent when
+///    unconfigured). Above auth so blocked paths are rejected before any
+///    credential work and ignored paths can tell auth to stand down.
+/// 7. [`AuthLayer`] — token auth (absent for keyless APIs).
+/// 8. [`RateLimitLayer`] — session rate/quota enforcement (absent for
 ///    keyless APIs, which have no session to read limits from).
-/// 8. [`HeaderTransformLayer`] — per-API header add/remove on requests and
+/// 9. [`HeaderTransformLayer`] — per-API header add/remove on requests and
 ///    responses (absent when unconfigured). Below auth/rate-limit so
 ///    gateway rejections are not transformed; above [`ApiIdHeaderLayer`] so
 ///    a transform can never spoof the anti-spoof api-id header.
-/// 9. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+/// 10. [`MockResponseLayer`] — gateway-answered mock responses (absent when
+///     unconfigured). Below auth/rate-limit (mocks on a protected API stay
+///     protected) and below the header transforms, so mock responses get
+///     the API's response transforms like any upstream response.
+/// 11. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
 ///
 /// Further transform layers slot in here as later M6 tasks land.
 #[derive(Debug, Clone)]
@@ -53,7 +62,9 @@ pub struct ChainBuilder {
     trace: Option<TraceLayer>,
     metrics: Option<MetricsLayer>,
     analytics: Option<AnalyticsLayer>,
+    path_policy: Option<PathPolicyLayer>,
     transform_headers: Option<HeaderTransformLayer>,
+    mock: Option<MockResponseLayer>,
 }
 
 impl ChainBuilder {
@@ -68,7 +79,9 @@ impl ChainBuilder {
             trace: None,
             metrics: None,
             analytics: None,
+            path_policy: None,
             transform_headers: None,
+            mock: None,
         }
     }
 
@@ -115,10 +128,24 @@ impl ChainBuilder {
         self
     }
 
+    /// Adds allow/block/ignore path-list enforcement (`None` is a no-op).
+    #[must_use]
+    pub fn path_policy(mut self, path_policy: Option<PathPolicyLayer>) -> Self {
+        self.path_policy = path_policy;
+        self
+    }
+
     /// Adds header add/remove transforms (`None` is a no-op).
     #[must_use]
     pub fn transform_headers(mut self, transform_headers: Option<HeaderTransformLayer>) -> Self {
         self.transform_headers = transform_headers;
+        self
+    }
+
+    /// Adds gateway-answered mock responses (`None` is a no-op).
+    #[must_use]
+    pub fn mock(mut self, mock: Option<MockResponseLayer>) -> Self {
+        self.mock = mock;
         self
     }
 
@@ -140,9 +167,11 @@ impl ChainBuilder {
             .option_layer(self.stats)
             .option_layer(self.analytics)
             .layer(SetContextLayer::new(self.ctx))
+            .option_layer(self.path_policy)
             .option_layer(self.auth)
             .option_layer(self.rate_limit)
             .option_layer(self.transform_headers)
+            .option_layer(self.mock)
             .layer(ApiIdHeaderLayer::new())
             .service(forward);
         BoxCloneSyncService::new(svc)
@@ -240,6 +269,136 @@ mod tests {
             resp.headers().get("x-gateway").expect("added").as_bytes(),
             b"g2way"
         );
+    }
+
+    #[tokio::test]
+    async fn path_policy_auth_and_mock_interact_correctly() {
+        use std::sync::Arc;
+
+        use g2_core::{AuthConfig, MockResponse, PathRule};
+        use g2_storage::SharedStorage;
+
+        use crate::mock::MockResponseLayer;
+        use crate::path_policy::PathPolicyLayer;
+
+        let rule = |pattern: &str| PathRule {
+            pattern: pattern.into(),
+            methods: vec![],
+        };
+        // Token auth with an empty store: any authenticated request fails,
+        // so a 200 proves auth was bypassed.
+        let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let auth = AuthLayer::from_config(&AuthConfig::default(), storage, "users-api", "acme")
+            .expect("valid")
+            .expect("token mode");
+        let path_policy = PathPolicyLayer::from_config(
+            &[],
+            &[rule("^/blocked$")],
+            &[rule("^/ping$")],
+            "users-api",
+        )
+        .expect("compiles")
+        .expect("non-empty");
+        let mock = MockResponseLayer::from_config(
+            &[MockResponse {
+                pattern: "^/mocked$".into(),
+                methods: vec![],
+                status: 299,
+                body: String::new(),
+                headers: Default::default(),
+            }],
+            "users-api",
+        )
+        .expect("compiles")
+        .expect("non-empty");
+
+        let chain = ChainBuilder::new(RequestContext::new("users-api", "acme"))
+            .path_policy(Some(path_policy))
+            .auth(Some(auth))
+            .mock(Some(mock))
+            .build(tower::service_fn(echo_forward));
+
+        let call = |path: &str| {
+            let req = Request::builder()
+                .uri(path)
+                .body(body(""))
+                .expect("request");
+            chain.clone().oneshot(req)
+        };
+
+        // Ignored path: no credentials, yet the upstream echo answers.
+        let resp = call("/ping").await.expect("infallible");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        assert!(resp.headers().contains_key("x-echo-api-id"));
+
+        // Blocked path: rejected before auth (403, not 401).
+        let resp = call("/blocked").await.expect("infallible");
+        assert_eq!(resp.status(), http::StatusCode::FORBIDDEN);
+
+        // Mock sits below auth: without credentials it is never reached.
+        let resp = call("/mocked").await.expect("infallible");
+        assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
+
+        // Everything else still requires credentials.
+        let resp = call("/other").await.expect("infallible");
+        assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ignored_path_reaches_a_mock_without_credentials() {
+        use g2_core::{MockResponse, PathRule};
+
+        use crate::mock::MockResponseLayer;
+        use crate::path_policy::PathPolicyLayer;
+
+        let storage: g2_storage::SharedStorage =
+            std::sync::Arc::new(g2_storage::MemoryStorage::new());
+        let auth = AuthLayer::from_config(
+            &g2_core::AuthConfig::default(),
+            storage,
+            "users-api",
+            "acme",
+        )
+        .expect("valid")
+        .expect("token mode");
+        let path_policy = PathPolicyLayer::from_config(
+            &[],
+            &[],
+            &[PathRule {
+                pattern: "^/status$".into(),
+                methods: vec![],
+            }],
+            "users-api",
+        )
+        .expect("compiles")
+        .expect("non-empty");
+        let mock = MockResponseLayer::from_config(
+            &[MockResponse {
+                pattern: "^/status$".into(),
+                methods: vec![],
+                status: 200,
+                body: "up".into(),
+                headers: Default::default(),
+            }],
+            "users-api",
+        )
+        .expect("compiles")
+        .expect("non-empty");
+
+        let chain = ChainBuilder::new(RequestContext::new("users-api", "acme"))
+            .path_policy(Some(path_policy))
+            .auth(Some(auth))
+            .mock(Some(mock))
+            .build(tower::service_fn(echo_forward));
+
+        let req = Request::builder()
+            .uri("/status")
+            .body(body(""))
+            .expect("request");
+        let resp = chain.oneshot(req).await.expect("infallible");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        // The mock answered, not the upstream echo.
+        assert!(!resp.headers().contains_key("x-echo-api-id"));
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@
 pub mod analytics;
 pub mod api_definition;
 pub mod config;
+pub mod endpoints;
 mod error;
 pub mod loader;
 pub mod policy;
@@ -32,6 +33,7 @@ pub mod transform;
 pub use analytics::AnalyticsRecord;
 pub use api_definition::{ApiDefinition, AuthConfig, JwtSigningMethod, DEFAULT_ORG_ID};
 pub use config::{AnalyticsSinkKind, GatewayConfig, SpikeGuardConfig};
+pub use endpoints::{MockResponse, PathRule};
 pub use error::Error;
 pub use policy::Policy;
 pub use session::{BasicAuthData, KeySession};

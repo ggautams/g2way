@@ -69,6 +69,8 @@ impl Modify for SecurityAddon {
         g2_core::HeaderTransforms,
         g2_core::HeaderTransform,
         g2_core::UrlRewriteRule,
+        g2_core::PathRule,
+        g2_core::MockResponse,
         g2_core::KeySession,
         g2_core::Policy,
         g2_core::session::RateLimit,
@@ -122,7 +124,13 @@ mod tests {
             );
         }
         let schemas = &doc.components.as_ref().expect("components").schemas;
-        for schema in ["ApiDefinition", "KeySession", "Policy"] {
+        for schema in [
+            "ApiDefinition",
+            "KeySession",
+            "Policy",
+            "PathRule",
+            "MockResponse",
+        ] {
             assert!(schemas.contains_key(schema), "schema `{schema}` missing");
         }
     }

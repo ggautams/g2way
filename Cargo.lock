@@ -696,6 +696,7 @@ dependencies = [
  "jsonwebtoken",
  "opentelemetry",
  "opentelemetry_sdk",
+ "regex",
  "serde",
  "serde_json",
  "tokio",

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{
     AnalyticsHandle, AnalyticsLayer, AuthLayer, ChainBuilder, ChainService, HeaderTransformLayer,
-    HttpMetrics, MetricsLayer, RateLimitLayer, RequestContext, SpikeGuard, StatsLayer,
-    StatsRegistry, TraceLayer,
+    HttpMetrics, MetricsLayer, MockResponseLayer, PathPolicyLayer, RateLimitLayer, RequestContext,
+    SpikeGuard, StatsLayer, StatsRegistry, TraceLayer,
 };
 use g2_storage::SharedStorage;
 
@@ -69,6 +69,13 @@ impl Route {
             .as_ref()
             .map(|t| HeaderTransformLayer::from_config(t, &def.api_id))
             .transpose()?;
+        let path_policy = PathPolicyLayer::from_config(
+            &def.allow_paths,
+            &def.block_paths,
+            &def.ignore_auth_paths,
+            &def.api_id,
+        )?;
+        let mock = MockResponseLayer::from_config(&def.mock_responses, &def.api_id)?;
         // Span names follow the OTel server-span convention (the route, not
         // the full path): the listen path, `/` for a catch-all route.
         let span_name = if target.listen_prefix.is_empty() {
@@ -81,9 +88,11 @@ impl Route {
             .metrics(metrics.map(|m| MetricsLayer::new(Arc::clone(m), &ctx, span_name)))
             .stats(stats.map(|r| StatsLayer::new(r.for_api(&def.api_id))))
             .analytics(analytics.map(|h| AnalyticsLayer::new(h.clone(), ctx.clone())))
+            .path_policy(path_policy)
             .auth(auth)
             .rate_limit(rate_limit)
             .transform_headers(transform_headers)
+            .mock(mock)
             .build(Forward::new(forwarder, Arc::clone(&target)));
         Ok(Self {
             listen_prefix: target.listen_prefix.clone(),

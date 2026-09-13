@@ -18,7 +18,7 @@ use crate::Error;
 /// the message, so `add`ing them through a transform is a configuration
 /// error: on the request side the forwarder strips them anyway, and on the
 /// response side they could corrupt the client connection.
-const HOP_BY_HOP: [&str; 8] = [
+pub(crate) const HOP_BY_HOP: [&str; 8] = [
     "connection",
     "keep-alive",
     "proxy-authenticate",
@@ -206,7 +206,7 @@ impl UrlRewriteRule {
 /// Methods a `transform_method` may rewrite an upstream request to: the
 /// RFC 9110 set minus `CONNECT`, which addresses the proxy itself and can
 /// never be a sensible upstream verb.
-const TRANSFORM_METHODS: [&str; 8] = [
+pub(crate) const TRANSFORM_METHODS: [&str; 8] = [
     "GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "TRACE",
 ];
 

@@ -3,6 +3,7 @@
 use http::Uri;
 use serde::{Deserialize, Serialize};
 
+use crate::endpoints::{MockResponse, PathRule};
 use crate::transform::{self, HeaderTransforms, UrlRewriteRule};
 use crate::Error;
 
@@ -330,6 +331,31 @@ pub struct ApiDefinition {
     /// the client's original method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform_method: Option<String>,
+
+    /// When non-empty, only requests matching one of these rules are
+    /// forwarded; everything else on this API is rejected with `403` (the
+    /// API becomes allow-list-only). See [`crate::endpoints`] for the
+    /// evaluation order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_paths: Vec<PathRule>,
+
+    /// Requests matching one of these rules are rejected with `403`. A
+    /// block always wins: it applies even to paths that are also allowed,
+    /// ignored, or mocked.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub block_paths: Vec<PathRule>,
+
+    /// Requests matching one of these rules skip authentication (and with
+    /// it rate limiting, which needs a session) — e.g. a public health or
+    /// webhook endpoint on an otherwise protected API.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignore_auth_paths: Vec<PathRule>,
+
+    /// Mock-response rules, tried in order after auth and rate limiting;
+    /// the first match is answered by the gateway without contacting the
+    /// upstream (see [`MockResponse`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mock_responses: Vec<MockResponse>,
 }
 
 /// Storage key holding one API definition: `g2:{org_id}:apidef:{api_id}`.
@@ -408,6 +434,18 @@ impl ApiDefinition {
         }
         if let Some(method) = &self.transform_method {
             transform::validate_transform_method(method, &self.api_id)?;
+        }
+        for (list, rules) in [
+            ("allow_paths", &self.allow_paths),
+            ("block_paths", &self.block_paths),
+            ("ignore_auth_paths", &self.ignore_auth_paths),
+        ] {
+            for (index, rule) in rules.iter().enumerate() {
+                rule.validate(&self.api_id, list, index)?;
+            }
+        }
+        for (index, mock) in self.mock_responses.iter().enumerate() {
+            mock.validate(&self.api_id, index)?;
         }
         Ok(())
     }
@@ -708,6 +746,57 @@ mod tests {
 
         let mut def = parse(minimal_json());
         def.transform_method = Some("CONNECT".into());
+        assert!(def.validate().is_err());
+    }
+
+    #[test]
+    fn path_lists_and_mocks_parse_and_validate() {
+        let json = r#"{
+            "api_id": "p",
+            "name": "p",
+            "listen_path": "/p/",
+            "target_url": "http://p.internal",
+            "allow_paths": [{"pattern": "^/p/public/"}],
+            "block_paths": [{"pattern": "^/p/public/admin$", "methods": ["POST"]}],
+            "ignore_auth_paths": [{"pattern": "^/p/public/ping$"}],
+            "mock_responses": [
+                {"pattern": "^/p/public/ping$", "status": 200, "body": "pong"}
+            ]
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        assert_eq!(def.allow_paths.len(), 1);
+        assert_eq!(def.block_paths[0].methods, vec!["POST"]);
+        assert_eq!(def.mock_responses[0].body, "pong");
+
+        // Optionals stay off the wire when unset (old records unaffected).
+        let bare = serde_json::to_string(&parse(minimal_json())).expect("serializes");
+        for field in [
+            "allow_paths",
+            "block_paths",
+            "ignore_auth_paths",
+            "mock_responses",
+        ] {
+            assert!(!bare.contains(field), "`{field}` serialized when empty");
+        }
+
+        // A broken rule in any list fails validation, naming the list.
+        let mut def = parse(minimal_json());
+        def.block_paths = vec![super::PathRule {
+            pattern: "(".into(),
+            methods: vec![],
+        }];
+        let err = def.validate().unwrap_err().to_string();
+        assert!(err.contains("block_paths[0]"), "got: {err}");
+
+        let mut def = parse(minimal_json());
+        def.mock_responses = vec![super::MockResponse {
+            pattern: "^/x$".into(),
+            methods: vec![],
+            status: 42,
+            body: String::new(),
+            headers: Default::default(),
+        }];
         assert!(def.validate().is_err());
     }
 
