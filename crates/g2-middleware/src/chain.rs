@@ -12,6 +12,7 @@ use crate::context::RequestContext;
 use crate::rate_limit::RateLimitLayer;
 use crate::set_context::SetContextLayer;
 use crate::stats::StatsLayer;
+use crate::trace::TraceLayer;
 use crate::{ChainService, ProxyBody};
 
 /// Builds the middleware chain for one API.
@@ -20,13 +21,16 @@ use crate::{ChainService, ProxyBody};
 /// path. The resulting [`ChainService`] wraps the innermost forwarding
 /// service with, outermost first:
 ///
-/// 1. [`StatsLayer`] — per-API request counters (outermost so rejections
+/// 1. [`TraceLayer`] — the per-request tracing span (outermost so every
+///    layer below runs inside it and can record span fields; absent when
+///    tracing is disabled).
+/// 2. [`StatsLayer`] — per-API request counters (above auth so rejections
 ///    count too; absent when stats are disabled).
-/// 2. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
-/// 3. [`AuthLayer`] — token auth (absent for keyless APIs).
-/// 4. [`RateLimitLayer`] — session rate/quota enforcement (absent for
+/// 3. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
+/// 4. [`AuthLayer`] — token auth (absent for keyless APIs).
+/// 5. [`RateLimitLayer`] — session rate/quota enforcement (absent for
 ///    keyless APIs, which have no session to read limits from).
-/// 5. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+/// 6. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
 ///
 /// Transform layers slot in here as later M6 tasks land.
 #[derive(Debug, Clone)]
@@ -35,6 +39,7 @@ pub struct ChainBuilder {
     auth: Option<AuthLayer>,
     rate_limit: Option<RateLimitLayer>,
     stats: Option<StatsLayer>,
+    trace: Option<TraceLayer>,
 }
 
 impl ChainBuilder {
@@ -46,7 +51,15 @@ impl ChainBuilder {
             auth: None,
             rate_limit: None,
             stats: None,
+            trace: None,
         }
+    }
+
+    /// Adds the per-request tracing span (`None` is a no-op).
+    #[must_use]
+    pub fn trace(mut self, trace: Option<TraceLayer>) -> Self {
+        self.trace = trace;
+        self
     }
 
     /// Adds per-API request counting (`None` is a no-op).
@@ -84,6 +97,7 @@ impl ChainBuilder {
         S::Future: Send + 'static,
     {
         let svc = ServiceBuilder::new()
+            .option_layer(self.trace)
             .option_layer(self.stats)
             .layer(SetContextLayer::new(self.ctx))
             .option_layer(self.auth)

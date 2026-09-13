@@ -27,6 +27,7 @@ pub mod response;
 pub mod set_context;
 pub mod spike;
 pub mod stats;
+pub mod trace;
 
 pub use api_id_header::{ApiIdHeader, ApiIdHeaderLayer, API_ID_HEADER};
 pub use auth::{Auth, AuthLayer};
@@ -37,6 +38,7 @@ pub use rate_limit::{RateLimit, RateLimitLayer};
 pub use set_context::{SetContext, SetContextLayer};
 pub use spike::SpikeGuard;
 pub use stats::{ApiStats, ApiStatsSnapshot, StatsLayer, StatsRegistry};
+pub use trace::{Trace, TraceLayer};
 
 /// Boxed error type used for proxied body streams.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;

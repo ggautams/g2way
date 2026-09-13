@@ -62,7 +62,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 
 ## M5 — Observability
 
-- [ ] OTLP trace export (opentelemetry-otlp) with per-request spans (api_id, key alias, status, upstream latency)
+- [x] OTLP trace export (opentelemetry-otlp) with per-request spans (api_id, key alias, status, upstream latency)
 - [ ] OTLP metrics + Prometheus `/metrics` endpoint
 - [ ] `AnalyticsSink` trait + per-request analytics records; stdout-JSON, Redis-list, and OTLP-logs sinks
 - [ ] deploy/k8s: otel-collector example; document Datadog exporter wiring
@@ -399,3 +399,27 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   reload/dashboard assertions (deploy/k8s unchanged since M3 — still
   applies cleanly). Next milestone: M5 observability (OTLP traces first);
   the deferred M2 `jwks_url` box still waits on the M7 TLS decision.
+- **2026-08-31** — M5 OTLP trace export landed. Transport is deliberately
+  OTLP over **HTTP/protobuf** (`{endpoint}/v1/traces`, port 4318) with
+  `reqwest-blocking-client` on the SDK's own batch thread — the grpc-tonic
+  exporter needs a tokio runtime handle, this one works before the runtime
+  starts and after it stops (telemetry now inits inside `run()` after
+  config merge; startup errors print via `eprintln!` since they can predate
+  the subscriber; `TelemetryGuard::shutdown()` flushes last). Spans come
+  from a new always-on `TraceLayer` (g2-middleware, outermost in every
+  chain) bridged via `tracing-opentelemetry`: name = listen path, fields
+  `api_id`/`org_id`/`http.request.method`/`url.path`/
+  `http.response.status_code` + `otel.status_code=ERROR` on 5xx only;
+  auth records `key_alias` and the forwarder records `upstream_latency_ms`
+  through `tracing::Span::current()` (no-ops when unexported). Spans also
+  enrich JSON logs (fmt layer has `with_current_span`); they're info-level,
+  so `RUST_LOG=warn` disables export. Config: `otlp_endpoint` /
+  `--otlp-endpoint` / `G2_OTLP_ENDPOINT`; resource carries service
+  name/version + `host.name` from `$HOSTNAME`. Non-ignored unit test runs a
+  fake one-shot collector (std TcpListener); **verified live**: real
+  gateway run exported protobuf spans carrying every field above. Health
+  endpoints/404s produce no span (no chain). Deps: opentelemetry 0.32 +
+  tracing-opentelemetry 0.33. Follow-ups noted: W3C `traceparent`
+  extract/inject (context propagation to upstreams) deliberately not in
+  this checkbox — decide when wiring the collector example; no span for
+  the admin API. Next: OTLP metrics + Prometheus `/metrics`.

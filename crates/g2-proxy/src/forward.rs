@@ -170,7 +170,15 @@ async fn forward(
     let upstream_req = Request::from_parts(parts, body);
 
     tracing::debug!(%api_id, uri = %upstream_req.uri(), "forwarding upstream");
-    match tokio::time::timeout(target.timeout, client.request(upstream_req)).await {
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(target.timeout, client.request(upstream_req)).await;
+    // Time spent talking to the upstream (to failure/timeout on the error
+    // paths), recorded on the request span (a no-op without a TraceLayer).
+    tracing::Span::current().record(
+        g2_middleware::trace::UPSTREAM_LATENCY_FIELD,
+        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+    );
+    match outcome {
         Ok(Ok(mut resp)) => {
             rewrite::strip_hop_by_hop_headers(resp.headers_mut());
             resp.map(ProxyBody::new)

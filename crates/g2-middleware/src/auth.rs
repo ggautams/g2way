@@ -282,6 +282,11 @@ where
         Box::pin(async move {
             match authenticate(&state, &req).await {
                 Ok(session_ctx) => {
+                    // Surface the key's alias on the request span (a no-op
+                    // when the chain has no TraceLayer).
+                    if let Some(alias) = session_ctx.session().alias.as_deref() {
+                        tracing::Span::current().record(crate::trace::KEY_ALIAS_FIELD, alias);
+                    }
                     req.extensions_mut().insert(session_ctx);
                     inner.call(req).await
                 }

@@ -77,6 +77,12 @@ pub struct GatewayConfig {
     /// Pod-local spike guard in front of the distributed rate limiter.
     /// `None` (the default) disables it.
     pub spike_guard: Option<SpikeGuardConfig>,
+
+    /// Base endpoint of an OTLP/HTTP collector for trace export, e.g.
+    /// `http://otel-collector:4318` (the `/v1/traces` signal path is
+    /// appended automatically). `None` — the default — disables OTLP
+    /// export; per-request spans then only enrich the process logs.
+    pub otlp_endpoint: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -89,6 +95,7 @@ impl Default for GatewayConfig {
             admin_listen_addr: None,
             admin_secret: None,
             spike_guard: None,
+            otlp_endpoint: None,
         }
     }
 }
@@ -140,6 +147,16 @@ impl GatewayConfig {
                     reason: "`spike_guard.capacity` and `spike_guard.refill_per_sec` must be \
                              greater than zero (omit `spike_guard` to disable it)"
                         .into(),
+                });
+            }
+        }
+        if let Some(endpoint) = &self.otlp_endpoint {
+            if !endpoint.starts_with("http://") && !endpoint.starts_with("https://") {
+                return Err(Error::InvalidGatewayConfig {
+                    reason: format!(
+                        "`otlp_endpoint` must be an http:// or https:// URL, got `{endpoint}` \
+                         (omit it to disable OTLP export)"
+                    ),
                 });
             }
         }
@@ -209,6 +226,19 @@ mod tests {
             refill_per_sec: 10,
         });
         cfg.validate().expect("positive fields are valid");
+    }
+
+    #[test]
+    fn otlp_endpoint_must_be_an_http_url() {
+        let mut cfg = GatewayConfig {
+            otlp_endpoint: Some("otel-collector:4318".into()),
+            ..GatewayConfig::default()
+        };
+        assert!(cfg.validate().is_err(), "scheme-less endpoint");
+        cfg.otlp_endpoint = Some("http://otel-collector:4318".into());
+        cfg.validate().expect("http endpoint is valid");
+        cfg.otlp_endpoint = Some("https://collector.example.com".into());
+        cfg.validate().expect("https endpoint is valid");
     }
 
     #[test]

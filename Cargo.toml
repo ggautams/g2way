@@ -56,6 +56,17 @@ base64 = "0.22"
 # OpenAPI
 utoipa = "5"
 
+# OpenTelemetry (OTLP trace export; see ADR-0001 decision 3)
+opentelemetry = "0.32"
+opentelemetry_sdk = "0.32"
+opentelemetry-otlp = { version = "0.32", default-features = false, features = [
+    "trace",
+    "http-proto",
+    "reqwest-blocking-client",
+    "internal-logs",
+] }
+tracing-opentelemetry = "0.33"
+
 # Errors, logging, CLI
 thiserror = "2"
 async-trait = "0.1"

@@ -48,19 +48,24 @@ struct Cli {
     #[arg(long, env = "G2_ADMIN_SECRET", hide_env_values = true)]
     admin_secret: Option<String>,
 
+    /// Base endpoint of an OTLP/HTTP collector for trace export, e.g.
+    /// http://otel-collector:4318 (overrides the config file). Without one,
+    /// spans are not exported.
+    #[arg(long, env = "G2_OTLP_ENDPOINT")]
+    otlp_endpoint: Option<String>,
+
     /// Log output format: `json` (default) or `pretty`.
     #[arg(long, env = "G2_LOG_FORMAT", default_value = "json")]
     log_format: LogFormat,
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    g2_telemetry::init_tracing(cli.log_format);
-
-    match run(cli) {
+    match run(Cli::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            tracing::error!(error = %err, "gateway failed to start");
+            // stderr, not tracing: failures this early can predate the
+            // subscriber (config errors), and it must never be silent.
+            eprintln!("g2way: failed to start: {err}");
             ExitCode::FAILURE
         }
     }
@@ -87,7 +92,22 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(admin_secret) = cli.admin_secret {
         config.admin_secret = Some(admin_secret);
     }
+    if let Some(otlp_endpoint) = cli.otlp_endpoint {
+        config.otlp_endpoint = Some(otlp_endpoint);
+    }
     config.validate()?;
+
+    // The OTLP exporter batches on its own thread (no tokio dependency), so
+    // telemetry is deliberately initialized before the runtime exists and
+    // flushed after it is gone.
+    let otlp = config
+        .otlp_endpoint
+        .clone()
+        .map(|endpoint| g2_telemetry::OtlpConfig { endpoint });
+    let telemetry = g2_telemetry::init_telemetry(cli.log_format, otlp.as_ref())?;
+    if let Some(cfg) = &otlp {
+        tracing::info!(endpoint = %cfg.endpoint, "OTLP trace export enabled");
+    }
 
     let grace = Duration::from_secs(config.shutdown_grace_period_secs);
 
@@ -189,5 +209,6 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Ok::<(), Box<dyn std::error::Error>>(())
     })?;
     tracing::info!("g2way stopped");
+    telemetry.shutdown();
     Ok(())
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{
     AuthLayer, ChainBuilder, ChainService, RateLimitLayer, RequestContext, SpikeGuard, StatsLayer,
-    StatsRegistry,
+    StatsRegistry, TraceLayer,
 };
 use g2_storage::SharedStorage;
 
@@ -61,7 +61,15 @@ impl Route {
                 spike_guard.map(Arc::clone),
             )
         });
-        let chain = ChainBuilder::new(ctx)
+        // Span names follow the OTel server-span convention (the route, not
+        // the full path): the listen path, `/` for a catch-all route.
+        let span_name = if target.listen_prefix.is_empty() {
+            "/"
+        } else {
+            target.listen_prefix.as_str()
+        };
+        let chain = ChainBuilder::new(ctx.clone())
+            .trace(Some(TraceLayer::new(ctx, span_name)))
             .stats(stats.map(|r| StatsLayer::new(r.for_api(&def.api_id))))
             .auth(auth)
             .rate_limit(rate_limit)
