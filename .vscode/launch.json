@@ -1,0 +1,17 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug g2way (examples/apis)",
+      "cargo": {
+        "args": ["build", "-p", "g2way", "--bin", "g2way"],
+        "filter": { "name": "g2way", "kind": "bin" }
+      },
+      "args": ["--apps-dir", "examples/apis", "--log-format", "pretty"],
+      "cwd": "${workspaceFolder}",
+      "env": { "RUST_BACKTRACE": "1" }
+    }
+  ]
+}

@@ -1,0 +1,95 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "make check (pre-commit gate)",
+      "type": "shell",
+      "command": "make check",
+      "group": { "kind": "build", "isDefault": true },
+      "problemMatcher": ["$rustc"],
+      "icon": { "id": "check-all", "color": "terminal.ansiGreen" },
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "cargo test",
+      "type": "shell",
+      "command": "cargo test --workspace",
+      "group": { "kind": "test", "isDefault": true },
+      "problemMatcher": ["$rustc"],
+      "icon": { "id": "beaker", "color": "terminal.ansiCyan" },
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "run gateway (examples/apis)",
+      "type": "shell",
+      "command": "make run",
+      "isBackground": true,
+      "problemMatcher": ["$rustc"],
+      "icon": { "id": "rocket", "color": "terminal.ansiMagenta" },
+      "presentation": { "panel": "dedicated", "group": "services" }
+    },
+    {
+      "label": "run gateway + httpbin",
+      "dependsOrder": "sequence",
+      "dependsOn": ["httpbin up", "run gateway (examples/apis)"],
+      "problemMatcher": [],
+      "icon": { "id": "play-circle", "color": "terminal.ansiMagenta" }
+    },
+    {
+      "label": "httpbin up",
+      "type": "shell",
+      "command": "make httpbin-up",
+      "problemMatcher": [],
+      "icon": { "id": "globe", "color": "terminal.ansiBlue" },
+      "presentation": { "panel": "shared", "group": "services" }
+    },
+    {
+      "label": "httpbin down",
+      "type": "shell",
+      "command": "make httpbin-down",
+      "problemMatcher": [],
+      "icon": { "id": "globe", "color": "terminal.ansiRed" },
+      "presentation": { "panel": "shared", "group": "services" }
+    },
+    {
+      "label": "redis up",
+      "type": "shell",
+      "command": "make redis-up",
+      "problemMatcher": [],
+      "icon": { "id": "database", "color": "terminal.ansiBlue" },
+      "presentation": { "panel": "shared", "group": "services" }
+    },
+    {
+      "label": "redis down",
+      "type": "shell",
+      "command": "make redis-down",
+      "problemMatcher": [],
+      "icon": { "id": "database", "color": "terminal.ansiRed" },
+      "presentation": { "panel": "shared", "group": "services" }
+    },
+    {
+      "label": "minikube: build + deploy + smoke",
+      "type": "shell",
+      "command": "make minikube-load k8s-deploy smoke",
+      "problemMatcher": [],
+      "icon": { "id": "cloud-upload", "color": "terminal.ansiYellow" },
+      "presentation": { "panel": "dedicated", "clear": true }
+    },
+    {
+      "label": "cargo fmt",
+      "type": "shell",
+      "command": "make fmt",
+      "problemMatcher": [],
+      "icon": { "id": "symbol-color", "color": "terminal.ansiWhite" },
+      "presentation": { "panel": "shared", "reveal": "silent" }
+    },
+    {
+      "label": "cargo doc (open)",
+      "type": "shell",
+      "command": "cargo doc --workspace --no-deps --open",
+      "problemMatcher": ["$rustc"],
+      "icon": { "id": "book", "color": "terminal.ansiWhite" },
+      "presentation": { "panel": "shared" }
+    }
+  ]
+}
