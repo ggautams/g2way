@@ -10,7 +10,9 @@
 //! secret get a single `403` message (no oracle), and unmatched paths are
 //! only revealed as `404` to authenticated callers.
 //!
-//! Endpoints: `/g2/health` (liveness, unauthenticated), `/g2/version`
+//! Endpoints: `/g2/health` (liveness, unauthenticated), `/metrics`
+//! (Prometheus text exposition, unauthenticated — scrapers do not send
+//! custom headers; keep the admin port off the public network), `/g2/version`
 //! (authenticated), key CRUD under `/g2/keys` (authenticated; raw keys
 //! are returned only at creation — storage holds hashes, see
 //! [`g2_core::session::hash_key`]), API definition / policy CRUD under
@@ -59,6 +61,10 @@ struct AdminState {
     /// Live-gateway handles for the dashboard endpoints; `None` when the
     /// router is built without them (those endpoints then answer 503).
     dashboard: Option<Dashboard>,
+
+    /// Prometheus render handle for `GET /metrics`; `None` when metrics
+    /// are not enabled (the endpoint then answers 503).
+    metrics: Option<g2_telemetry::PrometheusHandle>,
 }
 
 impl AdminState {
@@ -81,6 +87,7 @@ pub fn router(
     admin_secret: &str,
     storage: SharedStorage,
     dashboard: Option<Dashboard>,
+    metrics: Option<g2_telemetry::PrometheusHandle>,
 ) -> Result<Router, Error> {
     if admin_secret.trim().is_empty() {
         return Err(Error::InvalidGatewayConfig {
@@ -91,6 +98,7 @@ pub fn router(
         secret_digest: Sha256::digest(admin_secret.as_bytes()).into(),
         storage,
         dashboard,
+        metrics,
     };
 
     // The fallback lives inside the authed router so unknown paths are
@@ -133,9 +141,13 @@ pub fn router(
             state.clone(),
             require_admin_secret,
         ))
-        .with_state(state);
+        .with_state(state.clone());
 
-    Ok(Router::new().route("/g2/health", get(health)).merge(authed))
+    Ok(Router::new()
+        .route("/g2/health", get(health))
+        .route("/metrics", get(prometheus_metrics))
+        .with_state(state)
+        .merge(authed))
 }
 
 /// Serves `router` on `listener` until `shutdown` resolves, then drains.
@@ -178,6 +190,29 @@ async fn require_admin_secret(
     responses((status = 200, description = "Node is alive: `{\"status\":\"pass\"}`")))]
 async fn health() -> Response {
     Json(serde_json::json!({ "status": "pass" })).into_response()
+}
+
+/// `GET /metrics` — the gateway's metrics in the Prometheus text exposition
+/// format (unauthenticated: scrapers do not send custom headers, and the
+/// admin port is expected to stay off the public network).
+#[utoipa::path(get, path = "/metrics", tag = "system",
+    responses(
+        (status = 200, description = "Prometheus text exposition of the gateway's metrics",
+            content_type = "text/plain"),
+        (status = 503, description = "Metrics are not enabled on this node"),
+    ))]
+async fn prometheus_metrics(State(state): State<AdminState>) -> Response {
+    match &state.metrics {
+        Some(handle) => (
+            [(
+                axum::http::header::CONTENT_TYPE,
+                "text/plain; version=0.0.4",
+            )],
+            handle.render(),
+        )
+            .into_response(),
+        None => error_response(StatusCode::SERVICE_UNAVAILABLE, "metrics not enabled"),
+    }
 }
 
 /// `GET /g2/version` — the gateway's version (workspace-wide, so the crate
@@ -245,7 +280,7 @@ mod tests {
     const SECRET: &str = "test-admin-secret";
 
     fn test_router(storage: MemoryStorage) -> Router {
-        router(SECRET, Arc::new(storage), None).expect("router")
+        router(SECRET, Arc::new(storage), None, None).expect("router")
     }
 
     fn request(path: &str, secret: Option<&str>) -> Request {
@@ -282,7 +317,7 @@ mod tests {
     fn empty_secret_is_rejected_at_construction() {
         for empty in ["", "   "] {
             assert!(
-                router(empty, Arc::new(MemoryStorage::new()), None).is_err(),
+                router(empty, Arc::new(MemoryStorage::new()), None, None).is_err(),
                 "secret `{empty:?}` must be rejected"
             );
         }
@@ -293,6 +328,42 @@ mod tests {
         let (status, body) = call("/g2/health", None).await;
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("\"status\":\"pass\""), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_is_503_without_wiring() {
+        let (status, body) = call("/metrics", None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.contains("metrics not enabled"), "body: {body}");
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_needs_no_secret_and_renders_prometheus_text() {
+        let (_provider, handle) = g2_telemetry::metrics::build_meter_provider(None, true)
+            .expect("meter provider")
+            .expect("prometheus enabled");
+        let router = router(
+            SECRET,
+            Arc::new(MemoryStorage::new()),
+            None,
+            Some(handle.expect("prometheus handle")),
+        )
+        .expect("router");
+
+        let resp = router
+            .oneshot(request("/metrics", None))
+            .await
+            .expect("infallible");
+        assert_eq!(resp.status(), StatusCode::OK);
+        let content_type = resp
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(content_type.starts_with("text/plain"), "{content_type}");
+        // Rendering an empty registry is a valid (empty) exposition; the
+        // instrument-level rendering is unit-tested in g2-telemetry.
     }
 
     #[tokio::test]
@@ -339,14 +410,21 @@ mod tests {
             )
             .expect("def");
             let stats = Arc::new(StatsRegistry::new());
-            let table =
-                RouteTable::build(vec![def], &Forwarder::new(), &shared, None, Some(&stats))
-                    .expect("table");
+            let table = RouteTable::build(
+                vec![def],
+                &Forwarder::new(),
+                &shared,
+                None,
+                Some(&stats),
+                None,
+            )
+            .expect("table");
             let gateway = Arc::new(Gateway::new(table));
             let router = router(
                 SECRET,
                 shared,
                 Some(Dashboard::new(Arc::clone(&gateway), Arc::clone(&stats))),
+                None,
             )
             .expect("router");
             (router, gateway, stats)

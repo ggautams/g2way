@@ -10,7 +10,9 @@ rust-version.workspace = true
 [dependencies]
 opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
+opentelemetry-prometheus.workspace = true
 opentelemetry_sdk.workspace = true
+prometheus.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

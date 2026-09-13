@@ -37,6 +37,10 @@ pub struct ReloadContext {
     /// Per-API request counters, if enabled (shared across reloads so
     /// counters survive table swaps).
     pub stats: Option<Arc<g2_middleware::StatsRegistry>>,
+
+    /// OpenTelemetry request instruments, if metric export is enabled
+    /// (created once per process; shared across reloads).
+    pub metrics: Option<Arc<g2_middleware::HttpMetrics>>,
 }
 
 impl ReloadContext {
@@ -58,6 +62,7 @@ impl ReloadContext {
             &self.storage,
             self.spike_guard.as_ref(),
             self.stats.as_ref(),
+            self.metrics.as_ref(),
         )?)
     }
 }
@@ -111,6 +116,7 @@ mod tests {
             forwarder: Forwarder::new(),
             spike_guard: None,
             stats: None,
+            metrics: None,
         }
     }
 

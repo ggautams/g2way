@@ -9,6 +9,7 @@ use tower::{Service, ServiceBuilder};
 use crate::api_id_header::ApiIdHeaderLayer;
 use crate::auth::AuthLayer;
 use crate::context::RequestContext;
+use crate::metrics::MetricsLayer;
 use crate::rate_limit::RateLimitLayer;
 use crate::set_context::SetContextLayer;
 use crate::stats::StatsLayer;
@@ -24,13 +25,15 @@ use crate::{ChainService, ProxyBody};
 /// 1. [`TraceLayer`] — the per-request tracing span (outermost so every
 ///    layer below runs inside it and can record span fields; absent when
 ///    tracing is disabled).
-/// 2. [`StatsLayer`] — per-API request counters (above auth so rejections
+/// 2. [`MetricsLayer`] — the per-request duration histogram sample (absent
+///    when metrics are disabled).
+/// 3. [`StatsLayer`] — per-API request counters (above auth so rejections
 ///    count too; absent when stats are disabled).
-/// 3. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
-/// 4. [`AuthLayer`] — token auth (absent for keyless APIs).
-/// 5. [`RateLimitLayer`] — session rate/quota enforcement (absent for
+/// 4. [`SetContextLayer`] — stamps the [`RequestContext`] extension.
+/// 5. [`AuthLayer`] — token auth (absent for keyless APIs).
+/// 6. [`RateLimitLayer`] — session rate/quota enforcement (absent for
 ///    keyless APIs, which have no session to read limits from).
-/// 6. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+/// 7. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
 ///
 /// Transform layers slot in here as later M6 tasks land.
 #[derive(Debug, Clone)]
@@ -40,6 +43,7 @@ pub struct ChainBuilder {
     rate_limit: Option<RateLimitLayer>,
     stats: Option<StatsLayer>,
     trace: Option<TraceLayer>,
+    metrics: Option<MetricsLayer>,
 }
 
 impl ChainBuilder {
@@ -52,6 +56,7 @@ impl ChainBuilder {
             rate_limit: None,
             stats: None,
             trace: None,
+            metrics: None,
         }
     }
 
@@ -59,6 +64,13 @@ impl ChainBuilder {
     #[must_use]
     pub fn trace(mut self, trace: Option<TraceLayer>) -> Self {
         self.trace = trace;
+        self
+    }
+
+    /// Adds per-request duration metrics (`None` is a no-op).
+    #[must_use]
+    pub fn metrics(mut self, metrics: Option<MetricsLayer>) -> Self {
+        self.metrics = metrics;
         self
     }
 
@@ -98,6 +110,7 @@ impl ChainBuilder {
     {
         let svc = ServiceBuilder::new()
             .option_layer(self.trace)
+            .option_layer(self.metrics)
             .option_layer(self.stats)
             .layer(SetContextLayer::new(self.ctx))
             .option_layer(self.auth)

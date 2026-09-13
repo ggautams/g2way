@@ -168,7 +168,7 @@ mod tests {
         storage: &g2_storage::SharedStorage,
     ) -> Gateway {
         Gateway::new(
-            RouteTable::build(defs, &Forwarder::new(), storage, None, None).expect("table"),
+            RouteTable::build(defs, &Forwarder::new(), storage, None, None, None).expect("table"),
         )
     }
 
@@ -339,6 +339,7 @@ mod tests {
             vec![def_to("echo", "/echo/", &format!("http://{upstream}"))],
             &Forwarder::new(),
             &memory_storage(),
+            None,
             None,
             None,
         )

@@ -12,6 +12,7 @@ g2-core = { workspace = true, features = ["openapi"] }
 g2-middleware.workspace = true
 g2-proxy.workspace = true
 g2-storage.workspace = true
+g2-telemetry.workspace = true
 axum.workspace = true
 hex.workspace = true
 rand.workspace = true

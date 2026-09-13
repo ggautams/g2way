@@ -41,6 +41,7 @@ impl Modify for SecurityAddon {
     ),
     paths(
         crate::health,
+        crate::prometheus_metrics,
         crate::version,
         crate::reload,
         crate::dashboard::node,
@@ -100,6 +101,7 @@ mod tests {
         // must be documented; a new route without an annotation fails here.
         for path in [
             "/g2/health",
+            "/metrics",
             "/g2/version",
             "/g2/reload",
             "/g2/node",

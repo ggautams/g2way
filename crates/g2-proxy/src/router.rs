@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{
-    AuthLayer, ChainBuilder, ChainService, RateLimitLayer, RequestContext, SpikeGuard, StatsLayer,
-    StatsRegistry, TraceLayer,
+    AuthLayer, ChainBuilder, ChainService, HttpMetrics, MetricsLayer, RateLimitLayer,
+    RequestContext, SpikeGuard, StatsLayer, StatsRegistry, TraceLayer,
 };
 use g2_storage::SharedStorage;
 
@@ -46,6 +46,7 @@ impl Route {
         storage: &SharedStorage,
         spike_guard: Option<&Arc<SpikeGuard>>,
         stats: Option<&Arc<StatsRegistry>>,
+        metrics: Option<&Arc<HttpMetrics>>,
     ) -> Result<Self, Error> {
         let target = Arc::new(UpstreamTarget::build(&def)?);
         let ctx = RequestContext::new(def.api_id.clone(), def.org_id.clone());
@@ -69,7 +70,8 @@ impl Route {
             target.listen_prefix.as_str()
         };
         let chain = ChainBuilder::new(ctx.clone())
-            .trace(Some(TraceLayer::new(ctx, span_name)))
+            .trace(Some(TraceLayer::new(ctx.clone(), span_name)))
+            .metrics(metrics.map(|m| MetricsLayer::new(Arc::clone(m), &ctx, span_name)))
             .stats(stats.map(|r| StatsLayer::new(r.for_api(&def.api_id))))
             .auth(auth)
             .rate_limit(rate_limit)
@@ -114,9 +116,10 @@ impl RouteTable {
     /// middleware chain is composed here, around a forwarding service using
     /// `forwarder`'s shared client; token-auth APIs look sessions up in
     /// `storage`. `spike_guard` is the optional process-wide pod-local
-    /// guard shared by every route's rate limiter, and `stats` the optional
+    /// guard shared by every route's rate limiter, `stats` the optional
     /// process-wide counter registry (shared across reloads so counters
-    /// survive table swaps).
+    /// survive table swaps), and `metrics` the optional process-wide
+    /// OpenTelemetry instruments every route records into.
     ///
     /// # Errors
     ///
@@ -129,11 +132,12 @@ impl RouteTable {
         storage: &SharedStorage,
         spike_guard: Option<&Arc<SpikeGuard>>,
         stats: Option<&Arc<StatsRegistry>>,
+        metrics: Option<&Arc<HttpMetrics>>,
     ) -> Result<Self, Error> {
         let mut routes = Vec::with_capacity(defs.len());
         for def in defs {
             let active = def.active;
-            let route = Route::build(def, forwarder, storage, spike_guard, stats)?;
+            let route = Route::build(def, forwarder, storage, spike_guard, stats, metrics)?;
             if active {
                 routes.push(Arc::new(route));
             } else {
@@ -175,7 +179,7 @@ mod tests {
 
     fn table(defs: Vec<ApiDefinition>) -> Result<RouteTable, Error> {
         let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
-        RouteTable::build(defs, &Forwarder::new(), &storage, None, None)
+        RouteTable::build(defs, &Forwarder::new(), &storage, None, None, None)
     }
 
     #[test]

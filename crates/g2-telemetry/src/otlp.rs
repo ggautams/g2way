@@ -40,7 +40,7 @@ pub fn traces_endpoint(base: &str) -> String {
 /// The OTel resource identifying this gateway process: service name and
 /// version, plus `host.name` from `$HOSTNAME` when set (the pod name on
 /// k8s — the same identity the admin API's `/g2/node` reports).
-fn resource() -> Resource {
+pub(crate) fn resource() -> Resource {
     let mut attrs = vec![KeyValue::new("service.version", env!("CARGO_PKG_VERSION"))];
     if let Ok(hostname) = std::env::var("HOSTNAME") {
         if !hostname.is_empty() {

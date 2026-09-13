@@ -63,7 +63,7 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
 ## M5 — Observability
 
 - [x] OTLP trace export (opentelemetry-otlp) with per-request spans (api_id, key alias, status, upstream latency)
-- [ ] OTLP metrics + Prometheus `/metrics` endpoint
+- [x] OTLP metrics + Prometheus `/metrics` endpoint
 - [ ] `AnalyticsSink` trait + per-request analytics records; stdout-JSON, Redis-list, and OTLP-logs sinks
 - [ ] deploy/k8s: otel-collector example; document Datadog exporter wiring
 
@@ -423,3 +423,29 @@ no TLS connector yet (M7 task). No WebSocket/upgrade passthrough (M8).
   extract/inject (context propagation to upstreams) deliberately not in
   this checkbox — decide when wiring the collector example; no span for
   the admin API. Next: OTLP metrics + Prometheus `/metrics`.
+- **2026-08-31 (2)** — M5 metrics landed: one `SdkMeterProvider`, two
+  readers over the same instruments — periodic OTLP push (HTTP/protobuf to
+  `{otlp_endpoint}/v1/metrics`, same endpoint/knob and same no-tokio design
+  as traces) and a Prometheus pull reader (`opentelemetry-prometheus` 0.32,
+  which resumed maintenance and matches our 0.32 pin) rendered by
+  **unauthenticated** `GET /metrics` on the admin listener (scrapers can't
+  send custom headers; the admin port stays cluster-internal). **No new
+  config**: OTLP metrics ride `otlp_endpoint`, Prometheus is on iff the
+  admin listener is. Instrumentation is one semconv histogram —
+  `http.server.request.duration` (seconds, explicit semconv buckets; SDK
+  defaults are ms-tuned garbage for seconds) with `http.route`/
+  `http.response.status_code`/`g2.api_id`/`g2.org_id` — recorded by a new
+  `MetricsLayer` between trace and stats; per-API attrs are precomputed
+  Arc-backed `KeyValue`s (hot-path rule), instruments are created **once
+  per process** (`HttpMetrics::new()` after the global provider install —
+  earlier binds to the no-op provider and silently drops everything) and
+  shared via `ReloadContext.metrics`; `RouteTable::build` grew a 6th
+  `Option` param. Keyless APIs are measured (unlike rate limiting);
+  health/404s aren't (no chain). `init_telemetry` gained a `prometheus:
+  bool` and the guard now carries both providers + a `PrometheusHandle`.
+  Verified live: 3×200+1×404 showed as labeled histogram count/sum via
+  curl `/metrics` (no secret), and a fake collector received both
+  `POST /v1/traces` and `POST /v1/metrics` on SIGTERM flush (steady-state
+  push is the 60s default period). Not done: k8s Prometheus scrape
+  annotations / otel-collector example — that's the M5 deploy checkbox.
+  Next: `AnalyticsSink` trait + per-request analytics records.

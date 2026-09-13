@@ -97,17 +97,25 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     config.validate()?;
 
-    // The OTLP exporter batches on its own thread (no tokio dependency), so
-    // telemetry is deliberately initialized before the runtime exists and
-    // flushed after it is gone.
+    // The OTLP exporters batch on their own threads (no tokio dependency),
+    // so telemetry is deliberately initialized before the runtime exists and
+    // flushed after it is gone. The Prometheus pull side is enabled exactly
+    // when the admin listener is: that is the port serving `GET /metrics`.
     let otlp = config
         .otlp_endpoint
         .clone()
         .map(|endpoint| g2_telemetry::OtlpConfig { endpoint });
-    let telemetry = g2_telemetry::init_telemetry(cli.log_format, otlp.as_ref())?;
+    let prometheus_enabled = config.admin_listen_addr.is_some();
+    let telemetry =
+        g2_telemetry::init_telemetry(cli.log_format, otlp.as_ref(), prometheus_enabled)?;
     if let Some(cfg) = &otlp {
-        tracing::info!(endpoint = %cfg.endpoint, "OTLP trace export enabled");
+        tracing::info!(endpoint = %cfg.endpoint, "OTLP trace and metric export enabled");
     }
+    // Request instruments bind to the global meter provider installed just
+    // above; without any metrics side enabled they would no-op, so skip them.
+    let metrics =
+        (otlp.is_some() || prometheus_enabled).then(|| Arc::new(g2_middleware::HttpMetrics::new()));
+    let prometheus = telemetry.prometheus();
 
     let grace = Duration::from_secs(config.shutdown_grace_period_secs);
 
@@ -147,6 +155,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             forwarder: Forwarder::new(),
             spike_guard,
             stats: Some(Arc::clone(&stats)),
+            metrics,
         };
         let gateway = Arc::new(Gateway::new(reload_ctx.build_table().await?));
         tracing::info!(apps_dir = %config.apps_dir.display(), "API definitions loaded");
@@ -194,7 +203,12 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                     .as_deref()
                     .expect("validate() guarantees a secret when the admin listener is set");
                 let dashboard = g2_admin::Dashboard::new(Arc::clone(&gateway), Arc::clone(&stats));
-                let admin_router = g2_admin::router(secret, Arc::clone(&storage), Some(dashboard))?;
+                let admin_router = g2_admin::router(
+                    secret,
+                    Arc::clone(&storage),
+                    Some(dashboard),
+                    prometheus.clone(),
+                )?;
                 let admin_listener = tokio::net::TcpListener::bind(admin_addr).await?;
                 tracing::info!(admin_listen_addr = %admin_addr, "admin API listening");
                 let admin = g2_admin::serve(
