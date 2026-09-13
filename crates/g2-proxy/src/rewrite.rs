@@ -9,7 +9,7 @@ use g2_core::Error;
 use http::header::{HeaderMap, HeaderName, HeaderValue, CONNECTION, HOST};
 use regex::Regex;
 
-use crate::forward::UpstreamTarget;
+use crate::forward::{UpstreamAddr, UpstreamTarget};
 
 /// One URL rewrite rule with its pattern compiled at route-build time
 /// (ADR-0001 hot-path rule: no per-request regex parsing).
@@ -57,7 +57,9 @@ const HOP_BY_HOP: [&str; 8] = [
     "upgrade",
 ];
 
-/// Computes the upstream `path?query` for a request matched to `target`.
+/// Computes the upstream `path?query` for a request matched to `target`,
+/// bound for `addr` (the address picked from the target's rotation, whose
+/// base path the result is joined onto).
 ///
 /// The target's URL rewrite rules are tried first, in order, against the
 /// full client path; the first match's expansion replaces the listen-path
@@ -68,6 +70,7 @@ const HOP_BY_HOP: [&str; 8] = [
 /// client's query string is always forwarded untouched.
 pub(crate) fn upstream_path_and_query(
     target: &UpstreamTarget,
+    addr: &UpstreamAddr,
     req_path: &str,
     query: Option<&str>,
 ) -> String {
@@ -88,7 +91,7 @@ pub(crate) fn upstream_path_and_query(
         None => (req_path, None),
     };
 
-    let mut path = join_paths(&target.base_path, tail);
+    let mut path = join_paths(&addr.base_path, tail);
     for (i, q) in rewrite_query.iter().chain(query.iter()).enumerate() {
         path.push(if i == 0 { '?' } else { '&' });
         path.push_str(q);
@@ -187,6 +190,12 @@ mod tests {
     use super::*;
     use g2_core::ApiDefinition;
 
+    /// Path computation against the target's first (and in these tests only)
+    /// upstream address.
+    fn pq(target: &UpstreamTarget, path: &str, query: Option<&str>) -> String {
+        upstream_path_and_query(target, &target.targets[0], path, query)
+    }
+
     fn route(
         listen_path: &str,
         target_url: &str,
@@ -205,44 +214,35 @@ mod tests {
     #[test]
     fn strips_listen_path_onto_bare_target() {
         let r = route("/users/", "http://u.internal", true, false);
-        assert_eq!(upstream_path_and_query(&r, "/users/42", None), "/42");
-        assert_eq!(upstream_path_and_query(&r, "/users", None), "/");
-        assert_eq!(upstream_path_and_query(&r, "/users/", None), "/");
+        assert_eq!(pq(&r, "/users/42", None), "/42");
+        assert_eq!(pq(&r, "/users", None), "/");
+        assert_eq!(pq(&r, "/users/", None), "/");
     }
 
     #[test]
     fn strips_listen_path_onto_target_base_path() {
         let r = route("/users/", "http://u.internal/api/v1/", true, false);
-        assert_eq!(upstream_path_and_query(&r, "/users/42", None), "/api/v1/42");
-        assert_eq!(upstream_path_and_query(&r, "/users", None), "/api/v1");
+        assert_eq!(pq(&r, "/users/42", None), "/api/v1/42");
+        assert_eq!(pq(&r, "/users", None), "/api/v1");
     }
 
     #[test]
     fn no_strip_forwards_full_path() {
         let r = route("/users/", "http://u.internal/base", false, false);
-        assert_eq!(
-            upstream_path_and_query(&r, "/users/42", None),
-            "/base/users/42"
-        );
+        assert_eq!(pq(&r, "/users/42", None), "/base/users/42");
     }
 
     #[test]
     fn query_string_is_forwarded() {
         let r = route("/users/", "http://u.internal", true, false);
-        assert_eq!(
-            upstream_path_and_query(&r, "/users/42", Some("a=1&b=2")),
-            "/42?a=1&b=2"
-        );
+        assert_eq!(pq(&r, "/users/42", Some("a=1&b=2")), "/42?a=1&b=2");
     }
 
     #[test]
     fn root_listen_path_maps_everything() {
         let r = route("/", "http://u.internal", true, false);
-        assert_eq!(
-            upstream_path_and_query(&r, "/any/thing", None),
-            "/any/thing"
-        );
-        assert_eq!(upstream_path_and_query(&r, "/", None), "/");
+        assert_eq!(pq(&r, "/any/thing", None), "/any/thing");
+        assert_eq!(pq(&r, "/", None), "/");
     }
 
     fn route_with_rewrites(target_url: &str, rules: &str) -> UpstreamTarget {
@@ -260,12 +260,9 @@ mod tests {
             "http://u.internal/api/v1",
             r#"[{"pattern": "^/users/(\\d+)/profile$", "rewrite": "/profiles/$1"}]"#,
         );
-        assert_eq!(
-            upstream_path_and_query(&r, "/users/42/profile", None),
-            "/api/v1/profiles/42"
-        );
+        assert_eq!(pq(&r, "/users/42/profile", None), "/api/v1/profiles/42");
         // Non-matching paths keep the normal strip/join.
-        assert_eq!(upstream_path_and_query(&r, "/users/42", None), "/api/v1/42");
+        assert_eq!(pq(&r, "/users/42", None), "/api/v1/42");
     }
 
     #[test]
@@ -275,11 +272,8 @@ mod tests {
             r#"[{"pattern": "^/users/me$", "rewrite": "/self"},
                 {"pattern": "^/users/(\\w+)$", "rewrite": "/accounts/$1"}]"#,
         );
-        assert_eq!(upstream_path_and_query(&r, "/users/me", None), "/self");
-        assert_eq!(
-            upstream_path_and_query(&r, "/users/bob", None),
-            "/accounts/bob"
-        );
+        assert_eq!(pq(&r, "/users/me", None), "/self");
+        assert_eq!(pq(&r, "/users/bob", None), "/accounts/bob");
     }
 
     #[test]
@@ -289,13 +283,10 @@ mod tests {
             r#"[{"pattern": "^/users/legacy$", "rewrite": "/v2/users?compat=1"}]"#,
         );
         assert_eq!(
-            upstream_path_and_query(&r, "/users/legacy", Some("limit=5")),
+            pq(&r, "/users/legacy", Some("limit=5")),
             "/v2/users?compat=1&limit=5"
         );
-        assert_eq!(
-            upstream_path_and_query(&r, "/users/legacy", None),
-            "/v2/users?compat=1"
-        );
+        assert_eq!(pq(&r, "/users/legacy", None), "/v2/users?compat=1");
     }
 
     #[test]
@@ -304,7 +295,7 @@ mod tests {
             "http://u.internal",
             r#"[{"pattern": "^/users/(?<id>\\d+)$", "rewrite": "/people/${id}"}]"#,
         );
-        assert_eq!(upstream_path_and_query(&r, "/users/7", None), "/people/7");
+        assert_eq!(pq(&r, "/users/7", None), "/people/7");
     }
 
     #[test]

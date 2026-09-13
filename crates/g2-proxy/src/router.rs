@@ -318,7 +318,7 @@ mod tests {
         let built = table(vec![d]).expect("build");
         let route = built.match_path("/v/x").expect("route");
         // The route's own target stays the base definition's.
-        assert_eq!(route.target.authority.as_str(), "v1.internal");
+        assert_eq!(route.target.targets[0].authority.as_str(), "v1.internal");
 
         // A broken override fails the build like any invalid definition.
         let mut d = def("versioned", "/v/", "http://v1.internal");
@@ -339,9 +339,10 @@ mod tests {
     fn route_precomputes_target_parts() {
         let table = table(vec![def("a", "/a/", "https://api.internal:8443/base/")]).expect("build");
         let route = table.match_path("/a/x").expect("route");
-        assert_eq!(route.target.scheme.as_str(), "https");
-        assert_eq!(route.target.authority.as_str(), "api.internal:8443");
-        assert_eq!(route.target.base_path, "/base");
+        let addr = &route.target.targets[0];
+        assert_eq!(addr.scheme.as_str(), "https");
+        assert_eq!(addr.authority.as_str(), "api.internal:8443");
+        assert_eq!(addr.base_path, "/base");
     }
 
     #[test]

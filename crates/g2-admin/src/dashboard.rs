@@ -78,6 +78,7 @@ pub(crate) async fn node(State(state): State<AdminState>) -> Response {
                 "org_id": route.def.org_id,
                 "listen_path": route.def.listen_path,
                 "target_url": route.def.target_url,
+                "target_list": route.def.target_list,
                 "auth_mode": route.def.auth.mode_name(),
             })
         })

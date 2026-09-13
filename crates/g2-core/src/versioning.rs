@@ -79,9 +79,18 @@ pub struct VersionOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<u64>,
 
-    /// Replacement upstream base URL for this version.
+    /// Replacement upstream base URL for this version. Rejected at
+    /// validation time when the version's
+    /// effective `target_list` is non-empty — load-balanced traffic never
+    /// reads `target_url`, so the override would silently do nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_url: Option<String>,
+
+    /// Replacement load-balancing target list for this version. An empty
+    /// list disables load balancing for the version, reverting it to its
+    /// effective `target_url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_list: Option<Vec<String>>,
 
     /// Replacement upstream timeout for this version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -172,10 +181,16 @@ impl VersioningConfig {
                 )));
             }
         }
-        for name in self.versions.keys() {
+        for (name, overrides) in &self.versions {
             let effective = self
                 .apply(base, name)
                 .expect("apply() succeeds for every key of the versions map");
+            if overrides.target_url.is_some() && !effective.target_list.is_empty() {
+                return Err(fail(format!(
+                    "version `{name}`: the `target_url` override has no effect while the \
+                     effective `target_list` is non-empty; override `target_list` instead"
+                )));
+            }
             if let Err(Error::InvalidApiDefinition { api, reason }) = effective.validate() {
                 return Err(Error::InvalidApiDefinition {
                     api,
@@ -196,6 +211,9 @@ impl VersioningConfig {
         def.versioning = None;
         if let Some(v) = &overrides.target_url {
             def.target_url = v.clone();
+        }
+        if let Some(v) = &overrides.target_list {
+            def.target_list = v.clone();
         }
         if let Some(v) = overrides.upstream_timeout_ms {
             def.upstream_timeout_ms = v;
@@ -332,6 +350,44 @@ mod tests {
         assert_eq!(v2.auth, base.auth);
 
         assert!(cfg.apply(&base, "v3").is_none());
+    }
+
+    #[test]
+    fn target_list_override_replaces_or_clears_and_guards_target_url() {
+        let mut base = base();
+        base.target_list = vec!["http://a.internal".into(), "http://b.internal".into()];
+
+        // Replacing and clearing the list per version both work.
+        let cfg = versioning(
+            r#"{"versions": {
+                "v1": {"target_list": ["http://c.internal"]},
+                "v2": {"target_list": []}
+            }}"#,
+        );
+        cfg.validate(&base).expect("valid");
+        let v1 = cfg.apply(&base, "v1").expect("configured");
+        assert_eq!(v1.target_list, vec!["http://c.internal".to_owned()]);
+        let v2 = cfg.apply(&base, "v2").expect("configured");
+        assert!(v2.target_list.is_empty(), "empty override clears the list");
+
+        // A target_url override on a load-balanced effective definition
+        // would silently do nothing — rejected, naming the version.
+        let cfg = versioning(r#"{"versions": {"v2": {"target_url": "http://v2.internal"}}}"#);
+        let err = cfg.validate(&base).unwrap_err().to_string();
+        assert!(
+            err.contains("version `v2`") && err.contains("target_list"),
+            "got: {err}"
+        );
+
+        // …but overriding target_url together with an emptied list is fine.
+        let cfg = versioning(
+            r#"{"versions": {"v2": {"target_url": "http://v2.internal", "target_list": []}}}"#,
+        );
+        cfg.validate(&base).expect("valid");
+
+        // A broken list entry fails like any invalid effective definition.
+        let cfg = versioning(r#"{"versions": {"v2": {"target_list": ["nope"]}}}"#);
+        assert!(cfg.validate(&base).is_err());
     }
 
     #[test]

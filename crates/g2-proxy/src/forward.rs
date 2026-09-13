@@ -9,6 +9,7 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -30,6 +31,36 @@ type UpstreamClient = Client<HttpsConnector<HttpConnector>, ProxyBody>;
 use crate::response::error_response;
 use crate::rewrite;
 
+/// The precomputed parts of one upstream base URL: where a request is sent
+/// once an address has been picked from the target's rotation.
+#[derive(Debug, Clone)]
+pub struct UpstreamAddr {
+    /// Upstream scheme parsed from the target URL.
+    pub scheme: Scheme,
+    /// Upstream `host[:port]` parsed from the target URL.
+    pub authority: Authority,
+    /// Upstream base path from the target URL, trailing-slash-trimmed
+    /// (`""` when the URL has no path).
+    pub base_path: String,
+}
+
+impl UpstreamAddr {
+    /// Precomputes the parts of one target URL.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `url` has not passed [`ApiDefinition::validate`]'s target
+    /// URL checks; callers must validate the definition first.
+    fn from_url(url: &str) -> Self {
+        let uri: Uri = url.parse().expect("target URL validated as a URI");
+        Self {
+            scheme: uri.scheme().expect("validated scheme").clone(),
+            authority: uri.authority().expect("validated authority").clone(),
+            base_path: uri.path().trim_end_matches('/').to_owned(),
+        }
+    }
+}
+
 /// Everything about an API's upstream precomputed at route-build time so
 /// forwarding does no per-request parsing.
 #[derive(Debug, Clone)]
@@ -38,12 +69,10 @@ pub struct UpstreamTarget {
     pub api_id: String,
     /// `listen_path` with any trailing `/` removed (`"/users"`; empty for `"/"`).
     pub listen_prefix: String,
-    /// Upstream scheme parsed from `target_url`.
-    pub scheme: Scheme,
-    /// Upstream `host[:port]` parsed from `target_url`.
-    pub authority: Authority,
-    /// Upstream base path from `target_url` (`""` when the URL has no path).
-    pub base_path: String,
+    /// The upstream addresses requests are forwarded to. Never empty: the
+    /// definition's `target_list` when configured, else its single
+    /// `target_url`.
+    pub targets: Vec<UpstreamAddr>,
     /// Whether the listen-path prefix is removed before forwarding.
     pub strip_listen_path: bool,
     /// Whether the client's `Host` header is forwarded unchanged.
@@ -54,15 +83,23 @@ pub struct UpstreamTarget {
     pub(crate) rewrites: Vec<rewrite::CompiledRewrite>,
     /// Method override applied to the upstream-bound request.
     pub(crate) method_override: Option<Method>,
+    /// Round-robin cursor over `targets`, shared across clones so every
+    /// handle to this target advances one rotation.
+    next_target: Arc<AtomicUsize>,
 }
 
 impl UpstreamTarget {
     /// Validates `def` and precomputes its upstream target parts.
     pub(crate) fn build(def: &ApiDefinition) -> Result<Self, Error> {
         def.validate()?;
-        let target = def.target_uri();
-        let scheme = target.scheme().expect("validated scheme").clone();
-        let authority = target.authority().expect("validated authority").clone();
+        let targets = if def.target_list.is_empty() {
+            vec![UpstreamAddr::from_url(&def.target_url)]
+        } else {
+            def.target_list
+                .iter()
+                .map(|url| UpstreamAddr::from_url(url))
+                .collect()
+        };
         let rewrites = def
             .url_rewrites
             .iter()
@@ -83,15 +120,30 @@ impl UpstreamTarget {
         Ok(Self {
             api_id: def.api_id.clone(),
             listen_prefix: def.listen_path.trim_end_matches('/').to_owned(),
-            scheme,
-            authority,
-            base_path: target.path().trim_end_matches('/').to_owned(),
+            targets,
             strip_listen_path: def.strip_listen_path,
             preserve_host_header: def.preserve_host_header,
             timeout: Duration::from_millis(def.upstream_timeout_ms),
             rewrites,
             method_override,
+            next_target: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// The upstream address the next request should use: round-robin across
+    /// [`Self::targets`], pod-local (no cross-pod coordination — each
+    /// gateway process keeps its own rotation).
+    ///
+    /// Single-target APIs skip the atomic entirely, so unbalanced routes pay
+    /// nothing for this feature. The cursor wraps at `usize::MAX`, which can
+    /// skip ahead in the rotation once per ~2^64 requests — harmless.
+    #[must_use]
+    pub fn next_addr(&self) -> &UpstreamAddr {
+        if self.targets.len() == 1 {
+            return &self.targets[0];
+        }
+        let index = self.next_target.fetch_add(1, Ordering::Relaxed) % self.targets.len();
+        &self.targets[index]
     }
 }
 
@@ -204,12 +256,13 @@ async fn forward(
         .get::<ClientAddr>()
         .map_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED), |addr| addr.0.ip());
 
+    let addr = target.next_addr();
     let (mut parts, body) = req.into_parts();
     let path_and_query =
-        rewrite::upstream_path_and_query(target, parts.uri.path(), parts.uri.query());
+        rewrite::upstream_path_and_query(target, addr, parts.uri.path(), parts.uri.query());
     let upstream_uri = Uri::builder()
-        .scheme(target.scheme.clone())
-        .authority(target.authority.clone())
+        .scheme(addr.scheme.clone())
+        .authority(addr.authority.clone())
         .path_and_query(path_and_query)
         .build();
     let upstream_uri = match upstream_uri {
@@ -359,6 +412,44 @@ mod tests {
             .expect("request");
         let resp = svc.oneshot(req).await.expect("infallible");
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn round_robin_rotates_and_shares_across_clones() {
+        let def: ApiDefinition = serde_json::from_str(
+            r#"{"api_id":"lb","name":"lb","listen_path":"/lb/",
+                "target_url":"http://unused.internal",
+                "target_list":["http://a.internal","http://b.internal","http://c.internal"]}"#,
+        )
+        .expect("def");
+        let target = UpstreamTarget::build(&def).expect("target");
+
+        let hosts: Vec<&str> = (0..4)
+            .map(|_| target.next_addr().authority.host())
+            .collect();
+        assert_eq!(
+            hosts,
+            ["a.internal", "b.internal", "c.internal", "a.internal"]
+        );
+
+        // Clones share the cursor: the rotation continues, never restarts.
+        let clone = target.clone();
+        assert_eq!(clone.next_addr().authority.host(), "b.internal");
+        assert_eq!(target.next_addr().authority.host(), "c.internal");
+    }
+
+    #[test]
+    fn single_target_comes_from_target_url() {
+        let def: ApiDefinition = serde_json::from_str(
+            r#"{"api_id":"one","name":"one","listen_path":"/one/",
+                "target_url":"http://only.internal:8080/base"}"#,
+        )
+        .expect("def");
+        let target = UpstreamTarget::build(&def).expect("target");
+        assert_eq!(target.targets.len(), 1);
+        for _ in 0..3 {
+            assert_eq!(target.next_addr().authority.as_str(), "only.internal:8080");
+        }
     }
 
     #[tokio::test]

@@ -257,6 +257,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_balanced_targets_round_robin() {
+        let a = spawn_echo_upstream().await;
+        let b = spawn_echo_upstream().await;
+        // The single target_url is unroutable: proving a 200 means the
+        // target_list actually replaced it. Per-entry base paths are joined.
+        let mut def = def_to("lb", "/lb/", "http://unroutable.invalid");
+        def.target_list = vec![format!("http://{a}/a"), format!("http://{b}/b")];
+        let gw = gateway_for(vec![def]);
+
+        let mut bodies = Vec::new();
+        for _ in 0..4 {
+            let resp = gw.handle(get("/lb/x"), CLIENT).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            bodies.push(body_string(resp).await);
+        }
+        assert_eq!(bodies, ["GET /a/x", "GET /b/x", "GET /a/x", "GET /b/x"]);
+    }
+
+    #[tokio::test]
     async fn unmatched_path_is_404_json() {
         let gw = gateway_for(vec![]);
         let resp = gw.handle(get("/nope"), CLIENT).await;

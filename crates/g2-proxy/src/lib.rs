@@ -15,7 +15,8 @@
 //!    maps the path (regex URL rewrites first, else listen-path strip plus
 //!    upstream base-path join), applies any method transform, removes
 //!    hop-by-hop headers, adds `X-Forwarded-*`, and streams the request to
-//!    the upstream through a shared pooled hyper client ([`Forwarder`],
+//!    one of the upstream's addresses (round-robin across a `target_list`
+//!    when configured) through a shared pooled hyper client ([`Forwarder`],
 //!    speaking TLS to `https://` targets via rustls), enforcing the per-API
 //!    upstream timeout.
 //!
@@ -27,6 +28,6 @@ mod response;
 mod rewrite;
 pub mod router;
 
-pub use forward::{Forwarder, UpstreamTarget};
+pub use forward::{Forwarder, UpstreamAddr, UpstreamTarget};
 pub use gateway::{Gateway, ProxyBody};
 pub use router::{Route, RouteTable};

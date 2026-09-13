@@ -77,7 +77,7 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 ## M7 — Resilience & upstream management
 
 - [x] TLS upstream support (hyper-rustls connector) — removes the M1 https limitation
-- [ ] Load balancing across multiple upstream targets (round-robin)
+- [x] Load balancing across multiple upstream targets (round-robin)
 - [ ] Upstream health checks with eviction
 - [ ] Circuit breaker per route; retries for idempotent methods
 - [ ] Response caching (Redis, per-API TTL, safe methods only)
@@ -616,3 +616,23 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   (rustls in tree; remaining decision is just the fetch client — reusing
   the hyper client vs a one-shot request helper). Next: M7 load balancing
   across multiple upstream targets (round-robin).
+- **2026-08-31 (11)** — M7 round-robin load balancing landed.
+  `ApiDefinition.target_list: Vec<String>` (non-empty = enabled,
+  no separate bool): when set, upstream requests rotate across the list and
+  `target_url` is **not** used for forwarding (it stays
+  required as the canonical/dashboard URL). Each entry is validated like
+  `target_url` and may carry its own base path. Runtime: `UpstreamTarget`
+  now holds `targets: Vec<UpstreamAddr{scheme, authority, base_path}>` plus
+  a clone-shared `Arc<AtomicUsize>` cursor; `next_addr()` is lock-free,
+  pod-local (no cross-pod coordination), and single-target APIs
+  skip the atomic entirely. `rewrite::upstream_path_and_query` takes the
+  selected addr for its base-path join. Versioning: `VersionOverrides`
+  gained `target_list` (wholesale replace; `[]` reverts the version to its
+  `target_url`), and validation **rejects** a `target_url` override whose
+  effective `target_list` is non-empty — it would silently do nothing.
+  `/g2/node` now lists `target_list` per API. e2e test proves A,B,A,B
+  alternation with per-entry base paths and an unroutable `target_url`.
+  Not done (deliberate): weighted/least-conn strategies and per-target
+  health — eviction is exactly the next checkbox (upstream health checks),
+  which should hook into `next_addr()`. Next: M7 upstream health checks
+  with eviction.

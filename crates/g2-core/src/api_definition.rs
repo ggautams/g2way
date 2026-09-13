@@ -291,6 +291,14 @@ pub struct ApiDefinition {
     /// Must be an absolute `http`/`https` URL.
     pub target_url: String,
 
+    /// Upstream base URLs for round-robin load balancing. When non-empty,
+    /// upstream requests rotate across these
+    /// URLs — each gateway pod keeps its own rotation — and [`Self::target_url`]
+    /// is not used for forwarding. Every entry follows `target_url`'s rules
+    /// and may carry its own base path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub target_list: Vec<String>,
+
     /// When `true` (the default), the `listen_path` prefix is removed from the
     /// request path before the request is forwarded upstream.
     #[serde(default = "default_true")]
@@ -406,6 +414,27 @@ pub fn api_definition_key_prefix(org_id: &str) -> String {
     format!("g2:{org_id}:apidef:")
 }
 
+/// Checks that a target URL is an absolute `http`/`https` URL with a host;
+/// the error is a reason fragment the caller prefixes with the field name.
+fn check_target_url(url: &str) -> Result<(), String> {
+    let uri: Uri = url
+        .parse()
+        .map_err(|e| format!("is not a valid URL: {e}"))?;
+    match uri.scheme_str() {
+        Some("http") | Some("https") => {}
+        other => {
+            return Err(format!(
+                "must use http or https, got `{}`",
+                other.unwrap_or("<none>")
+            ));
+        }
+    }
+    if uri.authority().is_none() {
+        return Err("must include a host".into());
+    }
+    Ok(())
+}
+
 impl ApiDefinition {
     /// Validates the semantic invariants that serde cannot express.
     ///
@@ -441,21 +470,13 @@ impl ApiDefinition {
             ));
         }
 
-        let uri: Uri = self
-            .target_url
-            .parse()
-            .map_err(|e| fail(format!("`target_url` is not a valid URL: {e}")))?;
-        match uri.scheme_str() {
-            Some("http") | Some("https") => {}
-            other => {
-                return Err(fail(format!(
-                    "`target_url` must use http or https, got `{}`",
-                    other.unwrap_or("<none>")
-                )));
-            }
+        if let Err(reason) = check_target_url(&self.target_url) {
+            return Err(fail(format!("`target_url` {reason}")));
         }
-        if uri.authority().is_none() {
-            return Err(fail("`target_url` must include a host".into()));
+        for (index, url) in self.target_list.iter().enumerate() {
+            if let Err(reason) = check_target_url(url) {
+                return Err(fail(format!("`target_list[{index}]` {reason}")));
+            }
         }
         self.auth.validate(&self.api_id)?;
         if let Some(transforms) = &self.transform_headers {
@@ -886,6 +907,34 @@ mod tests {
         let mut def = parse(minimal_json());
         def.max_request_body_bytes = Some(0);
         assert!(def.validate().is_err(), "zero size limit");
+    }
+
+    #[test]
+    fn target_list_parses_and_validates() {
+        let json = r#"{
+            "api_id": "lb",
+            "name": "lb",
+            "listen_path": "/lb/",
+            "target_url": "http://primary.internal",
+            "target_list": ["http://a.internal", "https://b.internal:8443/base"]
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        assert_eq!(def.target_list.len(), 2);
+
+        // Optionals stay off the wire when unset (old records unaffected).
+        let bare = serde_json::to_string(&parse(minimal_json())).expect("serializes");
+        assert!(!bare.contains("target_list"), "`target_list` serialized");
+
+        // A broken entry fails validation, naming its index.
+        let mut def = parse(minimal_json());
+        def.target_list = vec!["http://ok.internal".into(), "not-a-url".into()];
+        let err = def.validate().unwrap_err().to_string();
+        assert!(err.contains("target_list[1]"), "got: {err}");
+
+        let mut def = parse(minimal_json());
+        def.target_list = vec!["ftp://x.example".into()];
+        assert!(def.validate().is_err(), "non-http scheme accepted");
     }
 
     #[test]
