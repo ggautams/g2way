@@ -15,6 +15,7 @@ arc-swap.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 http.workspace = true
+http-body.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-rustls.workspace = true

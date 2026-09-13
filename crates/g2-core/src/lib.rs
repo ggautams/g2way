@@ -34,7 +34,8 @@ pub mod versioning;
 
 pub use analytics::AnalyticsRecord;
 pub use api_definition::{
-    ApiDefinition, AuthConfig, HealthCheckConfig, JwtSigningMethod, DEFAULT_ORG_ID,
+    ApiDefinition, AuthConfig, CircuitBreakerConfig, HealthCheckConfig, JwtSigningMethod,
+    DEFAULT_ORG_ID,
 };
 pub use config::{AnalyticsSinkKind, GatewayConfig, SpikeGuardConfig};
 pub use endpoints::{MockResponse, PathRule};

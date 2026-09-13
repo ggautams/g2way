@@ -751,6 +751,7 @@ dependencies = [
  "g2-middleware",
  "g2-storage",
  "http",
+ "http-body",
  "http-body-util",
  "hyper",
  "hyper-rustls",

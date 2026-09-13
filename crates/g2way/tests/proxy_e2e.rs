@@ -400,6 +400,44 @@ async fn request_size_limit_end_to_end() {
 }
 
 #[tokio::test]
+async fn upstream_retries_and_circuit_breaker_end_to_end() {
+    let live = spawn_echo_upstream().await;
+    // Bind-then-drop a listener to obtain a port with nothing behind it.
+    let dead_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind");
+    let dead = dead_listener.local_addr().expect("addr");
+    drop(dead_listener);
+
+    let mut lb = api("/lb/", "http://unused.internal");
+    lb.target_list = vec![format!("http://{dead}"), format!("http://{live}")];
+    lb.upstream_retries = 1;
+    let mut cb = api("/cb/", &format!("http://{dead}"));
+    cb.api_id = "cb".into();
+    cb.circuit_breaker = Some(serde_json::from_str(r#"{"failure_threshold": 2}"#).expect("cfg"));
+    let (gw, _stop) = spawn_gateway(vec![lb, cb]).await;
+
+    // A real client GET has an empty (end-of-stream) body all the way
+    // through the chain, so a dead load-balancing pick is retried against
+    // the live address: every request succeeds.
+    for _ in 0..4 {
+        let (status, body) = http_get(&format!("http://{gw}/lb/ping")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body, "GET /ping len=0");
+    }
+
+    // Two consecutive 502s trip the breaker; the third request is shed
+    // with 503 without contacting the upstream.
+    for _ in 0..2 {
+        let (status, _) = http_get(&format!("http://{gw}/cb/ping")).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+    let (status, body) = http_get(&format!("http://{gw}/cb/ping")).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(body.contains("circuit open"), "got: {body}");
+}
+
+#[tokio::test]
 async fn serves_health_and_404_end_to_end() {
     let (gw, _stop) = spawn_gateway(vec![]).await;
 

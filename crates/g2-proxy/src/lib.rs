@@ -19,10 +19,14 @@
 //!    when configured, skipping addresses evicted by the `health` module's
 //!    active probes) through a shared pooled hyper client ([`Forwarder`],
 //!    speaking TLS to `https://` targets via rustls), enforcing the per-API
-//!    upstream timeout.
+//!    upstream timeout. A route with a circuit breaker (the `breaker`
+//!    module) sheds requests with `503` while its upstream keeps failing on
+//!    live traffic; idempotent empty-body requests can be retried against
+//!    the next address after a transport failure.
 //!
 //! [`Gateway::handle`] is the single entry point the binary calls per request.
 
+mod breaker;
 pub mod forward;
 pub mod gateway;
 mod health;

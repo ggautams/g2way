@@ -158,6 +158,66 @@ impl HealthCheckConfig {
     }
 }
 
+fn default_failure_threshold() -> u32 {
+    5
+}
+
+fn default_breaker_cooldown_ms() -> u64 {
+    30_000
+}
+
+/// Per-route circuit breaking on live traffic (see
+/// [`ApiDefinition::circuit_breaker`]).
+///
+/// Each gateway pod counts consecutive upstream failures — transport errors,
+/// upstream timeouts, and `5xx` upstream responses — for the route. After
+/// `failure_threshold` consecutive failures the circuit *opens*: requests are
+/// rejected with `503` without contacting the upstream for `cooldown_ms`.
+/// The first request after the cooldown is let through as a trial
+/// (*half-open*): its success closes the circuit, its failure re-opens it
+/// for another cooldown. Any upstream success resets the failure count.
+///
+/// A deliberate design choice: rather than a rate-based breaker
+/// (`threshold_percent` over `samples`, per endpoint), this one counts
+/// consecutive failures per route, which needs no sliding sample window and
+/// stays lock-free on the hot path. State is pod-local, like load-balancing
+/// rotation and health eviction.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Consecutive upstream failures after which the circuit opens.
+    /// Defaults to `5`.
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+
+    /// Milliseconds the circuit stays open before a trial request is let
+    /// through. Defaults to `30000`.
+    #[serde(default = "default_breaker_cooldown_ms")]
+    pub cooldown_ms: u64,
+}
+
+impl CircuitBreakerConfig {
+    /// Validates the breaker settings; `api` names the owning definition in
+    /// errors.
+    fn validate(&self, api: &str) -> Result<(), Error> {
+        let fail = |reason: String| Error::InvalidApiDefinition {
+            api: api.to_owned(),
+            reason,
+        };
+        if self.failure_threshold == 0 {
+            return Err(fail(
+                "`circuit_breaker.failure_threshold` must be greater than zero".into(),
+            ));
+        }
+        if self.cooldown_ms == 0 {
+            return Err(fail(
+                "`circuit_breaker.cooldown_ms` must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// JWT signature algorithms supported by [`AuthConfig::Jwt`].
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -507,11 +567,35 @@ pub struct ApiDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check: Option<HealthCheckConfig>,
 
+    /// Optional per-route circuit breaking: after enough consecutive
+    /// upstream failures on live traffic, requests are answered `503`
+    /// without contacting the upstream until a cooldown trial succeeds (see
+    /// [`CircuitBreakerConfig`]). Unset = no breaking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
+
+    /// Additional forwarding attempts after an upstream transport failure
+    /// (connection refused/reset — not timeouts or `5xx` responses), at most
+    /// `10`. Each attempt picks the next load-balancing address. Only
+    /// requests that can be safely replayed are retried: idempotent methods
+    /// (`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`, `TRACE`, after any method
+    /// transform) whose body is empty — a streamed request body cannot be
+    /// re-sent. All attempts share the API's one `upstream_timeout_ms`
+    /// budget. Defaults to `0` (no retries).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub upstream_retries: u32,
+
     /// Optional API versioning: the request header or query parameter that
     /// selects a version, and per-version overrides applied on top of this
     /// definition (see [`VersioningConfig`]). Unset = unversioned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub versioning: Option<VersioningConfig>,
+}
+
+/// Serde helper: keeps default-zero counters off the wire.
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde requires &T")]
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// Storage key holding one API definition: `g2:{org_id}:apidef:{api_id}`.
@@ -628,6 +712,15 @@ impl ApiDefinition {
         }
         if let Some(health) = &self.health_check {
             health.validate(&self.api_id)?;
+        }
+        if let Some(breaker) = &self.circuit_breaker {
+            breaker.validate(&self.api_id)?;
+        }
+        if self.upstream_retries > 10 {
+            return Err(fail(format!(
+                "`upstream_retries` must be at most 10, got {}",
+                self.upstream_retries
+            )));
         }
         // Last, so per-version effective definitions are validated only
         // after the base fields have passed (errors then name the version).
@@ -1129,6 +1222,49 @@ mod tests {
             def.health_check = Some(broken);
             assert!(def.validate().is_err(), "`{label}` accepted");
         }
+    }
+
+    #[test]
+    fn circuit_breaker_and_retries_parse_defaults_and_validate() {
+        let json = r#"{
+            "api_id": "cb",
+            "name": "cb",
+            "listen_path": "/cb/",
+            "target_url": "http://primary.internal",
+            "circuit_breaker": {},
+            "upstream_retries": 2
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        let cb = def.circuit_breaker.as_ref().expect("set");
+        assert_eq!(cb.failure_threshold, 5);
+        assert_eq!(cb.cooldown_ms, 30_000);
+        assert_eq!(def.upstream_retries, 2);
+
+        // Optionals stay off the wire when unset (old records unaffected).
+        let bare = serde_json::to_string(&parse(minimal_json())).expect("serializes");
+        for field in ["circuit_breaker", "upstream_retries"] {
+            assert!(!bare.contains(field), "`{field}` serialized when unset");
+        }
+
+        let mut def = parse(json);
+        def.circuit_breaker = Some(CircuitBreakerConfig {
+            failure_threshold: 0,
+            cooldown_ms: 1000,
+        });
+        assert!(def.validate().is_err(), "zero threshold accepted");
+
+        let mut def = parse(json);
+        def.circuit_breaker = Some(CircuitBreakerConfig {
+            failure_threshold: 5,
+            cooldown_ms: 0,
+        });
+        assert!(def.validate().is_err(), "zero cooldown accepted");
+
+        let mut def = parse(minimal_json());
+        def.upstream_retries = 11;
+        let err = def.validate().unwrap_err().to_string();
+        assert!(err.contains("upstream_retries"), "got: {err}");
     }
 
     #[test]

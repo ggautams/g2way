@@ -73,6 +73,7 @@ impl Modify for SecurityAddon {
         g2_core::MockResponse,
         g2_core::CorsConfig,
         g2_core::HealthCheckConfig,
+        g2_core::CircuitBreakerConfig,
         g2_core::VersioningConfig,
         g2_core::VersionOverrides,
         g2_core::VersionLocation,
@@ -137,6 +138,7 @@ mod tests {
             "MockResponse",
             "CorsConfig",
             "HealthCheckConfig",
+            "CircuitBreakerConfig",
             "VersioningConfig",
             "VersionOverrides",
         ] {

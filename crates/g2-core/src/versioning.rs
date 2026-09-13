@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api_definition::HealthCheckConfig;
+use crate::api_definition::{CircuitBreakerConfig, HealthCheckConfig};
 use crate::endpoints::{MockResponse, PathRule};
 use crate::transform::{HeaderTransforms, UrlRewriteRule};
 use crate::{ApiDefinition, Error};
@@ -128,6 +128,15 @@ pub struct VersionOverrides {
     /// Replacement upstream health-check settings for this version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check: Option<HealthCheckConfig>,
+
+    /// Replacement circuit-breaker settings for this version.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker: Option<CircuitBreakerConfig>,
+
+    /// Replacement upstream retry count for this version (`0` disables
+    /// retries for the version).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_retries: Option<u32>,
 }
 
 impl VersioningConfig {
@@ -246,6 +255,12 @@ impl VersioningConfig {
         }
         if let Some(v) = &overrides.health_check {
             def.health_check = Some(v.clone());
+        }
+        if let Some(v) = &overrides.circuit_breaker {
+            def.circuit_breaker = Some(v.clone());
+        }
+        if let Some(v) = overrides.upstream_retries {
+            def.upstream_retries = v;
         }
         Some(def)
     }
@@ -425,6 +440,43 @@ mod tests {
         let cfg = versioning(r#"{"versions": {"v2": {"health_check": {"interval_ms": 0}}}}"#);
         let err = cfg.validate(&base).unwrap_err().to_string();
         assert!(err.contains("version `v2`"), "got: {err}");
+    }
+
+    #[test]
+    fn circuit_breaker_and_retries_overrides_replace_the_base() {
+        let mut base = base();
+        base.circuit_breaker =
+            Some(serde_json::from_str(r#"{"failure_threshold": 3}"#).expect("breaker JSON"));
+        base.upstream_retries = 2;
+
+        let cfg = versioning(
+            r#"{"versions": {
+                "v1": {},
+                "v2": {"circuit_breaker": {"cooldown_ms": 5000}, "upstream_retries": 0}
+            }}"#,
+        );
+        cfg.validate(&base).expect("valid");
+        let v1 = cfg.apply(&base, "v1").expect("configured");
+        assert_eq!(
+            v1.circuit_breaker
+                .as_ref()
+                .expect("inherited")
+                .failure_threshold,
+            3
+        );
+        assert_eq!(v1.upstream_retries, 2);
+        let v2 = cfg.apply(&base, "v2").expect("configured");
+        let cb = v2.circuit_breaker.as_ref().expect("overridden");
+        assert_eq!((cb.failure_threshold, cb.cooldown_ms), (5, 5000));
+        assert_eq!(v2.upstream_retries, 0, "override disables retries");
+
+        // A broken override fails validation naming the version.
+        let cfg =
+            versioning(r#"{"versions": {"v2": {"circuit_breaker": {"failure_threshold": 0}}}}"#);
+        let err = cfg.validate(&base).unwrap_err().to_string();
+        assert!(err.contains("version `v2`"), "got: {err}");
+        let cfg = versioning(r#"{"versions": {"v2": {"upstream_retries": 99}}}"#);
+        assert!(cfg.validate(&base).is_err());
     }
 
     #[test]

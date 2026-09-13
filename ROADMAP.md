@@ -79,7 +79,7 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 - [x] TLS upstream support (hyper-rustls connector) — removes the M1 https limitation
 - [x] Load balancing across multiple upstream targets (round-robin)
 - [x] Upstream health checks with eviction
-- [ ] Circuit breaker per route; retries for idempotent methods
+- [x] Circuit breaker per route; retries for idempotent methods
 - [ ] Response caching (Redis, per-API TTL, safe methods only)
 
 ## M8+ — Extended parity (re-prioritize with the user)
@@ -664,3 +664,34 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   Next: M7 circuit breaker per route; retries for idempotent methods —
   the breaker can read the same per-address health idea but should trip
   on live traffic, not probes.
+- **2026-08-31 (13)** — M7 circuit breaker + idempotent retries landed.
+  `ApiDefinition.circuit_breaker: Option<CircuitBreakerConfig
+  {failure_threshold=5, cooldown_ms=30000}>` — **a deliberate design
+  choice**: consecutive failures per route (like the health thresholds),
+  not percent-over-samples per endpoint, because a sample window
+  can't be lock-free. Runtime is `g2-proxy::breaker`: classic three-state
+  breaker whose (state, transition-timestamp) live packed in one
+  `AtomicU64` (every transition is a single CAS; failure streak in a
+  separate relaxed counter), consulted only in the forwarder. Failures =
+  transport errors, timeouts, upstream 5xx (final outcome after retries —
+  retries mask per-address failures, health checks own those); open →
+  fast 503 "upstream circuit open" with **no** `UpstreamLatency` stamped;
+  half-open admits one trial via CAS, and an abandoned trial slot
+  (client gone mid-flight) is reclaimed after another cooldown; straggler
+  successes can't close an open circuit. `upstream_retries: u32` (≤10,
+  default 0): extra attempts on **transport failure only** (not timeouts
+  — the one per-API timeout budget spans all attempts — and not 5xx),
+  each attempt re-picks `next_addr()` (synergy with LB + eviction), and
+  only idempotent methods (post-transform) with `is_end_stream()` bodies
+  qualify — a streamed body can't be replayed, so bodied PUTs get one
+  attempt. The forwarder's single-attempt path moves headers instead of
+  cloning (hot-path rule). Both fields get `VersionOverrides` (wholesale;
+  `upstream_retries: 0` disables per version), per-version targets carry
+  their own breaker like health state (base target: none). `/g2/node`
+  APIs now carry `circuit_breaker` ("closed"/"open"/"half_open", null
+  when off/versioned); OpenAPI schema registered. Verified: unit (state
+  machine incl. trial-slot reclaim), forward-level over real TCP (trip on
+  5xx, recover, failed trial re-opens, POST/bodied-PUT not retried), e2e
+  through a full gateway, and **live** (breaker open→trial→closed in
+  `/g2/node` + logs; 6/6 200s against a half-dead LB pool). Next: M7's
+  last box — response caching (Redis, per-API TTL, safe methods only).

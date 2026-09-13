@@ -83,6 +83,10 @@ pub(crate) async fn node(State(state): State<AdminState>) -> Response {
                 // health checking is off or the API is versioned (each
                 // version probes its own target, not surfaced here).
                 "target_health": route.target.target_health(),
+                // Circuit state ("closed"/"open"/"half_open"); null when
+                // breaking is off or the API is versioned (each version
+                // keeps its own circuit, not surfaced here).
+                "circuit_breaker": route.target.breaker_state(),
                 "auth_mode": route.def.auth.mode_name(),
             })
         })
