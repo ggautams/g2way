@@ -80,7 +80,7 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 - [x] Load balancing across multiple upstream targets (round-robin)
 - [x] Upstream health checks with eviction
 - [x] Circuit breaker per route; retries for idempotent methods
-- [ ] Response caching (Redis, per-API TTL, safe methods only)
+- [x] Response caching (Redis, per-API TTL, safe methods only)
 
 ## M8+ — Extended parity (re-prioritize with the user)
 
@@ -695,3 +695,28 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   through a full gateway, and **live** (breaker open→trial→closed in
   `/g2/node` + logs; 6/6 200s against a half-dead LB pool). Next: M7's
   last box — response caching (Redis, per-API TTL, safe methods only).
+- **2026-08-31 (14)** — **M7 complete.** Response caching landed.
+  `ApiDefinition.cache: Option<CacheConfig {ttl_secs=60,
+  max_body_bytes=1MiB}>` (+ `VersionOverrides.cache`, wholesale). Runtime is
+  `CacheLayer` (g2-middleware), between mock and the api-id header — hits
+  stay authed/rate-limited, stored copies are raw upstream responses
+  (response transforms re-apply live), mocks never cached. Entries are JSON
+  (status + base64 headers/body) under `g2:{org}:cache:{scope}:{sha256("
+  METHOD path?query")}` where scope = api_id or `api_id:version`, written
+  with plain `Storage::set` + TTL — **no new Storage ops**, so both
+  backends just work. Cached: safe methods (GET/HEAD/OPTIONS), 2xx only,
+  and **never `Set-Cookie` responses** (a deliberate safety rule: the
+  cache is shared across clients). Fail open on storage errors;
+  corrupt entry = miss + overwrite. A miss adds no latency: the body
+  streams to the client through a recording tee, and a clean completion
+  within the cap spawns a background write. **Gotcha:** hyper never polls a
+  fixed-length body to the final `None` frame (it stops at the declared
+  length), so the tee must also treat frame + `is_end_stream()` as
+  completion — the e2e caught this. Verified live: two gateway processes
+  sharing real Redis — miss on pod A, `x-g2-cache: hit` replay on both
+  pods, per-query keys, POST bypass, TTL 59s in Redis. Not done
+  (deliberate): cache-flush admin endpoint (key schema is prefix-scannable
+  for it), Vary/no-store semantics, per-path cache lists. Next milestone:
+  M8+ extended parity — re-prioritize with the user first; the deferred
+  M2 `jwks_url` box is also still open (TLS landed; needs a fetch-client
+  choice).

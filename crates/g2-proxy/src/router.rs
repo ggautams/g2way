@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{
-    AnalyticsHandle, AnalyticsLayer, AuthLayer, ChainBuilder, ChainService, CorsLayer,
+    AnalyticsHandle, AnalyticsLayer, AuthLayer, CacheLayer, ChainBuilder, ChainService, CorsLayer,
     HeaderTransformLayer, HttpMetrics, IpFilterLayer, MetricsLayer, MockResponseLayer,
     PathPolicyLayer, RateLimitLayer, RequestContext, RequestSizeLimitLayer, SpikeGuard, StatsLayer,
     StatsRegistry, TraceLayer, VersionDispatch,
@@ -18,11 +18,17 @@ use crate::forward::{Forward, Forwarder, UpstreamTarget};
 /// Sets the per-version (inner) layers on `builder` from `def` — the one
 /// place the inner half of a chain is configured, shared by the unversioned
 /// [`ChainBuilder::build`] path and each version of a versioned API.
+///
+/// `cache_scope` namespaces the response cache: the API id for an
+/// unversioned API, `{api_id}:{version}` per version of a versioned one —
+/// versions can differ in upstream and transforms, so they must never share
+/// cached responses.
 fn inner_layers(
     builder: ChainBuilder,
     def: &ApiDefinition,
     storage: &SharedStorage,
     spike_guard: Option<&Arc<SpikeGuard>>,
+    cache_scope: &str,
 ) -> Result<ChainBuilder, Error> {
     let auth = AuthLayer::from_config(&def.auth, Arc::clone(storage), &def.api_id, &def.org_id)?;
     // Keyless APIs carry no session, so there are no limits to read;
@@ -48,13 +54,18 @@ fn inner_layers(
     )?;
     let mock = MockResponseLayer::from_config(&def.mock_responses, &def.api_id)?;
     let size_limit = def.max_request_body_bytes.map(RequestSizeLimitLayer::new);
+    let cache = def
+        .cache
+        .as_ref()
+        .map(|c| CacheLayer::new(c, cache_scope, &def.org_id, Arc::clone(storage)));
     Ok(builder
         .path_policy(path_policy)
         .size_limit(size_limit)
         .auth(auth)
         .rate_limit(rate_limit)
         .transform_headers(transform_headers)
-        .mock(mock))
+        .mock(mock)
+        .cache(cache))
 }
 
 /// One routable API: a validated [`ApiDefinition`] plus everything
@@ -121,7 +132,7 @@ impl Route {
                 if let Some(health) = &def.health_check {
                     crate::health::spawn_checker(forwarder, &target, health);
                 }
-                inner_layers(outer, &def, storage, spike_guard)?
+                inner_layers(outer, &def, storage, spike_guard, &def.api_id)?
                     .build(Forward::new(forwarder, Arc::clone(&target)))
             }
             // A versioned API gets one inner chain per version — each built
@@ -137,9 +148,15 @@ impl Route {
                     if let Some(health) = &vdef.health_check {
                         crate::health::spawn_checker(forwarder, &vtarget, health);
                     }
-                    let inner =
-                        inner_layers(ChainBuilder::new(ctx.clone()), &vdef, storage, spike_guard)?
-                            .build_inner(Forward::new(forwarder, vtarget));
+                    let cache_scope = format!("{}:{name}", vdef.api_id);
+                    let inner = inner_layers(
+                        ChainBuilder::new(ctx.clone()),
+                        &vdef,
+                        storage,
+                        spike_guard,
+                        &cache_scope,
+                    )?
+                    .build_inner(Forward::new(forwarder, vtarget));
                     chains.insert(name.clone(), inner);
                 }
                 outer.build_outer(VersionDispatch::from_config(

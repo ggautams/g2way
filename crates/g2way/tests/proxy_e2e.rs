@@ -211,6 +211,97 @@ async fn path_lists_and_mock_responses_end_to_end() {
 }
 
 #[tokio::test]
+async fn response_caching_end_to_end() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // An upstream that answers with how many requests it has served, so a
+    // replayed (cached) response is distinguishable from a fresh one.
+    let counter = Arc::new(AtomicUsize::new(0));
+    let upstream_counter = Arc::clone(&counter);
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind upstream");
+    let upstream = listener.local_addr().expect("upstream addr");
+    tokio::spawn(async move {
+        loop {
+            let Ok((stream, _)) = listener.accept().await else {
+                break;
+            };
+            let counter = Arc::clone(&upstream_counter);
+            tokio::spawn(async move {
+                let service = service_fn(move |_req: Request<Incoming>| {
+                    let n = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                    async move {
+                        Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(
+                            format!("count={n}"),
+                        ))))
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    let mut def = api("/c/", &format!("http://{upstream}"));
+    def.cache = Some(serde_json::from_str("{}").expect("cache defaults"));
+    def.validate().expect("valid definition");
+    let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+    let (gw, _stop) = spawn_gateway_with_storage(vec![def], Arc::clone(&storage)).await;
+
+    // First request misses and reaches the upstream.
+    let (status, body) = http_get(&format!("http://{gw}/c/data?q=1")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "count=1");
+
+    // The entry is written in the background after the body completes.
+    let mut written = false;
+    for _ in 0..100 {
+        if !g2_storage::Storage::scan_prefix(storage.as_ref(), "g2:default:cache:")
+            .await
+            .expect("scan")
+            .is_empty()
+        {
+            written = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(written, "cache entry never written");
+
+    // The repeat request is served from cache: same body, marked as a hit,
+    // and the upstream is not contacted again.
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let resp = client
+        .get(format!("http://{gw}/c/data?q=1").parse().expect("url"))
+        .await
+        .expect("request");
+    assert_eq!(
+        resp.headers()
+            .get("x-g2-cache")
+            .expect("hit marker")
+            .as_bytes(),
+        b"hit"
+    );
+    let body = resp.collect().await.expect("body").to_bytes();
+    assert_eq!(&body[..], b"count=1");
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "upstream hit again");
+
+    // A different query is a different entry; an unsafe method bypasses the
+    // cache entirely.
+    let (_, body) = http_get(&format!("http://{gw}/c/data?q=2")).await;
+    assert_eq!(body, "count=2");
+    let post_client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let req = Request::post(format!("http://{gw}/c/data?q=1"))
+        .body(Empty::new())
+        .expect("request");
+    let resp = post_client.request(req).await.expect("response");
+    let body = resp.collect().await.expect("body").to_bytes();
+    assert_eq!(&body[..], b"count=3", "POST must not be served from cache");
+}
+
+#[tokio::test]
 async fn api_versioning_end_to_end() {
     let upstream = spawn_echo_upstream().await;
 

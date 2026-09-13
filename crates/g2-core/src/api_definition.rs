@@ -218,6 +218,70 @@ impl CircuitBreakerConfig {
     }
 }
 
+fn default_cache_ttl_secs() -> u64 {
+    60
+}
+
+/// Default cap on cacheable response bodies: 1 MiB.
+const DEFAULT_CACHE_MAX_BODY_BYTES: u64 = 1_048_576;
+
+fn default_cache_max_body_bytes() -> u64 {
+    DEFAULT_CACHE_MAX_BODY_BYTES
+}
+
+/// Response caching for one API (see [`ApiDefinition::cache`]).
+///
+/// The gateway caches upstream responses in storage (shared by every pod)
+/// under [`response_cache_key_prefix`] and answers repeat requests without
+/// contacting the upstream, marking them with an `x-g2-cache: hit` header.
+///
+/// What is cached is deliberately conservative:
+///
+/// - **Safe methods only** (`GET`, `HEAD`, `OPTIONS`). Each method
+///   caches separately.
+/// - **`2xx` responses only**, and never a response carrying `Set-Cookie`:
+///   the cache is shared across clients and keys, so a
+///   per-client response must never be replayed to someone else.
+/// - Bodies larger than `max_body_bytes` are passed through uncached.
+///
+/// Entries are keyed by the exact request method, path, and query (no
+/// normalization: `?a=1&b=2` and `?b=2&a=1` cache separately) and expire
+/// after `ttl_secs`. HTTP cache-control semantics (`Vary`, `no-store`,
+/// `Age`) are not interpreted — the TTL is the whole contract.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CacheConfig {
+    /// Seconds a cached response is served before it expires. Defaults to
+    /// `60`.
+    #[serde(default = "default_cache_ttl_secs")]
+    pub ttl_secs: u64,
+
+    /// Largest response body (in bytes) worth caching; bigger responses are
+    /// streamed through uncached. Defaults to 1 MiB.
+    #[serde(default = "default_cache_max_body_bytes")]
+    pub max_body_bytes: u64,
+}
+
+impl CacheConfig {
+    /// Validates the cache settings; `api` names the owning definition in
+    /// errors.
+    fn validate(&self, api: &str) -> Result<(), Error> {
+        let fail = |reason: String| Error::InvalidApiDefinition {
+            api: api.to_owned(),
+            reason,
+        };
+        if self.ttl_secs == 0 {
+            return Err(fail("`cache.ttl_secs` must be greater than zero".into()));
+        }
+        if self.max_body_bytes == 0 {
+            return Err(fail(
+                "`cache.max_body_bytes` must be greater than zero".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// JWT signature algorithms supported by [`AuthConfig::Jwt`].
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -585,6 +649,13 @@ pub struct ApiDefinition {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub upstream_retries: u32,
 
+    /// Optional response caching: safe-method (`GET`/`HEAD`/`OPTIONS`) `2xx`
+    /// upstream responses are stored in shared storage for a per-API TTL and
+    /// replayed without contacting the upstream (see [`CacheConfig`]).
+    /// Unset = no caching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheConfig>,
+
     /// Optional API versioning: the request header or query parameter that
     /// selects a version, and per-version overrides applied on top of this
     /// definition (see [`VersioningConfig`]). Unset = unversioned.
@@ -612,6 +683,19 @@ pub fn api_definition_storage_key(org_id: &str, api_id: &str) -> String {
 #[must_use]
 pub fn api_definition_key_prefix(org_id: &str) -> String {
     format!("g2:{org_id}:apidef:")
+}
+
+/// Prefix shared by every cached response of one cache scope:
+/// `g2:{org_id}:cache:{scope}:`.
+///
+/// `scope` is the API id for an unversioned API, or `{api_id}:{version}` for
+/// one version of a versioned API — versions can differ in upstream and
+/// transforms, so they must never share entries. The full entry key is this
+/// prefix plus a digest of the request method, path, and query; scoping by
+/// prefix keeps a future flush-by-API admin operation a plain prefix scan.
+#[must_use]
+pub fn response_cache_key_prefix(org_id: &str, scope: &str) -> String {
+    format!("g2:{org_id}:cache:{scope}:")
 }
 
 /// Checks that a target URL is an absolute `http`/`https` URL with a host;
@@ -721,6 +805,9 @@ impl ApiDefinition {
                 "`upstream_retries` must be at most 10, got {}",
                 self.upstream_retries
             )));
+        }
+        if let Some(cache) = &self.cache {
+            cache.validate(&self.api_id)?;
         }
         // Last, so per-version effective definitions are validated only
         // after the base fields have passed (errors then name the version).
@@ -1268,6 +1355,40 @@ mod tests {
     }
 
     #[test]
+    fn cache_parses_defaults_and_validates() {
+        let json = r#"{
+            "api_id": "c",
+            "name": "c",
+            "listen_path": "/c/",
+            "target_url": "http://c.internal",
+            "cache": {}
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        let cache = def.cache.as_ref().expect("set");
+        assert_eq!(cache.ttl_secs, 60);
+        assert_eq!(cache.max_body_bytes, 1_048_576);
+
+        // Optionals stay off the wire when unset (old records unaffected).
+        let bare = serde_json::to_string(&parse(minimal_json())).expect("serializes");
+        assert!(!bare.contains("cache"), "`cache` serialized when unset");
+
+        let mut def = parse(json);
+        def.cache = Some(CacheConfig {
+            ttl_secs: 0,
+            max_body_bytes: 1024,
+        });
+        assert!(def.validate().is_err(), "zero ttl accepted");
+
+        let mut def = parse(json);
+        def.cache = Some(CacheConfig {
+            ttl_secs: 60,
+            max_body_bytes: 0,
+        });
+        assert!(def.validate().is_err(), "zero body cap accepted");
+    }
+
+    #[test]
     fn versioning_parses_and_validates() {
         let json = r#"{
             "api_id": "v",
@@ -1306,6 +1427,10 @@ mod tests {
             "g2:default:apidef:httpbin"
         );
         assert_eq!(api_definition_key_prefix("default"), "g2:default:apidef:");
+        assert_eq!(
+            response_cache_key_prefix("default", "httpbin:v2"),
+            "g2:default:cache:httpbin:v2:"
+        );
     }
 
     #[test]

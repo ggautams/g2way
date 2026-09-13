@@ -9,6 +9,7 @@ use tower::{Service, ServiceBuilder};
 use crate::analytics::AnalyticsLayer;
 use crate::api_id_header::ApiIdHeaderLayer;
 use crate::auth::AuthLayer;
+use crate::cache::CacheLayer;
 use crate::context::RequestContext;
 use crate::cors::CorsLayer;
 use crate::ip_filter::IpFilterLayer;
@@ -62,13 +63,19 @@ use crate::{ChainService, ProxyBody};
 ///     unconfigured). Below auth/rate-limit (mocks on a protected API stay
 ///     protected) and below the header transforms, so mock responses get
 ///     the API's response transforms like any upstream response.
-/// 14. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+/// 14. [`CacheLayer`] — shared response caching for safe requests (absent
+///     when unconfigured). Below auth/rate-limit so cache hits still
+///     require credentials and consume rate, below the header transforms so
+///     the stored copy is the raw upstream response (transforms re-apply
+///     live on every hit), and below mocks so mock responses — already
+///     gateway-local — are never cached.
+/// 15. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
 ///
 /// [`Self::build`] composes the full stack for an unversioned API. A
 /// versioned API splits the stack around its version dispatcher instead:
 /// [`Self::build_outer`] composes the shared, version-independent layers
 /// (items 1–7) around the dispatcher, and [`Self::build_inner`] composes
-/// the per-version layers (items 8–14) around each version's forwarder.
+/// the per-version layers (items 8–15) around each version's forwarder.
 /// The three methods must keep the ordering above consistent.
 #[derive(Debug, Clone)]
 pub struct ChainBuilder {
@@ -85,6 +92,7 @@ pub struct ChainBuilder {
     size_limit: Option<RequestSizeLimitLayer>,
     transform_headers: Option<HeaderTransformLayer>,
     mock: Option<MockResponseLayer>,
+    cache: Option<CacheLayer>,
 }
 
 impl ChainBuilder {
@@ -105,6 +113,7 @@ impl ChainBuilder {
             size_limit: None,
             transform_headers: None,
             mock: None,
+            cache: None,
         }
     }
 
@@ -193,6 +202,13 @@ impl ChainBuilder {
         self
     }
 
+    /// Adds shared response caching (`None` is a no-op).
+    #[must_use]
+    pub fn cache(mut self, cache: Option<CacheLayer>) -> Self {
+        self.cache = cache;
+        self
+    }
+
     /// Wraps `forward` — the innermost service that actually proxies to the
     /// upstream — with this chain's layers, returning the boxed, cloneable
     /// service stored on a route.
@@ -219,6 +235,7 @@ impl ChainBuilder {
             .option_layer(self.rate_limit)
             .option_layer(self.transform_headers)
             .option_layer(self.mock)
+            .option_layer(self.cache)
             .layer(ApiIdHeaderLayer::new())
             .service(forward);
         BoxCloneSyncService::new(svc)
@@ -271,6 +288,7 @@ impl ChainBuilder {
             .option_layer(self.rate_limit)
             .option_layer(self.transform_headers)
             .option_layer(self.mock)
+            .option_layer(self.cache)
             .layer(ApiIdHeaderLayer::new())
             .service(forward);
         BoxCloneSyncService::new(svc)

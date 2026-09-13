@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api_definition::{CircuitBreakerConfig, HealthCheckConfig};
+use crate::api_definition::{CacheConfig, CircuitBreakerConfig, HealthCheckConfig};
 use crate::endpoints::{MockResponse, PathRule};
 use crate::transform::{HeaderTransforms, UrlRewriteRule};
 use crate::{ApiDefinition, Error};
@@ -137,6 +137,11 @@ pub struct VersionOverrides {
     /// retries for the version).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_retries: Option<u32>,
+
+    /// Replacement response-cache settings for this version. Each version
+    /// caches under its own scope, so versions never share entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<CacheConfig>,
 }
 
 impl VersioningConfig {
@@ -261,6 +266,9 @@ impl VersioningConfig {
         }
         if let Some(v) = overrides.upstream_retries {
             def.upstream_retries = v;
+        }
+        if let Some(v) = &overrides.cache {
+            def.cache = Some(v.clone());
         }
         Some(def)
     }
@@ -477,6 +485,30 @@ mod tests {
         assert!(err.contains("version `v2`"), "got: {err}");
         let cfg = versioning(r#"{"versions": {"v2": {"upstream_retries": 99}}}"#);
         assert!(cfg.validate(&base).is_err());
+    }
+
+    #[test]
+    fn cache_override_replaces_the_base_settings() {
+        let mut base = base();
+        base.cache = Some(serde_json::from_str(r#"{"ttl_secs": 30}"#).expect("cache JSON"));
+
+        let cfg = versioning(
+            r#"{"versions": {
+                "v1": {},
+                "v2": {"cache": {"ttl_secs": 5, "max_body_bytes": 1024}}
+            }}"#,
+        );
+        cfg.validate(&base).expect("valid");
+        let v1 = cfg.apply(&base, "v1").expect("configured");
+        assert_eq!(v1.cache.as_ref().expect("inherited").ttl_secs, 30);
+        let v2 = cfg.apply(&base, "v2").expect("configured");
+        let cache = v2.cache.as_ref().expect("overridden");
+        assert_eq!((cache.ttl_secs, cache.max_body_bytes), (5, 1024));
+
+        // A broken override fails validation naming the version.
+        let cfg = versioning(r#"{"versions": {"v2": {"cache": {"ttl_secs": 0}}}}"#);
+        let err = cfg.validate(&base).unwrap_err().to_string();
+        assert!(err.contains("version `v2`"), "got: {err}");
     }
 
     #[test]
