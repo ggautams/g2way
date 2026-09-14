@@ -1,9 +1,16 @@
-//! JWKS (RFC 7517) key fetching and caching for JWT auth.
+//! JWKS (RFC 7517) key fetching and caching for JWT and OIDC auth.
 //!
 //! An API configured with `auth.jwks_url` verifies RS256 tokens against keys
 //! fetched from that URL instead of a static PEM. Keys live in a pod-local
 //! `kid → DecodingKey` map behind an [`ArcSwap`], read lock-free on the hot
 //! path (ADR-0001) and replaced wholesale by refreshes.
+//!
+//! The OIDC mode reuses the same cache but usually knows only the issuer:
+//! `JwksCache::via_discovery` resolves the JWKS URL lazily on the first
+//! refresh by fetching `{issuer}/.well-known/openid-configuration`,
+//! requiring the document's `issuer` to match the configured one exactly,
+//! and pins the resolved `jwks_uri` for the route's lifetime (a config
+//! reload rebuilds the route and re-discovers).
 //!
 //! Refresh happens two ways:
 //!
@@ -58,10 +65,29 @@ pub type SharedJwksFetch = Arc<dyn JwksFetch>;
 /// Minimum seconds between fetches triggered by unknown-`kid` cache misses.
 pub(crate) const MISS_REFETCH_COOLDOWN_SECS: u64 = 10;
 
+/// Where the key set is fetched from.
+enum JwksEndpoint {
+    /// A JWKS URL known at config time.
+    Url(String),
+    /// An OIDC issuer whose JWKS URL is resolved from the discovery
+    /// document on the first successful refresh, then pinned.
+    Discovery {
+        issuer_url: String,
+        resolved: std::sync::OnceLock<String>,
+    },
+}
+
+/// The two fields of an OIDC discovery document the gateway reads.
+#[derive(serde::Deserialize)]
+struct DiscoveryDoc {
+    issuer: String,
+    jwks_uri: String,
+}
+
 /// Pod-local `kid → DecodingKey` cache for one API's JWKS endpoint.
 pub(crate) struct JwksCache {
     api_id: Arc<str>,
-    url: String,
+    endpoint: JwksEndpoint,
     fetcher: SharedJwksFetch,
     /// Current key set; starts empty until the first successful fetch.
     keys: ArcSwap<HashMap<String, DecodingKey>>,
@@ -72,13 +98,89 @@ pub(crate) struct JwksCache {
 impl JwksCache {
     /// A cache for `url`, initially empty.
     pub(crate) fn new(api_id: &str, url: String, fetcher: SharedJwksFetch) -> Self {
+        Self::with_endpoint(api_id, JwksEndpoint::Url(url), fetcher)
+    }
+
+    /// A cache that discovers its JWKS URL from `issuer_url`'s OIDC
+    /// discovery document, initially empty.
+    pub(crate) fn via_discovery(
+        api_id: &str,
+        issuer_url: String,
+        fetcher: SharedJwksFetch,
+    ) -> Self {
+        Self::with_endpoint(
+            api_id,
+            JwksEndpoint::Discovery {
+                issuer_url,
+                resolved: std::sync::OnceLock::new(),
+            },
+            fetcher,
+        )
+    }
+
+    fn with_endpoint(api_id: &str, endpoint: JwksEndpoint, fetcher: SharedJwksFetch) -> Self {
         Self {
             api_id: api_id.into(),
-            url,
+            endpoint,
             fetcher,
             keys: ArcSwap::from_pointee(HashMap::new()),
             last_attempt_secs: AtomicU64::new(0),
         }
+    }
+
+    /// The endpoint as it is best known right now, for log lines: the JWKS
+    /// URL, or the issuer while discovery has not resolved one yet.
+    fn endpoint_desc(&self) -> &str {
+        match &self.endpoint {
+            JwksEndpoint::Url(url) => url,
+            JwksEndpoint::Discovery {
+                issuer_url,
+                resolved,
+            } => resolved.get().map_or(issuer_url.as_str(), String::as_str),
+        }
+    }
+
+    /// Resolves the JWKS URL, running OIDC discovery on first use.
+    ///
+    /// The resolved URI is pinned for the cache's lifetime — identity
+    /// providers do not move it, and a config reload rebuilds the route
+    /// (and this cache) anyway. Discovery failures leave it unresolved so
+    /// the next refresh retries.
+    async fn jwks_url(&self) -> Result<String, String> {
+        let JwksEndpoint::Discovery {
+            issuer_url,
+            resolved,
+        } = &self.endpoint
+        else {
+            let JwksEndpoint::Url(url) = &self.endpoint else {
+                unreachable!("endpoint is either Url or Discovery");
+            };
+            return Ok(url.clone());
+        };
+        if let Some(url) = resolved.get() {
+            return Ok(url.clone());
+        }
+        // OIDC Discovery §4: the well-known path is appended to the issuer
+        // (one trailing slash trimmed); the `iss` claim match elsewhere
+        // stays byte-exact.
+        let base = issuer_url.strip_suffix('/').unwrap_or(issuer_url);
+        let discovery_url = format!("{base}/.well-known/openid-configuration");
+        let body = self.fetcher.fetch(&discovery_url).await?;
+        let doc: DiscoveryDoc = serde_json::from_slice(&body)
+            .map_err(|e| format!("response is not a valid OIDC discovery document: {e}"))?;
+        if doc.issuer != *issuer_url {
+            return Err(format!(
+                "discovery document issuer `{}` does not match configured issuer `{issuer_url}`",
+                doc.issuer
+            ));
+        }
+        // A concurrent refresh may have resolved it first; both read the
+        // same provider, so first write wins.
+        let _ = resolved.set(doc.jwks_uri);
+        Ok(resolved
+            .get()
+            .cloned()
+            .expect("a OnceLock that was just set is non-empty"))
     }
 
     /// Fetches and swaps in the key set, returning how many keys it holds.
@@ -90,7 +192,8 @@ impl JwksCache {
     pub(crate) async fn refresh(&self) -> Result<usize, String> {
         self.last_attempt_secs
             .store(unix_now_secs(), Ordering::Relaxed);
-        let body = self.fetcher.fetch(&self.url).await?;
+        let url = self.jwks_url().await?;
+        let body = self.fetcher.fetch(&url).await?;
         let set: JwkSet = serde_json::from_slice(&body)
             .map_err(|e| format!("response is not a valid JWKS document: {e}"))?;
 
@@ -146,7 +249,7 @@ impl JwksCache {
             if let Err(e) = self.refresh().await {
                 tracing::warn!(
                     api_id = %self.api_id,
-                    url = %self.url,
+                    url = %self.endpoint_desc(),
                     error = %e,
                     "JWKS refetch after unknown kid failed"
                 );
@@ -209,7 +312,7 @@ async fn refresh_once(weak: &Weak<JwksCache>) -> bool {
         Err(e) => {
             tracing::warn!(
                 api_id = %cache.api_id,
-                url = %cache.url,
+                url = %cache.endpoint_desc(),
                 error = %e,
                 "JWKS refresh failed; keeping previous keys"
             );
@@ -222,7 +325,7 @@ impl std::fmt::Debug for JwksCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("JwksCache")
             .field("api_id", &self.api_id)
-            .field("url", &self.url)
+            .field("url", &self.endpoint_desc())
             .field("keys", &self.debug_key_count())
             .finish_non_exhaustive() // key material and fetcher stay unprintable
     }
@@ -235,18 +338,23 @@ pub(crate) mod test_support {
     use std::sync::atomic::AtomicUsize;
     use std::sync::Mutex;
 
-    /// Programmable in-memory fetcher: serves the current payload and counts
-    /// calls.
+    /// Programmable in-memory fetcher: serves the current payload (or a
+    /// per-URL route when one is set) and counts calls, in total and per
+    /// URL.
     pub(crate) struct FakeFetch {
         body: Mutex<Result<bytes::Bytes, String>>,
+        routes: Mutex<HashMap<String, Result<bytes::Bytes, String>>>,
         calls: AtomicUsize,
+        calls_by_url: Mutex<HashMap<String, usize>>,
     }
 
     impl FakeFetch {
         pub(crate) fn new(body: Result<&str, &str>) -> Arc<Self> {
             let fake = Self {
                 body: Mutex::new(Err(String::new())),
+                routes: Mutex::new(HashMap::new()),
                 calls: AtomicUsize::new(0),
+                calls_by_url: Mutex::new(HashMap::new()),
             };
             fake.set_body(body);
             Arc::new(fake)
@@ -258,15 +366,47 @@ pub(crate) mod test_support {
                 .map_err(str::to_owned);
         }
 
+        /// Serves `body` for requests to exactly `url` (other URLs keep
+        /// getting the default body).
+        pub(crate) fn set_route(&self, url: &str, body: Result<&str, &str>) {
+            self.routes.lock().unwrap().insert(
+                url.to_owned(),
+                body.map(|b| bytes::Bytes::from(b.to_owned()))
+                    .map_err(str::to_owned),
+            );
+        }
+
         pub(crate) fn calls(&self) -> usize {
             self.calls.load(Ordering::Relaxed)
+        }
+
+        /// How many times exactly `url` was fetched.
+        pub(crate) fn calls_to(&self, url: &str) -> usize {
+            self.calls_by_url
+                .lock()
+                .unwrap()
+                .get(url)
+                .copied()
+                .unwrap_or(0)
         }
     }
 
     impl JwksFetch for FakeFetch {
-        fn fetch(&self, _url: &str) -> JwksFetchFuture {
+        fn fetch(&self, url: &str) -> JwksFetchFuture {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            let body = self.body.lock().unwrap().clone();
+            *self
+                .calls_by_url
+                .lock()
+                .unwrap()
+                .entry(url.to_owned())
+                .or_insert(0) += 1;
+            let body = self
+                .routes
+                .lock()
+                .unwrap()
+                .get(url)
+                .cloned()
+                .unwrap_or_else(|| self.body.lock().unwrap().clone());
             Box::pin(async move { body })
         }
     }
@@ -394,6 +534,84 @@ mod tests {
             .await
             .expect("task exits once the cache is dropped")
             .expect("task does not panic");
+    }
+
+    const ISSUER: &str = "http://idp.internal/realm";
+    const DISCOVERY_URL: &str = "http://idp.internal/realm/.well-known/openid-configuration";
+    const KEYS_URL: &str = "http://idp.internal/realm/keys";
+
+    fn discovery_doc(issuer: &str) -> String {
+        format!(r#"{{"issuer":"{issuer}","jwks_uri":"{KEYS_URL}"}}"#)
+    }
+
+    fn discovery_cache(fetch: &Arc<FakeFetch>) -> JwksCache {
+        JwksCache::via_discovery("api", ISSUER.into(), Arc::clone(fetch) as SharedJwksFetch)
+    }
+
+    #[tokio::test]
+    async fn discovery_resolves_jwks_uri_once_then_loads_keys() {
+        let fetch = FakeFetch::new(Err("unrouted URL"));
+        fetch.set_route(DISCOVERY_URL, Ok(&discovery_doc(ISSUER)));
+        fetch.set_route(KEYS_URL, Ok(&jwks_json("k1")));
+        let cache = discovery_cache(&fetch);
+
+        assert_eq!(cache.refresh().await.expect("refresh works"), 1);
+        assert!(cache.key_for("k1").await.is_some());
+        assert_eq!(fetch.calls_to(DISCOVERY_URL), 1);
+        assert_eq!(fetch.calls_to(KEYS_URL), 1);
+
+        // The jwks_uri is pinned: later refreshes skip discovery.
+        cache.refresh().await.expect("second refresh works");
+        assert_eq!(fetch.calls_to(DISCOVERY_URL), 1, "discovery is pinned");
+        assert_eq!(fetch.calls_to(KEYS_URL), 2);
+    }
+
+    #[tokio::test]
+    async fn discovery_trims_one_trailing_slash_for_the_wellknown_url() {
+        // Configured issuer ends in `/`; the discovery URL must not get a
+        // double slash, but the issuer match stays byte-exact.
+        let issuer = format!("{ISSUER}/");
+        let fetch = FakeFetch::new(Err("unrouted URL"));
+        fetch.set_route(DISCOVERY_URL, Ok(&discovery_doc(&issuer)));
+        fetch.set_route(KEYS_URL, Ok(&jwks_json("k1")));
+        let cache = JwksCache::via_discovery("api", issuer, Arc::clone(&fetch) as SharedJwksFetch);
+
+        assert_eq!(cache.refresh().await.expect("refresh works"), 1);
+        assert_eq!(fetch.calls_to(DISCOVERY_URL), 1);
+    }
+
+    #[tokio::test]
+    async fn discovery_issuer_mismatch_is_an_error() {
+        let fetch = FakeFetch::new(Err("unrouted URL"));
+        fetch.set_route(DISCOVERY_URL, Ok(&discovery_doc("http://evil.example")));
+        fetch.set_route(KEYS_URL, Ok(&jwks_json("k1")));
+        let cache = discovery_cache(&fetch);
+
+        assert!(cache.refresh().await.is_err());
+        assert!(cache.key_for("k1").await.is_none(), "no keys were loaded");
+        assert_eq!(fetch.calls_to(KEYS_URL), 0, "jwks_uri is never trusted");
+    }
+
+    #[tokio::test]
+    async fn discovery_failure_is_retried_on_the_next_refresh() {
+        let fetch = FakeFetch::new(Err("unrouted URL"));
+        fetch.set_route(DISCOVERY_URL, Err("IdP down"));
+        fetch.set_route(KEYS_URL, Ok(&jwks_json("k1")));
+        let cache = discovery_cache(&fetch);
+
+        assert!(cache.refresh().await.is_err());
+        // The IdP comes back: the unresolved endpoint retries discovery.
+        fetch.set_route(DISCOVERY_URL, Ok(&discovery_doc(ISSUER)));
+        assert_eq!(cache.refresh().await.expect("refresh works"), 1);
+        assert_eq!(fetch.calls_to(DISCOVERY_URL), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_discovery_document_is_an_error() {
+        let fetch = FakeFetch::new(Err("unrouted URL"));
+        fetch.set_route(DISCOVERY_URL, Ok(r#"{"issuer": 42}"#));
+        let cache = discovery_cache(&fetch);
+        assert!(cache.refresh().await.is_err());
     }
 
     #[test]

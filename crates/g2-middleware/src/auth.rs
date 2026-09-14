@@ -13,6 +13,15 @@
 //!   cached pod-locally (see [`jwks`](crate::jwks)). Its claims are turned
 //!   into an ephemeral session: no storage lookup, `expires_at` from `exp`,
 //!   alias from the identity claim, access restricted to this API.
+//! - **`oidc`** — like `jwt` with `jwks_url`, but shaped for an external
+//!   OpenID Connect provider: RS256 keys come from the issuer's discovery
+//!   document (or a direct `jwks_url`), and the precompiled validation
+//!   additionally requires byte-exact `iss` and intersecting `aud` claims.
+//!   Claims become an ephemeral session exactly like `jwt` (identity under
+//!   an `oidc:` namespace); when a `policy_map` is configured, the client
+//!   id read from `policy_claim` must map to a stored active
+//!   [`Policy`], whose rate/quota/access replace the ephemeral session's
+//!   (unmapped client ids are rejected).
 //! - **`basic_auth`** — RFC 7617 `Authorization: Basic base64(user:pass)`.
 //!   The username (hashed under a `basic:` namespace) resolves to a stored
 //!   session whose `basic_auth.password_hash` the presented password is
@@ -52,16 +61,20 @@
 //!   client).
 //! - `403` — token unknown or fails verification, wrong password, session
 //!   inactive/expired, the session does not grant this API, or its policy
-//!   is missing or inactive. One message for all of these: which one it
-//!   was must not leak to the caller (details are logged). Unknown
-//!   basic-auth users still cost one bcrypt verify (against a dummy hash)
-//!   so response timing does not reveal whether a username exists.
+//!   is missing or inactive. For oidc this also covers every claims
+//!   rejection (wrong or missing `iss`/`aud`/`exp`, unknown `kid`, wrong
+//!   algorithm) and every policy-mapping rejection (policy claim missing
+//!   or unmapped). One message for all of these: which one it was must not
+//!   leak to the caller (details are logged). Unknown basic-auth users
+//!   still cost one bcrypt verify (against a dummy hash) so response
+//!   timing does not reveal whether a username exists.
 //! - `503` — the storage backend errored; the request may be retried.
 //! - `500` — the stored session or policy record is corrupt (not valid
 //!   JSON, disagrees with its storage key, references multiple policies)
 //!   or a stored bcrypt hash is malformed (operational bugs, logged
 //!   loudly).
 
+use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::future::Future;
 use std::pin::Pin;
@@ -127,6 +140,24 @@ enum Mode {
         /// Claim used as the caller identity.
         identity_claim: String,
     },
+    /// `oidc`: verify the bearer token against the issuer's JWKS keys,
+    /// with issuer/audience validation and optional client-id→policy
+    /// mapping.
+    Oidc {
+        /// Header carrying the token.
+        header: HeaderName,
+        /// Key cache — always JWKS-backed (discovery or direct URL).
+        cache: Arc<JwksCache>,
+        /// Precompiled RS256 validation with `iss`/`aud`/`exp` required.
+        validation: Box<Validation>,
+        /// Claim used as the caller identity.
+        identity_claim: String,
+        /// Client-id→policy mapping; `None` when the definition configured
+        /// none.
+        policy_mapping: Option<PolicyMapping>,
+        /// For fetching mapped policies.
+        storage: SharedStorage,
+    },
     /// `basic_auth`: resolve the username in storage, bcrypt-verify the
     /// password.
     Basic {
@@ -138,6 +169,15 @@ enum Mode {
     /// fingerprint (from the request's `ConnectionInfo` extension) in
     /// storage.
     Mtls { storage: SharedStorage },
+}
+
+/// The oidc mode's client-id→policy mapping, present when configured.
+struct PolicyMapping {
+    /// Claim holding the OAuth2 client id (`policy_claim` in the config).
+    claim: String,
+    /// Client id → policy id; tokens with an unmapped client id are
+    /// rejected (deny-unmatched).
+    map: BTreeMap<String, String>,
 }
 
 /// Where the JWT mode's verification keys come from.
@@ -153,6 +193,7 @@ impl std::fmt::Debug for AuthState {
         let mode = match &self.mode {
             Mode::Token { .. } => "token",
             Mode::Jwt { .. } => "jwt",
+            Mode::Oidc { .. } => "oidc",
             Mode::Basic { .. } => "basic",
             Mode::Mtls { .. } => "mtls",
         };
@@ -265,6 +306,51 @@ impl AuthLayer {
                     keys,
                     validation: Box::new(validation),
                     identity_claim: identity_claim.clone(),
+                }
+            }
+            AuthConfig::Oidc {
+                issuer_url,
+                audiences,
+                jwks_url,
+                jwks_refresh_secs,
+                header,
+                identity_claim,
+                policy_claim,
+                policy_map,
+            } => {
+                let fetcher = jwks_fetcher.ok_or_else(|| {
+                    invalid("`oidc` auth is configured but no JWKS fetcher is available".into())
+                })?;
+                let cache = Arc::new(match jwks_url {
+                    Some(url) => JwksCache::new(api_id, url.clone(), fetcher),
+                    None => JwksCache::via_discovery(api_id, issuer_url.clone(), fetcher),
+                });
+                let interval =
+                    Duration::from_secs(jwks_refresh_secs.unwrap_or(DEFAULT_JWKS_REFRESH_SECS));
+                // The route's AuthState Arc keeps the cache alive; a config
+                // reload drops it and the task self-exits.
+                JwksCache::spawn_refresher(&cache, interval);
+
+                let mut validation = Validation::new(Algorithm::RS256);
+                validation.set_issuer(std::slice::from_ref(issuer_url));
+                // `aud` must always be validated here: with jsonwebtoken's
+                // `validate_aud` on (the default) but no expected set, any
+                // token carrying an `aud` claim would be rejected — and
+                // turning it off would accept tokens minted for other
+                // consumers. Definition validation guarantees non-empty.
+                validation.set_audience(audiences);
+                validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+                let policy_mapping = (!policy_map.is_empty()).then(|| PolicyMapping {
+                    claim: policy_claim.clone(),
+                    map: policy_map.clone(),
+                });
+                Mode::Oidc {
+                    header: parse_header(header)?,
+                    cache,
+                    validation: Box::new(validation),
+                    identity_claim: identity_claim.clone(),
+                    policy_mapping,
+                    storage,
                 }
             }
             AuthConfig::BasicAuth { realm } => {
@@ -399,6 +485,28 @@ async fn authenticate(
                     authenticate_jwt(state, &key, validation, identity_claim, &token)
                 }
             }
+        }
+        Mode::Oidc {
+            header,
+            cache,
+            validation,
+            identity_claim,
+            policy_mapping,
+            storage,
+        } => {
+            let token = extract_token(header, None, None, req).ok_or_else(|| {
+                json_error(StatusCode::UNAUTHORIZED, "authorization field missing")
+            })?;
+            let key = resolve_jwks_key(state, cache, &token).await?;
+            let claims = verify_jwt_claims(state, &key, validation, &token)?;
+            build_oidc_session(
+                state,
+                &claims,
+                identity_claim,
+                policy_mapping.as_ref(),
+                storage,
+            )
+            .await
         }
         Mode::Basic { challenge, storage } => {
             authenticate_basic(state, storage, challenge, req).await
@@ -580,7 +688,25 @@ async fn resolve_policy(
         }
     };
 
-    let storage_key = policy_storage_key(&session.org_id, policy_id);
+    let policy = fetch_active_policy(state, storage, &session.org_id, policy_id).await?;
+    session.apply_policy(&policy);
+    Ok(session)
+}
+
+/// Fetches `policy_id` from storage and checks it is well-formed and
+/// active. Shared by the stored-session path ([`resolve_policy`]) and the
+/// oidc client-id mapping.
+///
+/// Rejections mirror the session-lookup contract: missing or inactive →
+/// no-oracle 403 (logged), corrupt or misfiled record → 500, storage
+/// failure → 503.
+async fn fetch_active_policy(
+    state: &AuthState,
+    storage: &SharedStorage,
+    org_id: &str,
+    policy_id: &str,
+) -> Result<Policy, Response<ProxyBody>> {
+    let storage_key = policy_storage_key(org_id, policy_id);
     let record = storage.get(&storage_key).await.map_err(|e| {
         tracing::error!(api_id = %state.api_id, error = %e, "policy storage lookup failed");
         json_error(StatusCode::SERVICE_UNAVAILABLE, "key storage unavailable")
@@ -589,7 +715,7 @@ async fn resolve_policy(
         tracing::error!(
             api_id = %state.api_id,
             policy_id,
-            "key session references a policy that does not exist"
+            "credential references a policy that does not exist"
         );
         return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
     };
@@ -597,7 +723,7 @@ async fn resolve_policy(
         tracing::error!(policy_id, error = %e, "stored policy is not valid JSON");
         json_error(StatusCode::INTERNAL_SERVER_ERROR, "malformed policy record")
     })?;
-    if policy.org_id != session.org_id || policy.policy_id != *policy_id {
+    if policy.org_id != org_id || policy.policy_id != policy_id {
         tracing::error!(
             policy_id,
             record_policy_id = %policy.policy_id,
@@ -610,12 +736,10 @@ async fn resolve_policy(
         ));
     }
     if !policy.active {
-        tracing::debug!(api_id = %state.api_id, policy_id, "policy is inactive; rejecting key");
+        tracing::debug!(api_id = %state.api_id, policy_id, "policy is inactive; rejecting");
         return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
     }
-
-    session.apply_policy(&policy);
-    Ok(session)
+    Ok(policy)
 }
 
 /// `jwt` mode with `jwks_url`: resolve the token's `kid` to a cached JWKS
@@ -657,12 +781,7 @@ fn authenticate_jwt(
     identity_claim: &str,
     token: &str,
 ) -> Result<SessionContext, Response<ProxyBody>> {
-    let claims = jsonwebtoken::decode::<serde_json::Value>(token, decoding_key, validation)
-        .map_err(|e| {
-            tracing::debug!(api_id = %state.api_id, error = %e, "JWT rejected");
-            json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG)
-        })?
-        .claims;
+    let claims = verify_jwt_claims(state, decoding_key, validation, token)?;
 
     let Some(identity) = claims.get(identity_claim).and_then(|v| v.as_str()) else {
         tracing::debug!(
@@ -685,6 +804,93 @@ fn authenticate_jwt(
     // The `jwt:` prefix keeps JWT identities from ever colliding with the
     // hash of a real stored token in later rate-limit/quota counters.
     let key_hash = hash_key(&format!("jwt:{identity}"));
+    Ok(SessionContext::new(session, key_hash))
+}
+
+/// Decodes and verifies `token` against `validation`, returning its claims.
+///
+/// Signature, algorithm, and every claim check the validation was built
+/// with (`exp` always; `iss`/`aud` for oidc) all fail into the shared
+/// no-oracle 403.
+// The large Err is a rejection Response built once on the cold path.
+#[allow(clippy::result_large_err)]
+fn verify_jwt_claims(
+    state: &AuthState,
+    decoding_key: &DecodingKey,
+    validation: &Validation,
+    token: &str,
+) -> Result<serde_json::Value, Response<ProxyBody>> {
+    jsonwebtoken::decode::<serde_json::Value>(token, decoding_key, validation)
+        .map(|data| data.claims)
+        .map_err(|e| {
+            tracing::debug!(api_id = %state.api_id, error = %e, "JWT rejected");
+            json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG)
+        })
+}
+
+/// `oidc` mode, after signature and claims verification: synthesize the
+/// ephemeral session (like `jwt`, under the `oidc:` namespace) and apply
+/// the client-id→policy mapping when one is configured.
+async fn build_oidc_session(
+    state: &AuthState,
+    claims: &serde_json::Value,
+    identity_claim: &str,
+    policy_mapping: Option<&PolicyMapping>,
+    storage: &SharedStorage,
+) -> Result<SessionContext, Response<ProxyBody>> {
+    let Some(identity) = claims.get(identity_claim).and_then(|v| v.as_str()) else {
+        tracing::debug!(
+            api_id = %state.api_id,
+            identity_claim,
+            "OIDC token valid but identity claim missing or not a string"
+        );
+        return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+    };
+    // `exp` presence and freshness were enforced by the validation.
+    let expires_at = claims.get("exp").and_then(serde_json::Value::as_u64);
+
+    let mut session = KeySession {
+        org_id: state.org_id.to_string(),
+        alias: Some(identity.to_owned()),
+        expires_at,
+        access: std::iter::once((state.api_id.to_string(), Default::default())).collect(),
+        ..KeySession::default()
+    };
+
+    if let Some(mapping) = policy_mapping {
+        let Some(client_id) = claims.get(&mapping.claim).and_then(|v| v.as_str()) else {
+            tracing::debug!(
+                api_id = %state.api_id,
+                policy_claim = %mapping.claim,
+                "OIDC token has no string client-id claim for policy mapping"
+            );
+            return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+        };
+        let Some(policy_id) = mapping.map.get(client_id) else {
+            tracing::debug!(
+                api_id = %state.api_id,
+                client_id,
+                "OIDC client id is not mapped to a policy"
+            );
+            return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+        };
+        let policy = fetch_active_policy(state, storage, &session.org_id, policy_id).await?;
+        // The policy's ACL replaces the session's this-API-only default,
+        // so it can also revoke access to this API.
+        session.apply_policy(&policy);
+        if !session.allows_api(&state.api_id) {
+            tracing::debug!(
+                api_id = %state.api_id,
+                policy_id,
+                "mapped policy does not grant this API"
+            );
+            return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+        }
+    }
+
+    // The `oidc:` prefix keeps OIDC identities from colliding with stored
+    // token hashes or `jwt:` identities in rate-limit/quota counters.
+    let key_hash = hash_key(&format!("oidc:{identity}"));
     Ok(SessionContext::new(session, key_hash))
 }
 
@@ -855,6 +1061,57 @@ mod tests {
 
     fn request(uri: &str) -> Request<ProxyBody> {
         Request::builder().uri(uri).body(body()).expect("request")
+    }
+
+    /// Throwaway RSA keypair generated for these tests only; shared by the
+    /// jwt and oidc modules.
+    const TEST_RSA_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC9vQS0xUUdaCmm
+2MuakxbnoUGSCzeKns0F3C3x7I/CSuPV1ckdPIGfOoveNs+mSHI6Z5MwR4SvJcxu
+wJZz8dmd9UXHLhr/R2MpOA5cLMdS7ZyVfKrUC0blvWuJ9Un8M2ONmtx97L6c9k07
+1HD9MX9NVJlsKKOhF7hvuL+C5Wc8dUsE8TjnHkZ4pCQcHB5eY1BEzHXA0uZqTgsy
+4+YfqQ9cT4O+XPVlnPPGuyNe94F/NGqDH0ogfQjc9AEqPVsrOoyejY/oBHmwhSrf
+7d8lDzTN6M2KR9L6mZUKUafCKdxw9cfyI/RQRpQq0SK6aeN4/LOiCpvliI+U6Lfd
+2MsWr7T/AgMBAAECggEAB5UVKhA0Gd++wl8pi8zS/oCwOSDfoFeGQ/SvlVppyE7r
+2fDIL7XqTC2vxzqTg8ajYfgfpq9E+ybci5SArrN8idZyampKQ+dbbBtEX6Sedo7u
+Uf8AaKbmt2mhcYru4PhAwzjsFNAwMd+Z6Ikt1sByoOl/lBXvrBFhmn1ckeOPA5hu
+j6n2AZyG/nePtFU0y9gi1FTDECM8B2dliQyCzU7LvjpCCbRD0EiKYP7ZpUzIHC65
+9WR6RRC3onLe28CueTD3QvAvYsP4QeeiI5wDpvYmLQvowGovRbiAVOHDRqG08gtY
+cZSpyVuKmyi6kkRL19wbsTxdyH+elP6Chg1SUowP2QKBgQD/V/SCRSeGV8RrC2AR
+rTtujEu73sTOY4kMaDz6LqVk9O3SbqL0ZG1fHP+bah+rA/4LjHbPozbH8d1DXrNc
+cVOHoYnVsWp4NWvv7n5OnVUVxr7arbvsX+dDPlcdMQTRyaAV0zL0SmHQN3jqPzb4
+BuEqlH6eCzYCngHRi7la3G0X5QKBgQC+OeM7zmL+yPHjG2XS6yBjF6adDrJK/PQE
+g+DmfD7lPtEAMnh2cXZ7ADdpcdHu0uha2LRvyCZq1e0SMBFzWd8ny7TQTxn0ZR24
+6mIMxO+sWfKLtN4J/37/Qrt6mHo4hXxbIg8SAaiOgxkaLhbbAkobWM51NySaAKru
+Fez21p5DEwKBgG1No1cYb0Ds1SHVbrxiYWyDFfBH/gszRHlRLbkSuq4qwpsvzQW8
+76ylZy2KEiBMxzT+XeWoQkz41fR+11ydDlqi5bPaDG+Evr2oY90XMFLwDsbhU+5t
+Zzu7teLDFwMOwj5VeBxmstREyrfLc6Zcm4p0onbY6bfZF4Ixw5iHfxOZAoGAEwGN
+pqgUVAiXwm02W0CK19vBFegmAEAN0XWrvtujHRyNnUttpcfoYpm+75Yjt4zzEkCc
+pp6E2B/PtAWBeNj95uf/hOCiYzzHH3arnUL//2RtS3AizzTr520vdixN6d/McP6S
+KuZnhPWsSGVaez9bUCgrWKLN0WVHrsoaBv+iiGkCgYEA+y+XusCUErqu/bqzzEYj
+Oih8/7hU7lA0CEIx65jqY15F5Q2QDXv/s6j0JKdcWtSkdqq6w/yEbp/AHE8uamLo
+OXYCPHHq5blRvGxnz1qnmVPHyVEYVjdboJiavY1gbwtK+wCBPS85htaRuFxFb9LD
+NO+F4qDaW22QCAuvcoMJMDE=
+-----END PRIVATE KEY-----";
+
+    const TEST_RSA_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvb0EtMVFHWgpptjLmpMW
+56FBkgs3ip7NBdwt8eyPwkrj1dXJHTyBnzqL3jbPpkhyOmeTMEeEryXMbsCWc/HZ
+nfVFxy4a/0djKTgOXCzHUu2clXyq1AtG5b1rifVJ/DNjjZrcfey+nPZNO9Rw/TF/
+TVSZbCijoRe4b7i/guVnPHVLBPE45x5GeKQkHBweXmNQRMx1wNLmak4LMuPmH6kP
+XE+Dvlz1ZZzzxrsjXveBfzRqgx9KIH0I3PQBKj1bKzqMno2P6AR5sIUq3+3fJQ80
+zejNikfS+pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq+0
+/wIDAQAB
+-----END PUBLIC KEY-----";
+
+    /// Base64url modulus of [`TEST_RSA_PUBLIC_PEM`]; pasted once and
+    /// drift-guarded by `jwt::jwks::jwk_material_matches_the_test_rsa_pem`.
+    const TEST_RSA_N: &str = "vb0EtMVFHWgpptjLmpMW56FBkgs3ip7NBdwt8eyPwkrj1dXJHTyBnzqL3jbPpkhyOmeTMEeEryXMbsCWc_HZnfVFxy4a_0djKTgOXCzHUu2clXyq1AtG5b1rifVJ_DNjjZrcfey-nPZNO9Rw_TF_TVSZbCijoRe4b7i_guVnPHVLBPE45x5GeKQkHBweXmNQRMx1wNLmak4LMuPmH6kPXE-Dvlz1ZZzzxrsjXveBfzRqgx9KIH0I3PQBKj1bKzqMno2P6AR5sIUq3-3fJQ80zejNikfS-pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq-0_w";
+
+    fn jwks_json(kid: &str) -> String {
+        format!(
+            r#"{{"keys":[{{"kty":"RSA","kid":"{kid}","alg":"RS256","use":"sig","n":"{TEST_RSA_N}","e":"AQAB"}}]}}"#
+        )
     }
 
     #[test]
@@ -1295,46 +1552,6 @@ mod tests {
 
         use super::*;
 
-        /// Throwaway RSA keypair generated for these tests only.
-        const TEST_RSA_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----
-MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC9vQS0xUUdaCmm
-2MuakxbnoUGSCzeKns0F3C3x7I/CSuPV1ckdPIGfOoveNs+mSHI6Z5MwR4SvJcxu
-wJZz8dmd9UXHLhr/R2MpOA5cLMdS7ZyVfKrUC0blvWuJ9Un8M2ONmtx97L6c9k07
-1HD9MX9NVJlsKKOhF7hvuL+C5Wc8dUsE8TjnHkZ4pCQcHB5eY1BEzHXA0uZqTgsy
-4+YfqQ9cT4O+XPVlnPPGuyNe94F/NGqDH0ogfQjc9AEqPVsrOoyejY/oBHmwhSrf
-7d8lDzTN6M2KR9L6mZUKUafCKdxw9cfyI/RQRpQq0SK6aeN4/LOiCpvliI+U6Lfd
-2MsWr7T/AgMBAAECggEAB5UVKhA0Gd++wl8pi8zS/oCwOSDfoFeGQ/SvlVppyE7r
-2fDIL7XqTC2vxzqTg8ajYfgfpq9E+ybci5SArrN8idZyampKQ+dbbBtEX6Sedo7u
-Uf8AaKbmt2mhcYru4PhAwzjsFNAwMd+Z6Ikt1sByoOl/lBXvrBFhmn1ckeOPA5hu
-j6n2AZyG/nePtFU0y9gi1FTDECM8B2dliQyCzU7LvjpCCbRD0EiKYP7ZpUzIHC65
-9WR6RRC3onLe28CueTD3QvAvYsP4QeeiI5wDpvYmLQvowGovRbiAVOHDRqG08gtY
-cZSpyVuKmyi6kkRL19wbsTxdyH+elP6Chg1SUowP2QKBgQD/V/SCRSeGV8RrC2AR
-rTtujEu73sTOY4kMaDz6LqVk9O3SbqL0ZG1fHP+bah+rA/4LjHbPozbH8d1DXrNc
-cVOHoYnVsWp4NWvv7n5OnVUVxr7arbvsX+dDPlcdMQTRyaAV0zL0SmHQN3jqPzb4
-BuEqlH6eCzYCngHRi7la3G0X5QKBgQC+OeM7zmL+yPHjG2XS6yBjF6adDrJK/PQE
-g+DmfD7lPtEAMnh2cXZ7ADdpcdHu0uha2LRvyCZq1e0SMBFzWd8ny7TQTxn0ZR24
-6mIMxO+sWfKLtN4J/37/Qrt6mHo4hXxbIg8SAaiOgxkaLhbbAkobWM51NySaAKru
-Fez21p5DEwKBgG1No1cYb0Ds1SHVbrxiYWyDFfBH/gszRHlRLbkSuq4qwpsvzQW8
-76ylZy2KEiBMxzT+XeWoQkz41fR+11ydDlqi5bPaDG+Evr2oY90XMFLwDsbhU+5t
-Zzu7teLDFwMOwj5VeBxmstREyrfLc6Zcm4p0onbY6bfZF4Ixw5iHfxOZAoGAEwGN
-pqgUVAiXwm02W0CK19vBFegmAEAN0XWrvtujHRyNnUttpcfoYpm+75Yjt4zzEkCc
-pp6E2B/PtAWBeNj95uf/hOCiYzzHH3arnUL//2RtS3AizzTr520vdixN6d/McP6S
-KuZnhPWsSGVaez9bUCgrWKLN0WVHrsoaBv+iiGkCgYEA+y+XusCUErqu/bqzzEYj
-Oih8/7hU7lA0CEIx65jqY15F5Q2QDXv/s6j0JKdcWtSkdqq6w/yEbp/AHE8uamLo
-OXYCPHHq5blRvGxnz1qnmVPHyVEYVjdboJiavY1gbwtK+wCBPS85htaRuFxFb9LD
-NO+F4qDaW22QCAuvcoMJMDE=
------END PRIVATE KEY-----";
-
-        const TEST_RSA_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAvb0EtMVFHWgpptjLmpMW
-56FBkgs3ip7NBdwt8eyPwkrj1dXJHTyBnzqL3jbPpkhyOmeTMEeEryXMbsCWc/HZ
-nfVFxy4a/0djKTgOXCzHUu2clXyq1AtG5b1rifVJ/DNjjZrcfey+nPZNO9Rw/TF/
-TVSZbCijoRe4b7i/guVnPHVLBPE45x5GeKQkHBweXmNQRMx1wNLmak4LMuPmH6kP
-XE+Dvlz1ZZzzxrsjXveBfzRqgx9KIH0I3PQBKj1bKzqMno2P6AR5sIUq3+3fJQ80
-zejNikfS+pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq+0
-/wIDAQAB
------END PUBLIC KEY-----";
-
         const SECRET: &str = "test-hs256-secret";
 
         fn hs256_cfg() -> AuthConfig {
@@ -1479,16 +1696,6 @@ zejNikfS+pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq+0
         mod jwks {
             use super::*;
             use crate::jwks::test_support::FakeFetch;
-
-            /// Base64url modulus of [`TEST_RSA_PUBLIC_PEM`]; pasted once and
-            /// drift-guarded by `jwk_material_matches_the_test_rsa_pem`.
-            const TEST_RSA_N: &str = "vb0EtMVFHWgpptjLmpMW56FBkgs3ip7NBdwt8eyPwkrj1dXJHTyBnzqL3jbPpkhyOmeTMEeEryXMbsCWc_HZnfVFxy4a_0djKTgOXCzHUu2clXyq1AtG5b1rifVJ_DNjjZrcfey-nPZNO9Rw_TF_TVSZbCijoRe4b7i_guVnPHVLBPE45x5GeKQkHBweXmNQRMx1wNLmak4LMuPmH6kPXE-Dvlz1ZZzzxrsjXveBfzRqgx9KIH0I3PQBKj1bKzqMno2P6AR5sIUq3-3fJQ80zejNikfS-pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq-0_w";
-
-            fn jwks_json(kid: &str) -> String {
-                format!(
-                    r#"{{"keys":[{{"kty":"RSA","kid":"{kid}","alg":"RS256","use":"sig","n":"{TEST_RSA_N}","e":"AQAB"}}]}}"#
-                )
-            }
 
             fn rs256_token(kid: &str, claims: &serde_json::Value) -> String {
                 let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
@@ -1692,6 +1899,391 @@ zejNikfS+pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq+0
                     AuthLayer::from_config(&cfg, Arc::new(MemoryStorage::new()), API, ORG, None);
                 assert!(err.is_err());
             }
+        }
+    }
+
+    mod oidc {
+        use g2_core::session::RateLimit;
+        use jsonwebtoken::{encode, EncodingKey, Header};
+
+        use super::*;
+        use crate::jwks::test_support::FakeFetch;
+
+        const ISSUER: &str = "http://idp.internal/realm";
+        const AUDIENCE: &str = "g2way-api";
+        const KID: &str = "k1";
+
+        fn future_exp() -> u64 {
+            unix_now_secs() + 3600
+        }
+
+        fn good_claims() -> serde_json::Value {
+            serde_json::json!({
+                "sub": "dana",
+                "iss": ISSUER,
+                "aud": AUDIENCE,
+                "exp": future_exp(),
+            })
+        }
+
+        fn rs256_token(kid: Option<&str>, claims: &serde_json::Value) -> String {
+            let mut header = Header::new(jsonwebtoken::Algorithm::RS256);
+            header.kid = kid.map(Into::into);
+            encode(
+                &header,
+                claims,
+                &EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes()).expect("private key"),
+            )
+            .expect("encode rs256")
+        }
+
+        fn oidc_validation() -> Box<Validation> {
+            let mut validation = Validation::new(Algorithm::RS256);
+            validation.set_issuer(&[ISSUER]);
+            validation.set_audience(&[AUDIENCE]);
+            validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+            Box::new(validation)
+        }
+
+        /// Builds an oidc-mode service directly around a FakeFetch-backed
+        /// cache, bypassing `from_config` so tests never race the
+        /// background refresher (same pattern as `jwt::jwks`).
+        fn oidc_service(
+            storage: MemoryStorage,
+            policy_map: &[(&str, &str)],
+        ) -> crate::ChainService {
+            let fetch = FakeFetch::new(Ok(&jwks_json(KID)));
+            let cache = Arc::new(JwksCache::new(
+                API,
+                "http://idp.internal/keys".into(),
+                Arc::clone(&fetch) as SharedJwksFetch,
+            ));
+            let policy_mapping = (!policy_map.is_empty()).then(|| PolicyMapping {
+                claim: "azp".into(),
+                map: policy_map
+                    .iter()
+                    .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                    .collect(),
+            });
+            let layer = AuthLayer {
+                state: Arc::new(AuthState {
+                    api_id: API.into(),
+                    org_id: ORG.into(),
+                    mode: Mode::Oidc {
+                        header: HeaderName::from_static("authorization"),
+                        cache,
+                        validation: oidc_validation(),
+                        identity_claim: "sub".into(),
+                        policy_mapping,
+                        storage: Arc::new(storage),
+                    },
+                }),
+            };
+            crate::ChainService::new(layer.layer(tower::service_fn(require_session)))
+        }
+
+        async fn call(svc: crate::ChainService, token: &str) -> Response<ProxyBody> {
+            let mut req = request("/x");
+            req.headers_mut().insert(
+                "authorization",
+                format!("Bearer {token}").parse().expect("value"),
+            );
+            svc.oneshot(req).await.expect("infallible")
+        }
+
+        async fn seed_policy(storage: &MemoryStorage, policy: &Policy) {
+            storage
+                .set(
+                    &policy_storage_key(&policy.org_id, &policy.policy_id),
+                    &serde_json::to_string(policy).expect("json"),
+                    None,
+                )
+                .await
+                .expect("seed policy");
+        }
+
+        fn policy(policy_id: &str, access_api: Option<&str>, active: bool) -> Policy {
+            Policy {
+                policy_id: policy_id.into(),
+                name: policy_id.into(),
+                org_id: ORG.into(),
+                active,
+                rate: Some(RateLimit {
+                    requests: 100,
+                    per_seconds: 60,
+                }),
+                quota: None,
+                access: access_api
+                    .map(|api| [(api.to_owned(), Default::default())].into())
+                    .unwrap_or_default(),
+            }
+        }
+
+        #[tokio::test]
+        async fn valid_token_builds_session_from_claims() {
+            let resp = oidc_call_no_policy(&good_claims()).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers()
+                    .get("x-echo-alias")
+                    .expect("alias")
+                    .as_bytes(),
+                b"dana"
+            );
+        }
+
+        async fn oidc_call_no_policy(claims: &serde_json::Value) -> Response<ProxyBody> {
+            call(
+                oidc_service(MemoryStorage::new(), &[]),
+                &rs256_token(Some(KID), claims),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn missing_token_is_401() {
+            let resp = oidc_service(MemoryStorage::new(), &[])
+                .oneshot(request("/x"))
+                .await
+                .expect("infallible");
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn claims_rejections_are_403() {
+            let mut wrong_iss = good_claims();
+            wrong_iss["iss"] = "http://evil.example".into();
+            let mut missing_iss = good_claims();
+            missing_iss.as_object_mut().expect("object").remove("iss");
+            let mut wrong_aud = good_claims();
+            wrong_aud["aud"] = "someone-else".into();
+            let mut missing_aud = good_claims();
+            missing_aud.as_object_mut().expect("object").remove("aud");
+            let mut expired = good_claims();
+            expired["exp"] = (unix_now_secs() - 600).into();
+            let mut missing_exp = good_claims();
+            missing_exp.as_object_mut().expect("object").remove("exp");
+            let mut identity_missing = good_claims();
+            identity_missing
+                .as_object_mut()
+                .expect("object")
+                .remove("sub");
+
+            for (name, claims) in [
+                ("wrong iss", wrong_iss),
+                ("missing iss", missing_iss),
+                ("wrong aud", wrong_aud),
+                ("missing aud", missing_aud),
+                ("expired", expired),
+                ("missing exp", missing_exp),
+                ("identity claim missing", identity_missing),
+            ] {
+                let resp = oidc_call_no_policy(&claims).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "case: {name}");
+            }
+
+            // Kid problems: absent, and not in the key set.
+            for (name, kid) in [("no kid", None), ("unknown kid", Some("ghost"))] {
+                let resp = call(
+                    oidc_service(MemoryStorage::new(), &[]),
+                    &rs256_token(kid, &good_claims()),
+                )
+                .await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "case: {name}");
+            }
+
+            // Alg confusion: an HS256 token with a resolvable kid.
+            let header = Header {
+                kid: Some(KID.into()),
+                ..Header::default()
+            };
+            let hs256 = encode(
+                &header,
+                &good_claims(),
+                &EncodingKey::from_secret(b"shared-secret"),
+            )
+            .expect("encode hs256");
+            let resp = call(oidc_service(MemoryStorage::new(), &[]), &hs256).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "case: alg confusion");
+        }
+
+        #[tokio::test]
+        async fn token_with_multiple_audiences_passes_on_any_match() {
+            let mut claims = good_claims();
+            claims["aud"] = serde_json::json!(["someone-else", AUDIENCE]);
+            let resp = oidc_call_no_policy(&claims).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn identity_uses_the_oidc_namespace_and_this_api_access() {
+            let storage: SharedStorage = Arc::new(MemoryStorage::new());
+            let state = AuthState {
+                api_id: API.into(),
+                org_id: ORG.into(),
+                mode: Mode::Mtls {
+                    storage: Arc::clone(&storage),
+                },
+            };
+            let ctx = build_oidc_session(&state, &good_claims(), "sub", None, &storage)
+                .await
+                .expect("session");
+            assert_eq!(ctx.key_hash(), hash_key("oidc:dana"));
+            assert!(ctx.session().allows_api(API));
+            assert!(!ctx.session().allows_api("some-other-api"));
+            assert_eq!(ctx.session().expires_at, good_claims()["exp"].as_u64());
+        }
+
+        #[tokio::test]
+        async fn mapped_policy_applies_rate_and_access() {
+            let storage = MemoryStorage::new();
+            seed_policy(&storage, &policy("gold", Some(API), true)).await;
+            let mut claims = good_claims();
+            claims["azp"] = "client-a".into();
+
+            let svc = oidc_service(storage, &[("client-a", "gold")]);
+            let resp = call(svc, &rs256_token(Some(KID), &claims)).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert_eq!(
+                resp.headers().get("x-echo-rate").expect("rate").as_bytes(),
+                b"100/60"
+            );
+        }
+
+        #[tokio::test]
+        async fn policy_mapping_rejections() {
+            // Every case configures the mapping `client-a → gold`.
+            let mut mapped = good_claims();
+            mapped["azp"] = "client-a".into();
+
+            // Unmapped client id.
+            let storage = MemoryStorage::new();
+            seed_policy(&storage, &policy("gold", Some(API), true)).await;
+            let mut unmapped = good_claims();
+            unmapped["azp"] = "stranger".into();
+            let resp = call(
+                oidc_service(storage, &[("client-a", "gold")]),
+                &rs256_token(Some(KID), &unmapped),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "unmapped client id");
+
+            // Policy claim missing entirely.
+            let storage = MemoryStorage::new();
+            seed_policy(&storage, &policy("gold", Some(API), true)).await;
+            let resp = call(
+                oidc_service(storage, &[("client-a", "gold")]),
+                &rs256_token(Some(KID), &good_claims()),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "missing policy claim");
+
+            // Mapped policy does not exist in storage.
+            let resp = call(
+                oidc_service(MemoryStorage::new(), &[("client-a", "gold")]),
+                &rs256_token(Some(KID), &mapped),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "missing policy");
+
+            // Mapped policy is inactive (tier kill switch).
+            let storage = MemoryStorage::new();
+            seed_policy(&storage, &policy("gold", Some(API), false)).await;
+            let resp = call(
+                oidc_service(storage, &[("client-a", "gold")]),
+                &rs256_token(Some(KID), &mapped),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "inactive policy");
+
+            // Mapped policy grants a different API only: the policy ACL
+            // replaced the ephemeral this-API grant, so access is revoked.
+            let storage = MemoryStorage::new();
+            seed_policy(&storage, &policy("gold", Some("some-other-api"), true)).await;
+            let resp = call(
+                oidc_service(storage, &[("client-a", "gold")]),
+                &rs256_token(Some(KID), &mapped),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "policy revokes API");
+        }
+
+        #[tokio::test]
+        async fn corrupt_policy_record_is_500() {
+            let storage = MemoryStorage::new();
+            storage
+                .set(&policy_storage_key(ORG, "gold"), "{not json", None)
+                .await
+                .expect("seed");
+            let mut claims = good_claims();
+            claims["azp"] = "client-a".into();
+            let resp = call(
+                oidc_service(storage, &[("client-a", "gold")]),
+                &rs256_token(Some(KID), &claims),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        }
+
+        #[tokio::test]
+        async fn from_config_discovers_and_verifies_tokens() {
+            // Full wiring through from_config with OIDC discovery: the
+            // fetcher serves the discovery document and the key set.
+            let fetch = FakeFetch::new(Err("unrouted URL"));
+            fetch.set_route(
+                "http://idp.internal/realm/.well-known/openid-configuration",
+                Ok(&format!(
+                    r#"{{"issuer":"{ISSUER}","jwks_uri":"http://idp.internal/realm/keys"}}"#
+                )),
+            );
+            fetch.set_route("http://idp.internal/realm/keys", Ok(&jwks_json(KID)));
+
+            let cfg = AuthConfig::Oidc {
+                issuer_url: ISSUER.into(),
+                audiences: vec![AUDIENCE.into()],
+                jwks_url: None,
+                jwks_refresh_secs: None,
+                header: "Authorization".into(),
+                identity_claim: "sub".into(),
+                policy_claim: "azp".into(),
+                policy_map: Default::default(),
+            };
+            let layer = AuthLayer::from_config(
+                &cfg,
+                Arc::new(MemoryStorage::new()),
+                API,
+                ORG,
+                Some(Arc::clone(&fetch) as SharedJwksFetch),
+            )
+            .expect("valid cfg")
+            .expect("oidc mode");
+            let svc = crate::ChainService::new(layer.layer(tower::service_fn(require_session)));
+
+            let mut req = request("/x");
+            req.headers_mut().insert(
+                "authorization",
+                format!("Bearer {}", rs256_token(Some(KID), &good_claims()))
+                    .parse()
+                    .expect("value"),
+            );
+            let resp = svc.oneshot(req).await.expect("infallible");
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[test]
+        fn oidc_without_a_fetcher_fails_layer_construction() {
+            let cfg = AuthConfig::Oidc {
+                issuer_url: ISSUER.into(),
+                audiences: vec![AUDIENCE.into()],
+                jwks_url: None,
+                jwks_refresh_secs: None,
+                header: "Authorization".into(),
+                identity_claim: "sub".into(),
+                policy_claim: "azp".into(),
+                policy_map: Default::default(),
+            };
+            let err = AuthLayer::from_config(&cfg, Arc::new(MemoryStorage::new()), API, ORG, None);
+            assert!(err.is_err());
         }
     }
 

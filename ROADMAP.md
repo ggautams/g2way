@@ -85,7 +85,10 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 ## M8+ — Extended parity (re-prioritize with the user)
 
 - [x] TLS termination & mTLS client certificates (ADR-0003, `docs/tls.md`)
-- [ ] OAuth2/OIDC, HMAC signatures, per-endpoint rate limits
+- [x] OAuth2/OIDC: external-IdP token validation (discovery + JWKS,
+      iss/aud checks, client-id→policy mapping; `docs/oidc.md`)
+- [ ] HMAC request signatures
+- [ ] Per-endpoint rate limits
 - [ ] WebSocket/SSE passthrough; gRPC passthrough
 - [ ] Plugin system (WASM pre/post hooks — needs an ADR first)
 - [ ] Service discovery; request/response body transforms
@@ -832,3 +835,29 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   M8+ WebSocket box first), UDG/federation, GraphQL-aware caching, APQ,
   batching (a JSON-array envelope is rejected). Next: the remaining M8+/M9
   boxes — re-prioritize with the user.
+- **2026-09-01** — M8+ OAuth2/OIDC landed (`docs/oidc.md`); the combined
+  "OAuth2/OIDC, HMAC signatures, per-endpoint rate limits" box was **split
+  into three** (user-confirmed scope: OIDC first). Shape is external-IdP
+  validation only — deliberately no gateway-hosted authorization server
+  (would be its own box if ever wanted). `AuthConfig::Oidc {issuer_url,
+  audiences (required non-empty), jwks_url?, jwks_refresh_secs?, header,
+  identity_claim, policy_claim="azp", policy_map}`. Discovery lives in
+  `JwksCache` (new `via_discovery`): the well-known doc is fetched through
+  the existing `JwksFetch` trait on the first refresh, its `issuer` must
+  match byte-exactly, and `jwks_uri` is pinned in a `OnceLock` until a
+  reload. Verification reuses the jwt machinery (`verify_jwt_claims`
+  extracted) with precomputed `iss`/`aud`/`exp`-required `Validation`;
+  identity namespace is `oidc:{identity}`. Policy mapping resolves through
+  `fetch_active_policy` (extracted from `resolve_policy`, same
+  403/500/503 contract); ephemeral-session-with-policy is a first (jwt
+  sessions still never carry policies). **Gotcha:** jsonwebtoken 10's
+  default `validate_aud=true` + no expected audience rejects any
+  aud-bearing token — that's why `audiences` is required (also a
+  deliberate hardening choice, as is single-claim client-id mapping
+  instead of aud/azp heuristics). **Boot race worth knowing:** on a
+  fresh route, requests can 403 until the eager background key fetch
+  lands (on-miss refetch is cooldown-gated behind it) — the e2e polls for
+  it; same pre-existing behavior as jwt+jwks. RS256-only (JWKS filter
+  unchanged); ES256 is a cheap follow-up. No ADR (JWKS precedent), no
+  OpenAPI changes (inline variant). Next: M8+ HMAC request signatures or
+  per-endpoint rate limits.

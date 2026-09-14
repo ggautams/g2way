@@ -836,3 +836,182 @@ NO+F4qDaW22QCAuvcoMJMDE=
     .await
     .expect("rotated key is picked up by the periodic refresh");
 }
+
+/// OIDC end to end: a fake IdP serves the discovery document and the JWKS;
+/// the gateway validates iss/aud, maps the client id to a stored policy,
+/// and proxies only compliant tokens.
+#[tokio::test]
+async fn oidc_end_to_end() {
+    use g2_core::policy::policy_storage_key;
+    use g2_core::Policy;
+
+    // Same throwaway keypair as `jwt_jwks_end_to_end`.
+    const TEST_RSA_PRIVATE_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC9vQS0xUUdaCmm
+2MuakxbnoUGSCzeKns0F3C3x7I/CSuPV1ckdPIGfOoveNs+mSHI6Z5MwR4SvJcxu
+wJZz8dmd9UXHLhr/R2MpOA5cLMdS7ZyVfKrUC0blvWuJ9Un8M2ONmtx97L6c9k07
+1HD9MX9NVJlsKKOhF7hvuL+C5Wc8dUsE8TjnHkZ4pCQcHB5eY1BEzHXA0uZqTgsy
+4+YfqQ9cT4O+XPVlnPPGuyNe94F/NGqDH0ogfQjc9AEqPVsrOoyejY/oBHmwhSrf
+7d8lDzTN6M2KR9L6mZUKUafCKdxw9cfyI/RQRpQq0SK6aeN4/LOiCpvliI+U6Lfd
+2MsWr7T/AgMBAAECggEAB5UVKhA0Gd++wl8pi8zS/oCwOSDfoFeGQ/SvlVppyE7r
+2fDIL7XqTC2vxzqTg8ajYfgfpq9E+ybci5SArrN8idZyampKQ+dbbBtEX6Sedo7u
+Uf8AaKbmt2mhcYru4PhAwzjsFNAwMd+Z6Ikt1sByoOl/lBXvrBFhmn1ckeOPA5hu
+j6n2AZyG/nePtFU0y9gi1FTDECM8B2dliQyCzU7LvjpCCbRD0EiKYP7ZpUzIHC65
+9WR6RRC3onLe28CueTD3QvAvYsP4QeeiI5wDpvYmLQvowGovRbiAVOHDRqG08gtY
+cZSpyVuKmyi6kkRL19wbsTxdyH+elP6Chg1SUowP2QKBgQD/V/SCRSeGV8RrC2AR
+rTtujEu73sTOY4kMaDz6LqVk9O3SbqL0ZG1fHP+bah+rA/4LjHbPozbH8d1DXrNc
+cVOHoYnVsWp4NWvv7n5OnVUVxr7arbvsX+dDPlcdMQTRyaAV0zL0SmHQN3jqPzb4
+BuEqlH6eCzYCngHRi7la3G0X5QKBgQC+OeM7zmL+yPHjG2XS6yBjF6adDrJK/PQE
+g+DmfD7lPtEAMnh2cXZ7ADdpcdHu0uha2LRvyCZq1e0SMBFzWd8ny7TQTxn0ZR24
+6mIMxO+sWfKLtN4J/37/Qrt6mHo4hXxbIg8SAaiOgxkaLhbbAkobWM51NySaAKru
+Fez21p5DEwKBgG1No1cYb0Ds1SHVbrxiYWyDFfBH/gszRHlRLbkSuq4qwpsvzQW8
+76ylZy2KEiBMxzT+XeWoQkz41fR+11ydDlqi5bPaDG+Evr2oY90XMFLwDsbhU+5t
+Zzu7teLDFwMOwj5VeBxmstREyrfLc6Zcm4p0onbY6bfZF4Ixw5iHfxOZAoGAEwGN
+pqgUVAiXwm02W0CK19vBFegmAEAN0XWrvtujHRyNnUttpcfoYpm+75Yjt4zzEkCc
+pp6E2B/PtAWBeNj95uf/hOCiYzzHH3arnUL//2RtS3AizzTr520vdixN6d/McP6S
+KuZnhPWsSGVaez9bUCgrWKLN0WVHrsoaBv+iiGkCgYEA+y+XusCUErqu/bqzzEYj
+Oih8/7hU7lA0CEIx65jqY15F5Q2QDXv/s6j0JKdcWtSkdqq6w/yEbp/AHE8uamLo
+OXYCPHHq5blRvGxnz1qnmVPHyVEYVjdboJiavY1gbwtK+wCBPS85htaRuFxFb9LD
+NO+F4qDaW22QCAuvcoMJMDE=
+-----END PRIVATE KEY-----";
+    const TEST_RSA_N: &str = "vb0EtMVFHWgpptjLmpMW56FBkgs3ip7NBdwt8eyPwkrj1dXJHTyBnzqL3jbPpkhyOmeTMEeEryXMbsCWc_HZnfVFxy4a_0djKTgOXCzHUu2clXyq1AtG5b1rifVJ_DNjjZrcfey-nPZNO9Rw_TF_TVSZbCijoRe4b7i_guVnPHVLBPE45x5GeKQkHBweXmNQRMx1wNLmak4LMuPmH6kPXE-Dvlz1ZZzzxrsjXveBfzRqgx9KIH0I3PQBKj1bKzqMno2P6AR5sIUq3-3fJQ80zejNikfS-pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq-0_w";
+    const AUDIENCE: &str = "g2way-e2e";
+
+    // The fake IdP: one server answering both the discovery document and
+    // the JWKS, dispatched by path. Its own address is the issuer.
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .expect("bind idp");
+    let idp_addr = listener.local_addr().expect("idp addr");
+    let issuer = format!("http://{idp_addr}");
+    let jwks = format!(
+        r#"{{"keys":[{{"kty":"RSA","kid":"k1","alg":"RS256","use":"sig","n":"{TEST_RSA_N}","e":"AQAB"}}]}}"#
+    );
+    let discovery = format!(r#"{{"issuer":"{issuer}","jwks_uri":"{issuer}/keys"}}"#);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let (jwks, discovery) = (jwks.clone(), discovery.clone());
+            tokio::spawn(async move {
+                let service = service_fn(move |req: Request<Incoming>| {
+                    let body = match req.uri().path() {
+                        "/.well-known/openid-configuration" => discovery.clone(),
+                        "/keys" => jwks.clone(),
+                        other => panic!("fake IdP got unexpected path {other}"),
+                    };
+                    async move {
+                        Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::from(
+                            body,
+                        ))))
+                    }
+                });
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            });
+        }
+    });
+
+    let token = |claims: &serde_json::Value| {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some("k1".into());
+        jsonwebtoken::encode(
+            &header,
+            claims,
+            &jsonwebtoken::EncodingKey::from_rsa_pem(TEST_RSA_PRIVATE_PEM.as_bytes())
+                .expect("private key"),
+        )
+        .expect("encode")
+    };
+    let exp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        + 3600;
+
+    // Storage carries the policy the mapped client id resolves to.
+    let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+    let policy = Policy {
+        policy_id: "gold".into(),
+        name: "gold".into(),
+        org_id: "default".into(),
+        active: true,
+        rate: None,
+        quota: None,
+        access: [("oidc".to_owned(), Default::default())].into(),
+    };
+    storage
+        .set(
+            &policy_storage_key("default", "gold"),
+            &serde_json::to_string(&policy).expect("json"),
+            None,
+        )
+        .await
+        .expect("seed policy");
+
+    let upstream = spawn_echo_upstream().await;
+    let def = serde_json::from_str::<ApiDefinition>(&format!(
+        r#"{{"api_id":"oidc","name":"oidc","listen_path":"/oidc/",
+            "target_url":"http://{upstream}",
+            "auth":{{"mode":"oidc","issuer_url":"{issuer}",
+                     "audiences":["{AUDIENCE}"],
+                     "policy_map":{{"client-gold":"gold"}}}}}}"#
+    ))
+    .expect("definition");
+    let (gw, _stop) = spawn_gateway_with_storage(vec![def], storage).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let get_with_token = |token: String| {
+        let client = client.clone();
+        let url = format!("http://{gw}/oidc/x");
+        async move {
+            let req = Request::get(url)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Empty::<Bytes>::new())
+                .expect("request");
+            client.request(req).await.expect("response").status()
+        }
+    };
+
+    // No token → 401.
+    let (status, _) = http_get(&format!("http://{gw}/oidc/x")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // A compliant token whose client id maps to the seeded policy → 200.
+    // Polled: right after boot the eager background fetch (discovery +
+    // keys) may not have landed yet, and the on-miss refetch is
+    // cooldown-gated behind it — requests inside that window 403.
+    let good = token(&serde_json::json!({
+        "sub": "dana", "iss": issuer, "aud": AUDIENCE,
+        "azp": "client-gold", "exp": exp,
+    }));
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if get_with_token(good.clone()).await == StatusCode::OK {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("discovered keys verify a compliant token");
+
+    // Wrong audience → the shared no-oracle 403.
+    let wrong_aud = serde_json::json!({
+        "sub": "dana", "iss": issuer, "aud": "someone-else",
+        "azp": "client-gold", "exp": exp,
+    });
+    assert_eq!(
+        get_with_token(token(&wrong_aud)).await,
+        StatusCode::FORBIDDEN
+    );
+
+    // Unmapped client id → 403.
+    let unmapped = serde_json::json!({
+        "sub": "dana", "iss": issuer, "aud": AUDIENCE,
+        "azp": "client-unknown", "exp": exp,
+    });
+    assert_eq!(
+        get_with_token(token(&unmapped)).await,
+        StatusCode::FORBIDDEN
+    );
+}

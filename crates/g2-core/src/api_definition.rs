@@ -1,5 +1,7 @@
 //! The [`ApiDefinition`] model: one upstream API exposed through the gateway.
 
+use std::collections::BTreeMap;
+
 use http::Uri;
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +47,14 @@ fn default_identity_claim() -> String {
 /// Seconds between background JWKS re-fetches when a definition sets
 /// `jwks_url` without a `jwks_refresh_secs`.
 pub const DEFAULT_JWKS_REFRESH_SECS: u64 = 300;
+
+/// Claim the OIDC mode reads as the OAuth2 client id (for policy mapping)
+/// when a definition does not name one.
+pub const DEFAULT_OIDC_POLICY_CLAIM: &str = "azp";
+
+fn default_oidc_policy_claim() -> String {
+    DEFAULT_OIDC_POLICY_CLAIM.to_owned()
+}
 
 /// Realm the basic-auth mode advertises in `WWW-Authenticate` challenges
 /// when a definition does not name one.
@@ -367,6 +377,61 @@ pub enum AuthConfig {
         identity_claim: String,
     },
 
+    /// OIDC bearer auth: RS256 tokens issued by an external identity
+    /// provider are verified against keys discovered from `issuer_url`
+    /// (or fetched directly from `jwks_url`), with exact `iss` and `aud`
+    /// checks, and their claims are turned into an ephemeral session.
+    ///
+    /// Optionally maps the OAuth2 client id (read from `policy_claim`) to a
+    /// stored [`Policy`](crate::Policy) via `policy_map`.
+    Oidc {
+        /// Identity provider issuer URL. Matched **byte-for-byte** against
+        /// the token's `iss` claim (a trailing-slash mismatch fails
+        /// closed, per OIDC), and used as the base of the discovery URL
+        /// `{issuer_url}/.well-known/openid-configuration` (one trailing
+        /// `/` is trimmed before concatenation only).
+        issuer_url: String,
+
+        /// Accepted `aud` values; required and non-empty (a deliberate
+        /// hardening choice). A token passes if its `aud`
+        /// intersects this list.
+        audiences: Vec<String>,
+
+        /// Direct JWKS URL, skipping OIDC discovery — for providers whose
+        /// discovery document is absent or non-standard.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        jwks_url: Option<String>,
+
+        /// Seconds between background JWKS re-fetches. Defaults to
+        /// [`DEFAULT_JWKS_REFRESH_SECS`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        jwks_refresh_secs: Option<u64>,
+
+        /// Request header carrying the token (a `Bearer ` prefix is
+        /// stripped).
+        #[serde(default = "default_auth_header")]
+        header: String,
+
+        /// Claim used as the caller identity (session alias and rate-limit
+        /// key). Defaults to `sub`.
+        #[serde(default = "default_identity_claim")]
+        identity_claim: String,
+
+        /// Claim holding the OAuth2 client id used for policy mapping.
+        /// Defaults to [`DEFAULT_OIDC_POLICY_CLAIM`] (`azp`); RFC 9068
+        /// access tokens may want `client_id` instead. (A single
+        /// configurable claim, not `aud`/`azp` heuristics.)
+        #[serde(default = "default_oidc_policy_claim")]
+        policy_claim: String,
+
+        /// Client id → policy id. When non-empty, a token whose client id
+        /// is not mapped is rejected (deny-unmatched); when
+        /// empty (the default), tokens get a JWT-like ephemeral session
+        /// with access to this API only.
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        policy_map: BTreeMap<String, String>,
+    },
+
     /// HTTP Basic auth (RFC 7617): `Authorization: Basic base64(user:pass)`.
     ///
     /// The username resolves (hashed, under a `basic:` namespace) to a
@@ -419,6 +484,7 @@ impl AuthConfig {
             Self::Keyless => "keyless",
             Self::AuthToken { .. } => "auth_token",
             Self::Jwt { .. } => "jwt",
+            Self::Oidc { .. } => "oidc",
             Self::BasicAuth { .. } => "basic_auth",
             Self::Mtls {} => "mtls",
         }
@@ -521,6 +587,74 @@ impl AuthConfig {
                             ));
                         }
                     }
+                }
+                Ok(())
+            }
+            Self::Oidc {
+                issuer_url,
+                audiences,
+                jwks_url,
+                jwks_refresh_secs,
+                header,
+                identity_claim,
+                policy_claim,
+                policy_map,
+            } => {
+                if http::header::HeaderName::from_bytes(header.as_bytes()).is_err() {
+                    return Err(fail(format!(
+                        "`auth.header` is not a valid header name: `{header}`"
+                    )));
+                }
+                if identity_claim.trim().is_empty() {
+                    return Err(fail("`auth.identity_claim` must not be empty".into()));
+                }
+                if policy_claim.trim().is_empty() {
+                    return Err(fail("`auth.policy_claim` must not be empty".into()));
+                }
+                // The issuer doubles as the discovery base URL, so it must
+                // be a plain http(s) origin+path — query or fragment parts
+                // would corrupt the `/.well-known/…` concatenation.
+                let issuer_ok = issuer_url.parse::<Uri>().ok().is_some_and(|u| {
+                    matches!(u.scheme_str(), Some("http" | "https"))
+                        && u.authority().is_some()
+                        && u.query().is_none()
+                }) && !issuer_url.contains('#');
+                if !issuer_ok {
+                    return Err(fail(format!(
+                        "`auth.issuer_url` is not a valid http(s) URL without \
+                         query or fragment: `{issuer_url}`"
+                    )));
+                }
+                // Verifying tokens without an audience check would accept
+                // any token the IdP ever issued for any consumer; jsonweb-
+                // token's Validation also rejects aud-bearing tokens when
+                // no audience is configured. Require one, always.
+                if audiences.is_empty() {
+                    return Err(fail("`auth.audiences` must not be empty".into()));
+                }
+                if audiences.iter().any(|a| a.trim().is_empty()) {
+                    return Err(fail("`auth.audiences` entries must not be empty".into()));
+                }
+                if let Some(url) = jwks_url {
+                    let uri = url.parse::<Uri>().ok().filter(|u| {
+                        matches!(u.scheme_str(), Some("http" | "https")) && u.authority().is_some()
+                    });
+                    if uri.is_none() {
+                        return Err(fail(format!(
+                            "`auth.jwks_url` is not a valid http(s) URL: `{url}`"
+                        )));
+                    }
+                }
+                if jwks_refresh_secs.is_some_and(|s| s == 0) {
+                    return Err(fail("`auth.jwks_refresh_secs` must be at least 1".into()));
+                }
+                if policy_map
+                    .iter()
+                    .any(|(k, v)| k.trim().is_empty() || v.trim().is_empty())
+                {
+                    return Err(fail(
+                        "`auth.policy_map` keys and values must not be empty".into(),
+                    ));
                 }
                 Ok(())
             }
@@ -1251,6 +1385,154 @@ mod tests {
                 assert_eq!(identity_claim, DEFAULT_IDENTITY_CLAIM);
             }
             other => panic!("expected jwt auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oidc_json_defaults_and_round_trips() {
+        let json = r#"{
+            "api_id": "o",
+            "name": "o",
+            "listen_path": "/o/",
+            "target_url": "http://o.internal",
+            "auth": {
+                "mode": "oidc",
+                "issuer_url": "https://idp.example.com/realm",
+                "audiences": ["g2way-api"]
+            }
+        }"#;
+        let def = parse(json);
+        def.validate().expect("minimal oidc definition is valid");
+        assert_eq!(def.auth.mode_name(), "oidc");
+        match &def.auth {
+            AuthConfig::Oidc {
+                issuer_url,
+                audiences,
+                jwks_url,
+                jwks_refresh_secs,
+                header,
+                identity_claim,
+                policy_claim,
+                policy_map,
+            } => {
+                assert_eq!(issuer_url, "https://idp.example.com/realm");
+                assert_eq!(audiences, &["g2way-api"]);
+                assert!(jwks_url.is_none() && jwks_refresh_secs.is_none());
+                assert_eq!(header, DEFAULT_AUTH_HEADER);
+                assert_eq!(identity_claim, DEFAULT_IDENTITY_CLAIM);
+                assert_eq!(policy_claim, DEFAULT_OIDC_POLICY_CLAIM);
+                assert!(policy_map.is_empty());
+            }
+            other => panic!("expected oidc auth, got {other:?}"),
+        }
+        let serialized = serde_json::to_string(&def).expect("serializes");
+        let back: ApiDefinition = serde_json::from_str(&serialized).expect("parses back");
+        assert_eq!(back.auth, def.auth);
+    }
+
+    #[test]
+    fn oidc_requires_audiences_in_json() {
+        // `audiences` has no serde default: omitting it is a parse error,
+        // not a validation error — the config cannot even express an
+        // audience-free OIDC API.
+        let json = r#"{
+            "api_id": "o",
+            "name": "o",
+            "listen_path": "/o/",
+            "target_url": "http://o.internal",
+            "auth": { "mode": "oidc", "issuer_url": "https://idp.example.com" }
+        }"#;
+        assert!(serde_json::from_str::<ApiDefinition>(json).is_err());
+    }
+
+    #[test]
+    fn oidc_validation_rejects_bad_configs() {
+        let mut def = parse(minimal_json());
+        let oidc = |issuer_url: &str,
+                    audiences: &[&str],
+                    jwks_url: Option<&str>,
+                    jwks_refresh_secs,
+                    policy_map: &[(&str, &str)]| AuthConfig::Oidc {
+            issuer_url: issuer_url.into(),
+            audiences: audiences.iter().map(|a| (*a).into()).collect(),
+            jwks_url: jwks_url.map(Into::into),
+            jwks_refresh_secs,
+            header: DEFAULT_AUTH_HEADER.into(),
+            identity_claim: DEFAULT_IDENTITY_CLAIM.into(),
+            policy_claim: DEFAULT_OIDC_POLICY_CLAIM.into(),
+            policy_map: policy_map
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+        };
+
+        // Valid baselines: discovery-based and direct-jwks configurations.
+        def.auth = oidc("https://idp.example.com", &["aud"], None, None, &[]);
+        def.validate().expect("discovery config is valid");
+        def.auth = oidc(
+            "https://idp.example.com",
+            &["aud"],
+            Some("https://idp.example.com/jwks.json"),
+            Some(60),
+            &[("client-a", "gold")],
+        );
+        def.validate().expect("direct-jwks config is valid");
+
+        let rejected = [
+            // Empty or blank audiences.
+            oidc("https://idp.example.com", &[], None, None, &[]),
+            oidc("https://idp.example.com", &["ok", " "], None, None, &[]),
+            // Issuer not a URL / wrong scheme / query / fragment.
+            oidc("not a url", &["aud"], None, None, &[]),
+            oidc("ftp://idp.example.com", &["aud"], None, None, &[]),
+            oidc("https://idp.example.com/?x=1", &["aud"], None, None, &[]),
+            oidc("https://idp.example.com/#frag", &["aud"], None, None, &[]),
+            // Bad jwks_url, zero refresh interval.
+            oidc("https://idp.example.com", &["aud"], Some("nope"), None, &[]),
+            oidc("https://idp.example.com", &["aud"], None, Some(0), &[]),
+            // Blank policy-map entries.
+            oidc(
+                "https://idp.example.com",
+                &["aud"],
+                None,
+                None,
+                &[(" ", "p")],
+            ),
+            oidc(
+                "https://idp.example.com",
+                &["aud"],
+                None,
+                None,
+                &[("c", "")],
+            ),
+        ];
+        for (i, auth) in rejected.into_iter().enumerate() {
+            def.auth = auth;
+            assert!(def.validate().is_err(), "case {i} must be rejected");
+        }
+
+        // Empty identity/policy claims and bad headers are rejected too.
+        for patch in [
+            |a: &mut AuthConfig| {
+                if let AuthConfig::Oidc { identity_claim, .. } = a {
+                    *identity_claim = " ".into();
+                }
+            },
+            |a: &mut AuthConfig| {
+                if let AuthConfig::Oidc { policy_claim, .. } = a {
+                    *policy_claim = String::new();
+                }
+            },
+            |a: &mut AuthConfig| {
+                if let AuthConfig::Oidc { header, .. } = a {
+                    *header = "bad header\n".into();
+                }
+            },
+        ] {
+            let mut auth = oidc("https://idp.example.com", &["aud"], None, None, &[]);
+            patch(&mut auth);
+            def.auth = auth;
+            assert!(def.validate().is_err());
         }
     }
 
