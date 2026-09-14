@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{ClientAddr, ConnectionInfo, ProxyBody};
 use http::header::{HeaderValue, CONNECTION, TE, UPGRADE};
@@ -37,7 +38,7 @@ use crate::rewrite;
 
 /// The precomputed parts of one upstream base URL: where a request is sent
 /// once an address has been picked from the target's rotation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamAddr {
     /// Upstream scheme parsed from the target URL.
     pub scheme: Scheme,
@@ -49,6 +50,28 @@ pub struct UpstreamAddr {
 }
 
 impl UpstreamAddr {
+    /// Precomputes the parts of one target URL: an absolute `http`/`https`
+    /// URL with a host. The fallible twin of [`Self::from_url`], for URLs
+    /// that did not come from a validated definition (service discovery
+    /// resolves them at runtime).
+    pub(crate) fn try_from_url(url: &str) -> Result<Self, String> {
+        let uri: Uri = url
+            .parse()
+            .map_err(|e| format!("`{url}` is not a valid URL: {e}"))?;
+        let scheme = match uri.scheme() {
+            Some(s) if s == &Scheme::HTTP || s == &Scheme::HTTPS => s.clone(),
+            _ => return Err(format!("`{url}` must be an absolute http/https URL")),
+        };
+        let Some(authority) = uri.authority() else {
+            return Err(format!("`{url}` must include a host"));
+        };
+        Ok(Self {
+            scheme,
+            authority: authority.clone(),
+            base_path: uri.path().trim_end_matches('/').to_owned(),
+        })
+    }
+
     /// Precomputes the parts of one target URL.
     ///
     /// # Panics
@@ -56,27 +79,85 @@ impl UpstreamAddr {
     /// Panics if `url` has not passed [`ApiDefinition::validate`]'s target
     /// URL checks; callers must validate the definition first.
     fn from_url(url: &str) -> Self {
-        let uri: Uri = url.parse().expect("target URL validated as a URI");
-        Self {
-            scheme: uri.scheme().expect("validated scheme").clone(),
-            authority: uri.authority().expect("validated authority").clone(),
-            base_path: uri.path().trim_end_matches('/').to_owned(),
+        Self::try_from_url(url).expect("target URL validated")
+    }
+}
+
+/// One coherent generation of an API's upstream addresses, with the health
+/// flags that belong to exactly those addresses.
+///
+/// A target's set is replaced wholesale when service discovery resolves a
+/// different address list (see [`crate::discovery`]); bundling the flags
+/// with the addresses makes the flags-index-matches-address invariant
+/// structural instead of implicit. A fresh set starts all-healthy, like a
+/// freshly built route.
+#[derive(Debug)]
+pub(crate) struct TargetSet {
+    /// The upstream addresses requests are forwarded to. Never empty: the
+    /// definition's `target_list` when configured, else its single
+    /// `target_url`; service discovery rejects empty results.
+    pub(crate) addrs: Vec<UpstreamAddr>,
+    /// Per-address health flags written by the checker task (see
+    /// [`crate::health`]); present iff health checking is active for the
+    /// owning target.
+    pub(crate) health: Option<HealthState>,
+}
+
+impl TargetSet {
+    /// A set over `addrs`, all healthy, carrying health state iff
+    /// `health_checked`.
+    pub(crate) fn new(addrs: Vec<UpstreamAddr>, health_checked: bool) -> Self {
+        let health = health_checked.then(|| HealthState::new(addrs.len()));
+        Self { addrs, health }
+    }
+
+    /// The address the next request should use: round-robin via `cursor`,
+    /// skipping addresses evicted by health checking — the healthy subset
+    /// keeps round-robining — but eviction never empties the pool: with
+    /// every address evicted, the plain rotation is used (fail open; a dead
+    /// upstream then answers `502` like an unchecked one).
+    ///
+    /// Single-address sets skip the atomic entirely, so unbalanced routes
+    /// pay nothing for this feature. The cursor wraps at `usize::MAX`, which
+    /// can skip ahead in the rotation once per ~2^64 requests — harmless.
+    pub(crate) fn next_addr(&self, cursor: &AtomicUsize) -> &UpstreamAddr {
+        let count = self.addrs.len();
+        if count == 1 {
+            return &self.addrs[0];
         }
+        for _ in 0..count {
+            let index = cursor.fetch_add(1, Ordering::Relaxed) % count;
+            if self
+                .health
+                .as_ref()
+                .is_none_or(|health| health.is_healthy(index))
+            {
+                return &self.addrs[index];
+            }
+        }
+        let index = cursor.fetch_add(1, Ordering::Relaxed) % count;
+        &self.addrs[index]
     }
 }
 
 /// Everything about an API's upstream precomputed at route-build time so
 /// forwarding does no per-request parsing.
+///
+/// Structurally immutable — built once per route table — except for one
+/// designated swappable leaf: the target set holding the current upstream
+/// addresses, which service discovery may replace wholesale between reloads
+/// (ADR-0006). Reads stay lock-free and allocation-free.
 #[derive(Debug, Clone)]
 pub struct UpstreamTarget {
     /// The `api_id` of the API definition (for logs and error context).
     pub api_id: String,
     /// `listen_path` with any trailing `/` removed (`"/users"`; empty for `"/"`).
     pub listen_prefix: String,
-    /// The upstream addresses requests are forwarded to. Never empty: the
-    /// definition's `target_list` when configured, else its single
-    /// `target_url`.
-    pub targets: Vec<UpstreamAddr>,
+    /// The current generation of upstream addresses (+ their health flags).
+    /// Seeded from the definition's `target_list`/`target_url`; shared
+    /// across clones (like [`Self::next_target`]) so a discovery swap
+    /// reaches every handle.
+    targets: Arc<ArcSwap<TargetSet>>,
     /// Whether the listen-path prefix is removed before forwarding.
     pub strip_listen_path: bool,
     /// Whether the client's `Host` header is forwarded unchanged.
@@ -87,17 +168,18 @@ pub struct UpstreamTarget {
     pub(crate) rewrites: Vec<rewrite::CompiledRewrite>,
     /// Method override applied to the upstream-bound request.
     pub(crate) method_override: Option<Method>,
-    /// Round-robin cursor over `targets`, shared across clones so every
-    /// handle to this target advances one rotation.
+    /// Round-robin cursor over the current target set, shared across clones
+    /// so every handle to this target advances one rotation.
     next_target: Arc<AtomicUsize>,
-    /// Per-address health flags written by the checker task (see
-    /// [`crate::health`]); present iff the definition enables health
-    /// checking and this target forwards traffic (the base target of a
-    /// versioned API does not — each version carries its own target).
-    pub(crate) health: Option<Arc<HealthState>>,
     /// Per-route circuit state read and written by the forwarder (see
-    /// [`crate::breaker`]); present under the same conditions as `health`.
+    /// [`crate::breaker`]); present iff the definition enables breaking and
+    /// this target forwards traffic (the base target of a versioned API
+    /// does not — each version carries its own target).
     pub(crate) breaker: Option<Arc<CircuitBreaker>>,
+    /// Live service-discovery status for dashboards (see
+    /// [`crate::discovery`]); present under the same conditions as
+    /// `breaker`.
+    pub(crate) discovery: Option<Arc<crate::discovery::DiscoveryStatus>>,
     /// Additional forwarding attempts after a transport failure, for
     /// idempotent empty-body requests only.
     pub(crate) retries: u32,
@@ -141,75 +223,105 @@ impl UpstreamTarget {
             .transpose()?;
         // The base target of a versioned API never forwards (each version's
         // effective definition — versioning stripped — builds its own
-        // target), so only unversioned definitions get live health and
-        // circuit state.
-        let (health, breaker) = if def.versioning.is_none() {
-            (
-                def.health_check
-                    .as_ref()
-                    .map(|_| Arc::new(HealthState::new(targets.len()))),
-                def.circuit_breaker
-                    .as_ref()
-                    .map(|cfg| Arc::new(CircuitBreaker::new(cfg, &def.api_id))),
-            )
+        // target), so only unversioned definitions get live health,
+        // circuit, and discovery state.
+        let forwards = def.versioning.is_none();
+        let health_checked = forwards && def.health_check.is_some();
+        let breaker = if forwards {
+            def.circuit_breaker
+                .as_ref()
+                .map(|cfg| Arc::new(CircuitBreaker::new(cfg, &def.api_id)))
         } else {
-            (None, None)
+            None
+        };
+        let discovery = if forwards {
+            def.service_discovery
+                .as_ref()
+                .map(|_| Arc::new(crate::discovery::DiscoveryStatus::default()))
+        } else {
+            None
         };
         Ok(Self {
             api_id: def.api_id.clone(),
             listen_prefix: def.listen_path.trim_end_matches('/').to_owned(),
-            targets,
+            targets: Arc::new(ArcSwap::from_pointee(TargetSet::new(
+                targets,
+                health_checked,
+            ))),
             strip_listen_path: def.strip_listen_path,
             preserve_host_header: def.preserve_host_header,
             timeout: Duration::from_millis(def.upstream_timeout_ms),
             rewrites,
             method_override,
             next_target: Arc::new(AtomicUsize::new(0)),
-            health,
             breaker,
+            discovery,
             retries: def.upstream_retries,
             upgrades_enabled: def.enable_upgrades,
             http2: def.upstream_http2,
         })
     }
 
-    /// The upstream address the next request should use: round-robin across
-    /// [`Self::targets`], pod-local (no cross-pod coordination — each
-    /// gateway process keeps its own rotation). Addresses evicted
-    /// by health checking are skipped — the healthy subset keeps
-    /// round-robining — but eviction never empties the pool: with every
-    /// address evicted, the plain rotation is used (fail open; a dead
-    /// upstream then answers `502` like an unchecked one).
+    /// The current target set, as a cheap wait-free load guard. Round-robin
+    /// address selection is pod-local (no cross-pod coordination — each
+    /// gateway process keeps its own rotation):
+    /// `target.target_set().next_addr(target.cursor())`.
     ///
-    /// Single-target APIs skip the atomic entirely, so unbalanced routes pay
-    /// nothing for this feature. The cursor wraps at `usize::MAX`, which can
-    /// skip ahead in the rotation once per ~2^64 requests — harmless.
-    #[must_use]
-    pub fn next_addr(&self) -> &UpstreamAddr {
-        let count = self.targets.len();
-        if count == 1 {
-            return &self.targets[0];
-        }
-        for _ in 0..count {
-            let index = self.next_target.fetch_add(1, Ordering::Relaxed) % count;
-            if self
-                .health
-                .as_ref()
-                .is_none_or(|health| health.is_healthy(index))
-            {
-                return &self.targets[index];
-            }
-        }
-        let index = self.next_target.fetch_add(1, Ordering::Relaxed) % count;
-        &self.targets[index]
+    /// Hold the guard only briefly (address pick + URI assembly) — a
+    /// long-held guard pins a stale set alive across discovery swaps.
+    pub(crate) fn target_set(&self) -> arc_swap::Guard<Arc<TargetSet>> {
+        self.targets.load()
     }
 
-    /// Health of each address in [`Self::targets`], in order; `None` when
-    /// health checking is not active for this target (unconfigured, or the
-    /// unused base target of a versioned API). For status/dashboard APIs.
+    /// The current target set as an owned `Arc`, for background tasks that
+    /// hold it across await points (health checker, discovery refresher).
+    pub(crate) fn target_set_full(&self) -> Arc<TargetSet> {
+        self.targets.load_full()
+    }
+
+    /// Replaces the target set wholesale (service discovery). The rotation
+    /// cursor is deliberately left running — its modulo changes with the
+    /// address count, which at worst skips ahead in the new rotation.
+    pub(crate) fn store_target_set(&self, set: Arc<TargetSet>) {
+        self.targets.store(set);
+    }
+
+    /// The round-robin cursor accompanying [`Self::target_set`].
+    pub(crate) fn cursor(&self) -> &AtomicUsize {
+        &self.next_target
+    }
+
+    /// Health of each address in the current target set, in order; `None`
+    /// when health checking is not active for this target (unconfigured, or
+    /// the unused base target of a versioned API). For status/dashboard APIs.
     #[must_use]
     pub fn target_health(&self) -> Option<Vec<bool>> {
-        self.health.as_ref().map(|health| health.snapshot())
+        self.targets
+            .load()
+            .health
+            .as_ref()
+            .map(HealthState::snapshot)
+    }
+
+    /// The addresses currently in the load-balancing rotation, rendered as
+    /// URLs. Equals the definition's `target_list`/`target_url` until
+    /// service discovery swaps in a resolved set. For status/dashboard APIs.
+    #[must_use]
+    pub fn live_targets(&self) -> Vec<String> {
+        self.targets
+            .load()
+            .addrs
+            .iter()
+            .map(|addr| format!("{}://{}{}", addr.scheme, addr.authority, addr.base_path))
+            .collect()
+    }
+
+    /// A snapshot of the service-discovery status; `None` when discovery is
+    /// not active for this target (unconfigured, or the unused base target
+    /// of a versioned API). For status/dashboard APIs.
+    #[must_use]
+    pub fn discovery_status(&self) -> Option<crate::discovery::DiscoverySnapshot> {
+        self.discovery.as_ref().map(|status| status.snapshot())
     }
 
     /// The circuit breaker's current state (`"closed"`, `"open"`,
@@ -440,14 +552,19 @@ async fn run_attempts(
     let api_id = target.api_id.as_str();
     let mut body = Some(body);
     for attempt in 1..=max_attempts {
-        let addr = target.next_addr();
-        let path_and_query =
-            rewrite::upstream_path_and_query(target, addr, parts.uri.path(), parts.uri.query());
-        let upstream_uri = Uri::builder()
-            .scheme(addr.scheme.clone())
-            .authority(addr.authority.clone())
-            .path_and_query(path_and_query)
-            .build();
+        // The set guard lives only for URI assembly: a long-held guard would
+        // pin a stale set alive across discovery swaps.
+        let upstream_uri = {
+            let set = target.target_set();
+            let addr = set.next_addr(target.cursor());
+            let path_and_query =
+                rewrite::upstream_path_and_query(target, addr, parts.uri.path(), parts.uri.query());
+            Uri::builder()
+                .scheme(addr.scheme.clone())
+                .authority(addr.authority.clone())
+                .path_and_query(path_and_query)
+                .build()
+        };
         let upstream_uri = match upstream_uri {
             Ok(uri) => uri,
             Err(err) => {
@@ -1015,6 +1132,13 @@ mod tests {
         );
     }
 
+    /// The next round-robin pick's host, owned (tests only — the hot path
+    /// borrows through the guard instead).
+    fn pick(target: &UpstreamTarget) -> String {
+        let set = target.target_set();
+        set.next_addr(target.cursor()).authority.host().to_owned()
+    }
+
     #[test]
     fn round_robin_rotates_and_shares_across_clones() {
         let def: ApiDefinition = serde_json::from_str(
@@ -1025,9 +1149,7 @@ mod tests {
         .expect("def");
         let target = UpstreamTarget::build(&def).expect("target");
 
-        let hosts: Vec<&str> = (0..4)
-            .map(|_| target.next_addr().authority.host())
-            .collect();
+        let hosts: Vec<String> = (0..4).map(|_| pick(&target)).collect();
         assert_eq!(
             hosts,
             ["a.internal", "b.internal", "c.internal", "a.internal"]
@@ -1035,8 +1157,8 @@ mod tests {
 
         // Clones share the cursor: the rotation continues, never restarts.
         let clone = target.clone();
-        assert_eq!(clone.next_addr().authority.host(), "b.internal");
-        assert_eq!(target.next_addr().authority.host(), "c.internal");
+        assert_eq!(pick(&clone), "b.internal");
+        assert_eq!(pick(&target), "c.internal");
     }
 
     #[test]
@@ -1049,14 +1171,13 @@ mod tests {
         )
         .expect("def");
         let target = UpstreamTarget::build(&def).expect("target");
-        let health = target.health.as_ref().expect("health state built");
         assert_eq!(target.target_health(), Some(vec![true, true, true]));
 
         // Evicting `b` leaves the healthy pair round-robining.
+        let set = target.target_set_full();
+        let health = set.health.as_ref().expect("health state built");
         health.set_healthy(1, false);
-        let hosts: Vec<&str> = (0..4)
-            .map(|_| target.next_addr().authority.host())
-            .collect();
+        let hosts: Vec<String> = (0..4).map(|_| pick(&target)).collect();
         assert_eq!(
             hosts,
             ["a.internal", "c.internal", "a.internal", "c.internal"]
@@ -1066,13 +1187,46 @@ mod tests {
         // instead of having nowhere to go.
         health.set_healthy(0, false);
         health.set_healthy(2, false);
-        let hosts: Vec<&str> = (0..3)
-            .map(|_| target.next_addr().authority.host())
-            .collect();
+        let hosts: Vec<String> = (0..3).map(|_| pick(&target)).collect();
         assert!(
             hosts.iter().all(|h| h.ends_with(".internal")),
             "fail-open must still pick real addresses, got {hosts:?}"
         );
+    }
+
+    #[test]
+    fn swapping_the_target_set_redirects_the_rotation() {
+        let def: ApiDefinition = serde_json::from_str(
+            r#"{"api_id":"sd","name":"sd","listen_path":"/sd/",
+                "target_url":"http://unused.internal",
+                "target_list":["http://a.internal","http://b.internal"],
+                "health_check":{}}"#,
+        )
+        .expect("def");
+        let target = UpstreamTarget::build(&def).expect("target");
+        assert_eq!(pick(&target), "a.internal");
+
+        // A discovery-style swap: every subsequent pick uses the new set,
+        // and the fresh health state starts all-healthy.
+        let swapped = TargetSet::new(
+            vec![UpstreamAddr::try_from_url("http://x.internal:7000").expect("valid")],
+            target.target_set().health.is_some(),
+        );
+        target.store_target_set(Arc::new(swapped));
+        for _ in 0..3 {
+            assert_eq!(pick(&target), "x.internal");
+        }
+        assert_eq!(target.target_health(), Some(vec![true]));
+        assert_eq!(target.live_targets(), ["http://x.internal:7000"]);
+    }
+
+    #[test]
+    fn try_from_url_rejects_bad_schemes_and_missing_hosts() {
+        assert!(UpstreamAddr::try_from_url("http://ok.internal/base").is_ok());
+        assert!(UpstreamAddr::try_from_url("https://ok.internal:8443").is_ok());
+        for bad in ["ftp://x.internal", "/relative", "not a url", "http://"] {
+            assert!(UpstreamAddr::try_from_url(bad).is_err(), "`{bad}` accepted");
+        }
     }
 
     #[test]
@@ -1109,9 +1263,13 @@ mod tests {
         )
         .expect("def");
         let target = UpstreamTarget::build(&def).expect("target");
-        assert_eq!(target.targets.len(), 1);
+        assert_eq!(target.target_set().addrs.len(), 1);
         for _ in 0..3 {
-            assert_eq!(target.next_addr().authority.as_str(), "only.internal:8080");
+            let set = target.target_set();
+            assert_eq!(
+                set.next_addr(target.cursor()).authority.as_str(),
+                "only.internal:8080"
+            );
         }
     }
 

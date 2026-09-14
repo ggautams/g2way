@@ -212,6 +212,9 @@ impl Route {
                 if let Some(health) = &def.health_check {
                     crate::health::spawn_checker(forwarder, &target, health);
                 }
+                if let Some(sd) = &def.service_discovery {
+                    crate::discovery::spawn_refresher(forwarder, &target, sd);
+                }
                 inner_layers(outer, &def, res, &jwks_fetch, &def.api_id)?
                     .build(Forward::new(forwarder, Arc::clone(&target)))
             }
@@ -227,6 +230,9 @@ impl Route {
                     let vtarget = Arc::new(UpstreamTarget::build(&vdef)?);
                     if let Some(health) = &vdef.health_check {
                         crate::health::spawn_checker(forwarder, &vtarget, health);
+                    }
+                    if let Some(sd) = &vdef.service_discovery {
+                        crate::discovery::spawn_refresher(forwarder, &vtarget, sd);
                     }
                     let scope = format!("{}:{name}", vdef.api_id);
                     let inner = inner_layers(
@@ -486,7 +492,10 @@ mod tests {
         let built = table(vec![d]).expect("build");
         let route = built.match_path("/v/x").expect("route");
         // The route's own target stays the base definition's.
-        assert_eq!(route.target.targets[0].authority.as_str(), "v1.internal");
+        assert_eq!(
+            route.target.target_set().addrs[0].authority.as_str(),
+            "v1.internal"
+        );
 
         // A broken override fails the build like any invalid definition.
         let mut d = def("versioned", "/v/", "http://v1.internal");
@@ -507,7 +516,8 @@ mod tests {
     fn route_precomputes_target_parts() {
         let table = table(vec![def("a", "/a/", "https://api.internal:8443/base/")]).expect("build");
         let route = table.match_path("/a/x").expect("route");
-        let addr = &route.target.targets[0];
+        let set = route.target.target_set();
+        let addr = &set.addrs[0];
         assert_eq!(addr.scheme.as_str(), "https");
         assert_eq!(addr.authority.as_str(), "api.internal:8443");
         assert_eq!(addr.base_path, "/base");

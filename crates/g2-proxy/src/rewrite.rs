@@ -198,7 +198,8 @@ mod tests {
     /// Path computation against the target's first (and in these tests only)
     /// upstream address.
     fn pq(target: &UpstreamTarget, path: &str, query: Option<&str>) -> String {
-        upstream_path_and_query(target, &target.targets[0], path, query)
+        let set = target.target_set();
+        upstream_path_and_query(target, &set.addrs[0], path, query)
     }
 
     fn route(

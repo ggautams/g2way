@@ -12,6 +12,11 @@
 //! config reload that drops the old route table lets the old checker exit on
 //! its next tick — no explicit abort plumbing. Eviction is pod-local, like
 //! the round-robin rotation itself.
+//!
+//! The checker follows service-discovery swaps: each tick it loads the
+//! target's current [`TargetSet`] and, when the set changed since the last
+//! tick, rebuilds its probe URIs and failure streaks for the new addresses
+//! (which start all-healthy, like a fresh route).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
@@ -21,10 +26,10 @@ use g2_core::HealthCheckConfig;
 use g2_middleware::ProxyBody;
 use http::{Method, Request, Uri};
 
-use crate::forward::{Forwarder, UpstreamAddr, UpstreamClient, UpstreamTarget};
+use crate::forward::{Forwarder, TargetSet, UpstreamAddr, UpstreamClient, UpstreamTarget};
 
-/// Live health flags for one target's upstream addresses, indexed like
-/// [`UpstreamTarget::targets`](crate::UpstreamTarget::targets).
+/// Live health flags for one [`TargetSet`]'s upstream addresses, indexed
+/// like its address list.
 ///
 /// Written by the checker task, read lock-free by `next_addr()` on the hot
 /// path. Every address starts healthy: a freshly loaded config must not
@@ -79,7 +84,7 @@ pub(crate) fn spawn_checker(
     target: &Arc<UpstreamTarget>,
     cfg: &HealthCheckConfig,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let state = Arc::clone(target.health.as_ref()?);
+    target.target_set().health.as_ref()?;
     let Ok(handle) = tokio::runtime::Handle::try_current() else {
         tracing::warn!(
             api_id = %target.api_id,
@@ -87,18 +92,11 @@ pub(crate) fn spawn_checker(
         );
         return None;
     };
-    let uris: Vec<Uri> = target
-        .targets
-        .iter()
-        .map(|addr| probe_uri(addr, &cfg.path))
-        .collect();
     Some(handle.spawn(run_checker(
         // Probes must speak the target's protocol: a pure-HTTP/2 upstream
         // rejects HTTP/1.1 probes, which would evict every address.
         forwarder.client_for(target).clone(),
         Arc::downgrade(target),
-        state,
-        uris,
         target.api_id.clone(),
         cfg.clone(),
     )))
@@ -115,25 +113,56 @@ fn probe_uri(addr: &UpstreamAddr, path: &str) -> Uri {
         .expect("validated target parts and health path form a URI")
 }
 
-/// The checker task: probes every address each interval and applies the
-/// threshold transitions, until `target` is dropped (route table swap).
+/// The checker task: probes every address of the target's *current* set
+/// each interval and applies the threshold transitions, until `target` is
+/// dropped (route table swap). A service-discovery swap between ticks
+/// rebuilds the probe URIs and streaks for the new set; a swap racing one
+/// probe round at worst writes flags into a set that is no longer mounted —
+/// harmless, since the mounted one starts all-healthy.
 async fn run_checker(
     client: UpstreamClient,
     target: Weak<UpstreamTarget>,
-    state: Arc<HealthState>,
-    uris: Vec<Uri>,
     api_id: String,
     cfg: HealthCheckConfig,
 ) {
     let interval = Duration::from_millis(cfg.interval_ms);
     let timeout = Duration::from_millis(cfg.timeout_ms);
-    let mut streaks: Vec<Streak> = uris.iter().map(|_| Streak::default()).collect();
+    let mut probed: Option<(Arc<TargetSet>, Vec<Uri>, Vec<Streak>)> = None;
     loop {
         tokio::time::sleep(interval).await;
-        if target.strong_count() == 0 {
+        let Some(strong) = target.upgrade() else {
             tracing::debug!(%api_id, "target dropped; stopping upstream health checks");
             return;
+        };
+        let current = strong.target_set_full();
+        // Only the set is held across the probes: keeping the target alive
+        // would delay a reload's cleanup by one probe round.
+        drop(strong);
+        match &probed {
+            Some((set, _, _)) if Arc::ptr_eq(set, &current) => {}
+            _ => {
+                let uris: Vec<Uri> = current
+                    .addrs
+                    .iter()
+                    .map(|addr| probe_uri(addr, &cfg.path))
+                    .collect();
+                let streaks = uris.iter().map(|_| Streak::default()).collect();
+                if probed.is_some() {
+                    tracing::debug!(
+                        %api_id,
+                        addresses = uris.len(),
+                        "probe set rebuilt after a target-set swap"
+                    );
+                }
+                probed = Some((current, uris, streaks));
+            }
         }
+        let (set, uris, streaks) = probed.as_mut().expect("probed set assigned above");
+        let Some(state) = set.health.as_ref() else {
+            // Unreachable in practice: swapped-in sets carry health state
+            // whenever the seed set did. Defensive skip, never a panic.
+            continue;
+        };
         let results =
             futures_util::future::join_all(uris.iter().map(|uri| probe(&client, uri, timeout)))
                 .await;
@@ -279,6 +308,38 @@ mod tests {
             .await
             .expect("checker must exit once its target is dropped")
             .expect("checker task must not panic");
+    }
+
+    #[tokio::test]
+    async fn checker_follows_a_discovery_swap() {
+        let (live_a, _flag_a) = spawn_toggle_upstream().await;
+        let (target, cfg) = checked_target(
+            &[live_a],
+            r#"{"interval_ms": 20, "timeout_ms": 250, "unhealthy_threshold": 1, "healthy_threshold": 1}"#,
+        );
+        spawn_checker(&Forwarder::new(), &target, &cfg).expect("spawned");
+        wait_for_health(&target, &[true]).await;
+
+        // Swap in a discovery-style set: a live and a dead address. The new
+        // set starts all-healthy; the checker rebuilds its probe set and
+        // evicts the dead one.
+        let (live_b, _flag_b) = spawn_toggle_upstream().await;
+        let dead = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let dead_addr = dead.local_addr().expect("addr");
+        drop(dead);
+        let addrs = vec![
+            UpstreamAddr::try_from_url(&format!("http://{live_b}")).expect("valid"),
+            UpstreamAddr::try_from_url(&format!("http://{dead_addr}")).expect("valid"),
+        ];
+        target.store_target_set(Arc::new(TargetSet::new(addrs, true)));
+        assert_eq!(
+            target.target_health(),
+            Some(vec![true, true]),
+            "a swapped-in set must start all-healthy"
+        );
+        wait_for_health(&target, &[true, false]).await;
     }
 
     #[tokio::test]

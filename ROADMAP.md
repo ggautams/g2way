@@ -95,7 +95,10 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
       h2c/ALPN upstream client + trailer forwarding; `docs/grpc.md`)
 - [x] Plugin system (WASM pre/post hooks — wasmtime, custom JSON ABI;
       ADR-0005, `docs/plugins.md`)
-- [ ] Service discovery; request/response body transforms
+- [x] Service discovery (HTTP+JSON polling of a catalog endpoint;
+      live target swaps via ArcSwap — ADR-0006, `docs/service-discovery.md`)
+- [ ] Request/response body transforms (template-engine decision made:
+      minijinja — pure Rust, serde-native, fits MSRV/no-cmake)
 
 ## M9 — GraphQL
 
@@ -1014,3 +1017,37 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   mutation on continue, base64 bodies, compile cache across reloads —
   ADR-0005 consequences list. Next: M8+ service discovery /
   body transforms, or an M9 GraphQL box (subscriptions unblocked).
+- **2026-09-01 (7)** — M8+ service discovery landed (ADR-0006,
+  `docs/service-discovery.md`); the "service discovery; body transforms" box
+  was **split** (user-confirmed: discovery first, HTTP+JSON polling flavor;
+  body transforms will use **minijinja** when they land).
+  `ApiDefinition.service_discovery {endpoint, data_path, port_data_path,
+  parent_data_path, scheme, interval_ms, timeout_ms}` — dotted-path
+  extraction over the polled JSON (`extract_entries` in g2-core, pure +
+  table-tested; covers Consul/etcd/Eureka shapes; deliberately no
+  `use_nested_query`/`use_target_list` knobs) + a `VersionOverrides` arm. Core
+  change (**scoped ADR-0001 amendment**): `UpstreamTarget.targets` became
+  `Arc<ArcSwap<TargetSet {addrs, health}>>` — one designated swappable
+  leaf; `next_addr` moved onto `TargetSet` (callers hold a load guard
+  briefly), and `HealthState` now lives *inside* the set, making the
+  flags-index-matches-addrs invariant structural (health checks + discovery
+  coexist; the checker re-derives probe URIs/streaks on `Arc::ptr_eq`
+  change; swapped-in sets start all-healthy). New `g2-proxy::discovery`
+  refresher (JWKS/health lifecycle: Weak + `Handle::try_current` guard;
+  first poll immediate, h1 client always): stale-on-error keeps the
+  previous set on *any* failure incl. **empty results** (deliberate
+  asymmetry vs JWKS revocation, reasoned in ADR-0006 §4); swap only on
+  change (no health reset/log churn); seeds = `target_list`/`target_url`
+  until the first success. `/g2/node` gained `live_targets` +
+  `service_discovery {endpoint, last_success_unix_secs, last_error}`.
+  Zero new deps (arc-swap/serde_json already in g2-proxy). Tests: g2-core
+  config/extraction tables, forward swap/rotation units, discovery
+  module suite (fake endpoint incl. failure table + task-exit),
+  checker-follows-swap, 2-case `discovery_e2e.rs` (traffic follows catalog
+  flips live; dead catalog = frozen targets keep serving). **Surprise
+  (env):** the workspace `target/` had grown to 106G and filled the disk
+  mid-`make check` — deleted `target/debug/incremental` (62G); worth an
+  occasional `cargo clean`. Not done (deliberate, ADR-0006): DNS
+  SRV/k8s-Endpoints sources, poll jitter, catalog-metadata weighting.
+  Next: M8+ body transforms (minijinja), or an M9 GraphQL box
+  (subscriptions unblocked).

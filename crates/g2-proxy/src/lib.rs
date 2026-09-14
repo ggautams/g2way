@@ -17,7 +17,9 @@
 //!    hop-by-hop headers, adds `X-Forwarded-*`, and streams the request to
 //!    one of the upstream's addresses (round-robin across a `target_list`
 //!    when configured, skipping addresses evicted by the `health` module's
-//!    active probes) through a shared pooled hyper client ([`Forwarder`],
+//!    active probes; the `discovery` module may live-swap the whole address
+//!    set from a polled HTTP+JSON catalog) through a shared pooled hyper
+//!    client ([`Forwarder`],
 //!    speaking TLS to `https://` targets via rustls), enforcing the per-API
 //!    upstream timeout. A route with a circuit breaker (the `breaker`
 //!    module) sheds requests with `503` while its upstream keeps failing on
@@ -27,6 +29,7 @@
 //! [`Gateway::handle`] is the single entry point the binary calls per request.
 
 mod breaker;
+mod discovery;
 pub mod forward;
 pub mod gateway;
 mod health;
@@ -34,6 +37,7 @@ mod response;
 mod rewrite;
 pub mod router;
 
+pub use discovery::DiscoverySnapshot;
 pub use forward::{Forwarder, UpstreamAddr, UpstreamTarget};
 pub use gateway::{Gateway, ProxyBody};
 pub use router::{Route, RouteResources, RouteTable};

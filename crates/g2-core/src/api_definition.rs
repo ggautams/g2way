@@ -190,6 +190,292 @@ impl HealthCheckConfig {
     }
 }
 
+fn default_discovery_interval_ms() -> u64 {
+    10_000
+}
+
+fn default_discovery_timeout_ms() -> u64 {
+    5_000
+}
+
+/// Scheme applied to discovered `host[:port]` entries when a definition does
+/// not set `service_discovery.scheme`.
+pub const DEFAULT_DISCOVERY_SCHEME: &str = "http";
+
+fn default_discovery_scheme() -> String {
+    DEFAULT_DISCOVERY_SCHEME.to_owned()
+}
+
+/// Upstream service discovery via HTTP+JSON polling (see
+/// [`ApiDefinition::service_discovery`]).
+///
+/// Each gateway pod polls `endpoint` every `interval_ms` and extracts the
+/// current upstream addresses from the JSON response using the configured
+/// data paths (see [`Self::extract_entries`] for the exact semantics — the
+/// mechanism covers Consul/etcd/Eureka-style REST catalogs with one shape).
+/// A successful poll that yields a *different* address list replaces the
+/// API's load-balancing targets live, without a reload.
+///
+/// Until the first successful poll the API forwards to its static seeds
+/// (`target_list`, else `target_url` — which stays required as the
+/// canonical fallback). A failed poll — fetch error, non-2xx, unparseable
+/// body, extraction error, invalid entry, or an *empty* result — keeps the
+/// previous addresses and logs a warning: stale targets beat empty targets,
+/// so discovery can never leave an API with nothing to forward to.
+///
+/// Polling is pod-local (each pod polls the endpoint itself, like health
+/// probing); the discovery endpoint is fetched over HTTP/1.1 regardless of
+/// the API's `upstream_http2` setting, and response bodies are capped at
+/// 1 MiB.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServiceDiscoveryConfig {
+    /// The URL polled for the current upstream addresses. Must be an
+    /// absolute `http`/`https` URL.
+    pub endpoint: String,
+
+    /// Dotted path to the host entry (or list of host entries) inside the
+    /// JSON response — e.g. `"Address"` or `"node.ip"`. Segments index
+    /// object keys, or array elements when they parse as a number. Empty
+    /// (the default) means the looked-up value itself.
+    #[serde(default)]
+    pub data_path: String,
+
+    /// Optional dotted path to the port for each host entry. The value must
+    /// be an integer `1`–`65535` or a string of digits. Unset = discovered
+    /// entries carry their own port or use the scheme default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port_data_path: Option<String>,
+
+    /// Optional dotted path to a JSON *array* to iterate: per element,
+    /// [`Self::data_path`] and [`Self::port_data_path`] are resolved
+    /// relative to the element instead of the response root. Empty means
+    /// the response root itself is the array (e.g. Consul's
+    /// `/v1/catalog/service/{name}`). Unset = no iteration; the paths
+    /// resolve from the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_data_path: Option<String>,
+
+    /// Scheme (`http` or `https`) applied to discovered `host[:port]`
+    /// entries. Defaults to [`DEFAULT_DISCOVERY_SCHEME`]. Entries that are
+    /// already full `http(s)://` URLs keep their own scheme.
+    #[serde(default = "default_discovery_scheme")]
+    pub scheme: String,
+
+    /// Milliseconds between polls (per pod). Defaults to `10000`.
+    #[serde(default = "default_discovery_interval_ms")]
+    pub interval_ms: u64,
+
+    /// Milliseconds a poll may take before counting as a failure.
+    /// Defaults to `5000`.
+    #[serde(default = "default_discovery_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+/// One host entry extracted from a discovery response by
+/// [`ServiceDiscoveryConfig::extract_entries`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredEntry {
+    /// The raw host entry: a bare host, `host:port` authority, or a full
+    /// `http(s)://` URL.
+    pub host: String,
+    /// Port resolved via `port_data_path`, if configured.
+    pub port: Option<u16>,
+}
+
+/// Resolves a dotted path inside a JSON value: object segments index keys,
+/// and a segment that parses as a number indexes an array element. The empty
+/// path resolves to the value itself.
+fn json_lookup<'a>(mut value: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    if path.is_empty() {
+        return Some(value);
+    }
+    for segment in path.split('.') {
+        value = match value {
+            serde_json::Value::Object(map) => map.get(segment)?,
+            serde_json::Value::Array(items) => items.get(segment.parse::<usize>().ok()?)?,
+            _ => return None,
+        };
+    }
+    Some(value)
+}
+
+/// Coerces a looked-up port value: an integer `1`–`65535`, or a string of
+/// digits in that range. `path` names the offending path in errors.
+fn coerce_port(value: &serde_json::Value, path: &str) -> Result<u16, String> {
+    let port = match value {
+        serde_json::Value::Number(n) => n.as_u64().and_then(|n| u16::try_from(n).ok()),
+        serde_json::Value::String(s) if s.chars().all(|c| c.is_ascii_digit()) => {
+            s.parse::<u16>().ok()
+        }
+        _ => None,
+    };
+    match port {
+        Some(p) if p != 0 => Ok(p),
+        _ => Err(format!(
+            "`port_data_path` `{path}` must be a port between 1 and 65535, got `{value}`"
+        )),
+    }
+}
+
+/// Checks dotted-path syntax: the empty path is allowed (identity), but a
+/// non-empty path must have no empty segments (`a..b`, `.a`, `a.`).
+fn check_data_path(path: &str) -> Result<(), String> {
+    if !path.is_empty() && path.split('.').any(str::is_empty) {
+        return Err(format!("has an empty segment: `{path}`"));
+    }
+    Ok(())
+}
+
+impl ServiceDiscoveryConfig {
+    /// Validates the discovery settings; `api` names the owning definition
+    /// in errors.
+    fn validate(&self, api: &str) -> Result<(), Error> {
+        let fail = |reason: String| Error::InvalidApiDefinition {
+            api: api.to_owned(),
+            reason,
+        };
+        if let Err(reason) = check_target_url(&self.endpoint) {
+            return Err(fail(format!("`service_discovery.endpoint` {reason}")));
+        }
+        if self.scheme != "http" && self.scheme != "https" {
+            return Err(fail(format!(
+                "`service_discovery.scheme` must be `http` or `https`, got `{}`",
+                self.scheme
+            )));
+        }
+        if self.interval_ms == 0 {
+            return Err(fail(
+                "`service_discovery.interval_ms` must be greater than zero".into(),
+            ));
+        }
+        if self.timeout_ms == 0 {
+            return Err(fail(
+                "`service_discovery.timeout_ms` must be greater than zero".into(),
+            ));
+        }
+        for (name, path) in [
+            ("data_path", Some(&self.data_path)),
+            ("port_data_path", self.port_data_path.as_ref()),
+            ("parent_data_path", self.parent_data_path.as_ref()),
+        ] {
+            if let Some(path) = path {
+                if let Err(reason) = check_data_path(path) {
+                    return Err(fail(format!("`service_discovery.{name}` {reason}")));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Extracts the host entries from a discovery response document.
+    ///
+    /// With [`Self::parent_data_path`] set, that path must resolve to an
+    /// array; for each element, [`Self::data_path`] must resolve to a JSON
+    /// string (the host entry) and [`Self::port_data_path`], when set, to a
+    /// valid port. Without it, `data_path` resolves from the root to either
+    /// a single string or an array of strings, and `port_data_path`
+    /// resolves from the root to one port applied to every entry.
+    ///
+    /// # Errors
+    ///
+    /// Any failed lookup or malformed value fails the whole extraction with
+    /// a descriptive message — never a partial list, so a broken discovery
+    /// response cannot silently shrink the upstream pool.
+    pub fn extract_entries(&self, doc: &serde_json::Value) -> Result<Vec<DiscoveredEntry>, String> {
+        if let Some(parent_path) = &self.parent_data_path {
+            let parent = json_lookup(doc, parent_path).ok_or_else(|| {
+                format!("`parent_data_path` `{parent_path}` not found in the response")
+            })?;
+            let items = parent
+                .as_array()
+                .ok_or_else(|| format!("`parent_data_path` `{parent_path}` is not an array"))?;
+            items
+                .iter()
+                .enumerate()
+                .map(|(index, item)| {
+                    let host = self.entry_host(item, &format!("[{index}]"))?;
+                    let port = self
+                        .port_data_path
+                        .as_ref()
+                        .map(|path| {
+                            json_lookup(item, path)
+                                .ok_or_else(|| {
+                                    format!(
+                                        "`port_data_path` `{path}` not found in element [{index}]"
+                                    )
+                                })
+                                .and_then(|value| coerce_port(value, path))
+                        })
+                        .transpose()?;
+                    Ok(DiscoveredEntry { host, port })
+                })
+                .collect()
+        } else {
+            let value = json_lookup(doc, &self.data_path).ok_or_else(|| {
+                format!("`data_path` `{}` not found in the response", self.data_path)
+            })?;
+            let hosts = match value {
+                serde_json::Value::String(host) if !host.trim().is_empty() => {
+                    vec![host.clone()]
+                }
+                serde_json::Value::String(_) => {
+                    return Err(format!(
+                        "`data_path` `{}` is not a non-empty string",
+                        self.data_path
+                    ));
+                }
+                serde_json::Value::Array(items) => items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| match item.as_str() {
+                        Some(host) if !host.trim().is_empty() => Ok(host.to_owned()),
+                        _ => Err(format!(
+                            "`data_path` `{}` element [{index}] is not a non-empty string",
+                            self.data_path
+                        )),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                _ => {
+                    return Err(format!(
+                        "`data_path` `{}` must resolve to a string or array of strings",
+                        self.data_path
+                    ));
+                }
+            };
+            let port = self
+                .port_data_path
+                .as_ref()
+                .map(|path| {
+                    json_lookup(doc, path)
+                        .ok_or_else(|| {
+                            format!("`port_data_path` `{path}` not found in the response")
+                        })
+                        .and_then(|value| coerce_port(value, path))
+                })
+                .transpose()?;
+            Ok(hosts
+                .into_iter()
+                .map(|host| DiscoveredEntry { host, port })
+                .collect())
+        }
+    }
+
+    /// Resolves [`Self::data_path`] inside `scope` to a non-empty string
+    /// host entry; `place` names the scope in errors.
+    fn entry_host(&self, scope: &serde_json::Value, place: &str) -> Result<String, String> {
+        let value = json_lookup(scope, &self.data_path)
+            .ok_or_else(|| format!("`data_path` `{}` not found in {place}", self.data_path))?;
+        match value.as_str() {
+            Some(host) if !host.trim().is_empty() => Ok(host.to_owned()),
+            _ => Err(format!(
+                "`data_path` `{}` in {place} is not a non-empty string",
+                self.data_path
+            )),
+        }
+    }
+}
+
 fn default_failure_threshold() -> u32 {
     5
 }
@@ -940,6 +1226,14 @@ pub struct ApiDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check: Option<HealthCheckConfig>,
 
+    /// Optional upstream service discovery: each pod polls an HTTP+JSON
+    /// endpoint on an interval and live-swaps the API's load-balancing
+    /// targets to the discovered addresses (see [`ServiceDiscoveryConfig`]).
+    /// [`Self::target_list`]/[`Self::target_url`] remain the seed addresses
+    /// used until the first successful poll. Unset = static targets only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_discovery: Option<ServiceDiscoveryConfig>,
+
     /// Optional per-route circuit breaking: after enough consecutive
     /// upstream failures on live traffic, requests are answered `503`
     /// without contacting the upstream until a cooldown trial succeeds (see
@@ -1154,6 +1448,9 @@ impl ApiDefinition {
         }
         if let Some(health) = &self.health_check {
             health.validate(&self.api_id)?;
+        }
+        if let Some(discovery) = &self.service_discovery {
+            discovery.validate(&self.api_id)?;
         }
         if let Some(breaker) = &self.circuit_breaker {
             breaker.validate(&self.api_id)?;
@@ -2086,6 +2383,246 @@ mod tests {
         ] {
             def.health_check = Some(broken);
             assert!(def.validate().is_err(), "`{label}` accepted");
+        }
+    }
+
+    #[test]
+    fn service_discovery_parses_defaults_and_validates() {
+        let json = r#"{
+            "api_id": "sd",
+            "name": "sd",
+            "listen_path": "/sd/",
+            "target_url": "http://seed.internal",
+            "service_discovery": {"endpoint": "http://consul.internal:8500/v1/catalog/service/users"}
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        let sd = def.service_discovery.as_ref().expect("set");
+        assert_eq!(sd.data_path, "");
+        assert_eq!(sd.port_data_path, None);
+        assert_eq!(sd.parent_data_path, None);
+        assert_eq!(sd.scheme, DEFAULT_DISCOVERY_SCHEME);
+        assert_eq!(sd.interval_ms, 10_000);
+        assert_eq!(sd.timeout_ms, 5_000);
+
+        // Optionals stay off the wire when unset (old records unaffected).
+        let bare = serde_json::to_string(&parse(minimal_json())).expect("serializes");
+        assert!(
+            !bare.contains("service_discovery"),
+            "`service_discovery` serialized"
+        );
+        let set = serde_json::to_string(&def).expect("serializes");
+        assert!(
+            !set.contains("port_data_path"),
+            "unset sub-field serialized"
+        );
+    }
+
+    #[test]
+    fn service_discovery_rejects_invalid_settings() {
+        let base = ServiceDiscoveryConfig {
+            endpoint: "http://catalog.internal/services".into(),
+            data_path: String::new(),
+            port_data_path: None,
+            parent_data_path: None,
+            scheme: "http".into(),
+            interval_ms: 10_000,
+            timeout_ms: 5_000,
+        };
+        let mut def = parse(minimal_json());
+        for (label, broken) in [
+            (
+                "non-http endpoint",
+                ServiceDiscoveryConfig {
+                    endpoint: "ftp://catalog.internal".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "relative endpoint",
+                ServiceDiscoveryConfig {
+                    endpoint: "/services".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "bad scheme",
+                ServiceDiscoveryConfig {
+                    scheme: "grpc".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "zero interval",
+                ServiceDiscoveryConfig {
+                    interval_ms: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "zero timeout",
+                ServiceDiscoveryConfig {
+                    timeout_ms: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "empty path segment",
+                ServiceDiscoveryConfig {
+                    data_path: "a..b".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "leading dot",
+                ServiceDiscoveryConfig {
+                    parent_data_path: Some(".data".into()),
+                    ..base.clone()
+                },
+            ),
+        ] {
+            def.service_discovery = Some(broken);
+            assert!(def.validate().is_err(), "`{label}` accepted");
+        }
+    }
+
+    #[test]
+    fn service_discovery_extracts_entries() {
+        let sd = |json: &str| -> ServiceDiscoveryConfig {
+            serde_json::from_str(json).expect("valid discovery JSON")
+        };
+        let entry = |host: &str, port: Option<u16>| DiscoveredEntry {
+            host: host.to_owned(),
+            port,
+        };
+
+        for (label, config, doc, expected) in [
+            (
+                "bare array of strings, empty data_path",
+                sd(r#"{"endpoint": "http://c.internal"}"#),
+                serde_json::json!(["a.internal", "b.internal:9000"]),
+                vec![entry("a.internal", None), entry("b.internal:9000", None)],
+            ),
+            (
+                "single string under a dotted path",
+                sd(r#"{"endpoint": "http://c.internal", "data_path": "node.ip"}"#),
+                serde_json::json!({"node": {"ip": "10.0.0.7"}}),
+                vec![entry("10.0.0.7", None)],
+            ),
+            (
+                "consul-style root array via empty parent_data_path",
+                sd(r#"{"endpoint": "http://c.internal", "parent_data_path": "",
+                        "data_path": "Address", "port_data_path": "ServicePort"}"#),
+                serde_json::json!([
+                    {"Address": "10.0.0.1", "ServicePort": 8300},
+                    {"Address": "10.0.0.2", "ServicePort": 8301}
+                ]),
+                vec![entry("10.0.0.1", Some(8300)), entry("10.0.0.2", Some(8301))],
+            ),
+            (
+                "nested parent path with numeric array index and string port",
+                sd(
+                    r#"{"endpoint": "http://c.internal", "parent_data_path": "data.nodes",
+                        "data_path": "addrs.0", "port_data_path": "port"}"#,
+                ),
+                serde_json::json!({"data": {"nodes": [
+                    {"addrs": ["x.internal", "ignored"], "port": "7000"}
+                ]}}),
+                vec![entry("x.internal", Some(7000))],
+            ),
+            (
+                "root-level port applied to every entry",
+                sd(r#"{"endpoint": "http://c.internal", "data_path": "hosts",
+                        "port_data_path": "port"}"#),
+                serde_json::json!({"hosts": ["a.internal", "b.internal"], "port": 8080}),
+                vec![
+                    entry("a.internal", Some(8080)),
+                    entry("b.internal", Some(8080)),
+                ],
+            ),
+            (
+                "full URLs pass through untouched",
+                sd(r#"{"endpoint": "http://c.internal"}"#),
+                serde_json::json!(["https://a.internal:8443/base"]),
+                vec![entry("https://a.internal:8443/base", None)],
+            ),
+        ] {
+            let entries = config
+                .extract_entries(&doc)
+                .unwrap_or_else(|e| panic!("`{label}` failed: {e}"));
+            assert_eq!(entries, expected, "`{label}`");
+        }
+    }
+
+    #[test]
+    fn service_discovery_extraction_errors() {
+        let sd = |json: &str| -> ServiceDiscoveryConfig {
+            serde_json::from_str(json).expect("valid discovery JSON")
+        };
+        for (label, config, doc, needle) in [
+            (
+                "parent path not an array",
+                sd(r#"{"endpoint": "http://c.internal", "parent_data_path": "svc"}"#),
+                serde_json::json!({"svc": {"a": 1}}),
+                "is not an array",
+            ),
+            (
+                "missing parent path",
+                sd(r#"{"endpoint": "http://c.internal", "parent_data_path": "svc"}"#),
+                serde_json::json!({"other": []}),
+                "not found",
+            ),
+            (
+                "missing data path",
+                sd(r#"{"endpoint": "http://c.internal", "data_path": "hosts"}"#),
+                serde_json::json!({"other": []}),
+                "not found",
+            ),
+            (
+                "non-string host element",
+                sd(r#"{"endpoint": "http://c.internal", "data_path": "hosts"}"#),
+                serde_json::json!({"hosts": ["ok.internal", 42]}),
+                "not a non-empty string",
+            ),
+            (
+                "empty host string",
+                sd(r#"{"endpoint": "http://c.internal"}"#),
+                serde_json::json!("  "),
+                "not a non-empty string",
+            ),
+            (
+                "non-string host in parent element",
+                sd(r#"{"endpoint": "http://c.internal", "parent_data_path": "",
+                        "data_path": "ip"}"#),
+                serde_json::json!([{"ip": 42}]),
+                "not a non-empty string",
+            ),
+            (
+                "port zero",
+                sd(r#"{"endpoint": "http://c.internal", "data_path": "hosts",
+                        "port_data_path": "port"}"#),
+                serde_json::json!({"hosts": ["a"], "port": 0}),
+                "between 1 and 65535",
+            ),
+            (
+                "port too large",
+                sd(r#"{"endpoint": "http://c.internal", "data_path": "hosts",
+                        "port_data_path": "port"}"#),
+                serde_json::json!({"hosts": ["a"], "port": 70000}),
+                "between 1 and 65535",
+            ),
+            (
+                "non-numeric port string",
+                sd(r#"{"endpoint": "http://c.internal", "data_path": "hosts",
+                        "port_data_path": "port"}"#),
+                serde_json::json!({"hosts": ["a"], "port": "eighty"}),
+                "between 1 and 65535",
+            ),
+        ] {
+            let err = config
+                .extract_entries(&doc)
+                .expect_err(&format!("`{label}` accepted"));
+            assert!(err.contains(needle), "`{label}`: got `{err}`");
         }
     }
 

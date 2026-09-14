@@ -17,7 +17,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api_definition::{CacheConfig, CircuitBreakerConfig, HealthCheckConfig};
+use crate::api_definition::{
+    CacheConfig, CircuitBreakerConfig, HealthCheckConfig, ServiceDiscoveryConfig,
+};
 use crate::endpoints::{EndpointRateLimit, MockResponse, PathRule};
 use crate::graphql::GraphQlConfig;
 use crate::plugins::PluginsConfig;
@@ -136,6 +138,14 @@ pub struct VersionOverrides {
     /// Replacement upstream health-check settings for this version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health_check: Option<HealthCheckConfig>,
+
+    /// Replacement service-discovery settings for this version (replaced
+    /// wholesale). Like other `Option`-typed base fields it can be
+    /// overridden but not cleared per version — keep discovery off the base
+    /// definition if only some versions want it. The version's effective
+    /// `target_list`/`target_url` are its seed addresses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_discovery: Option<ServiceDiscoveryConfig>,
 
     /// Replacement circuit-breaker settings for this version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -291,6 +301,9 @@ impl VersioningConfig {
         }
         if let Some(v) = &overrides.health_check {
             def.health_check = Some(v.clone());
+        }
+        if let Some(v) = &overrides.service_discovery {
+            def.service_discovery = Some(v.clone());
         }
         if let Some(v) = &overrides.circuit_breaker {
             def.circuit_breaker = Some(v.clone());
@@ -489,6 +502,45 @@ mod tests {
 
         // A broken override fails validation naming the version.
         let cfg = versioning(r#"{"versions": {"v2": {"health_check": {"interval_ms": 0}}}}"#);
+        let err = cfg.validate(&base).unwrap_err().to_string();
+        assert!(err.contains("version `v2`"), "got: {err}");
+    }
+
+    #[test]
+    fn service_discovery_override_replaces_the_base_settings() {
+        let mut base = base();
+        base.service_discovery = Some(
+            serde_json::from_str(r#"{"endpoint": "http://catalog.internal/v1"}"#)
+                .expect("discovery JSON"),
+        );
+
+        let cfg = versioning(
+            r#"{"versions": {
+                "v1": {},
+                "v2": {"service_discovery": {
+                    "endpoint": "http://catalog.internal/v2", "interval_ms": 2000
+                }}
+            }}"#,
+        );
+        cfg.validate(&base).expect("valid");
+        let v1 = cfg.apply(&base, "v1").expect("configured");
+        assert_eq!(
+            v1.service_discovery.as_ref().expect("inherited").endpoint,
+            "http://catalog.internal/v1"
+        );
+        let v2 = cfg.apply(&base, "v2").expect("configured");
+        let sd = v2.service_discovery.as_ref().expect("overridden");
+        assert_eq!(
+            (sd.endpoint.as_str(), sd.interval_ms),
+            ("http://catalog.internal/v2", 2000)
+        );
+
+        // A broken override fails validation naming the version.
+        let cfg = versioning(
+            r#"{"versions": {"v2": {"service_discovery": {
+                "endpoint": "http://catalog.internal", "interval_ms": 0
+            }}}}"#,
+        );
         let err = cfg.validate(&base).unwrap_err().to_string();
         assert!(err.contains("version `v2`"), "got: {err}");
     }

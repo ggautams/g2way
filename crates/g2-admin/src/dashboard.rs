@@ -79,10 +79,26 @@ pub(crate) async fn node(State(state): State<AdminState>) -> Response {
                 "listen_path": route.def.listen_path,
                 "target_url": route.def.target_url,
                 "target_list": route.def.target_list,
-                // Per-address health flags (target_list order); null when
+                // The addresses actually in rotation — equals the
+                // configured targets until service discovery swaps them.
+                // Versioned APIs show the unused base target (each version
+                // rotates its own set, not surfaced here).
+                "live_targets": route.target.live_targets(),
+                // Per-address health flags (live_targets order); null when
                 // health checking is off or the API is versioned (each
                 // version probes its own target, not surfaced here).
                 "target_health": route.target.target_health(),
+                // Last discovery success/error; null when discovery is off
+                // or the API is versioned (each version polls its own
+                // endpoint, not surfaced here).
+                "service_discovery": route.target.discovery_status().map(|s| {
+                    serde_json::json!({
+                        "endpoint": route.def.service_discovery.as_ref()
+                            .map(|sd| sd.endpoint.clone()),
+                        "last_success_unix_secs": s.last_success_unix_secs,
+                        "last_error": s.last_error,
+                    })
+                }),
                 // Circuit state ("closed"/"open"/"half_open"); null when
                 // breaking is off or the API is versioned (each version
                 // keeps its own circuit, not surfaced here).
