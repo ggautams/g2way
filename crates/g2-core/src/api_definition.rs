@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use http::Uri;
 use serde::{Deserialize, Serialize};
 
-use crate::endpoints::{MockResponse, PathRule};
+use crate::endpoints::{EndpointRateLimit, MockResponse, PathRule};
 use crate::graphql::GraphQlConfig;
 use crate::security::{self, CorsConfig};
 use crate::transform::{self, HeaderTransforms, UrlRewriteRule};
@@ -887,8 +887,9 @@ pub struct ApiDefinition {
     pub block_paths: Vec<PathRule>,
 
     /// Requests matching one of these rules skip authentication (and with
-    /// it rate limiting, which needs a session) — e.g. a public health or
-    /// webhook endpoint on an otherwise protected API.
+    /// it session rate limiting, which needs a session) — e.g. a public
+    /// health or webhook endpoint on an otherwise protected API. API-level
+    /// [`endpoint_rate_limits`](Self::endpoint_rate_limits) still apply.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ignore_auth_paths: Vec<PathRule>,
 
@@ -897,6 +898,15 @@ pub struct ApiDefinition {
     /// upstream (see [`MockResponse`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub mock_responses: Vec<MockResponse>,
+
+    /// Aggregate per-endpoint rate limits: the first rule matching a
+    /// request caps how many matching requests **all clients combined** may
+    /// make per window; excess is rejected with `429`. Counted
+    /// independently of any key session's rate/quota and enforced even on
+    /// keyless APIs and `ignore_auth_paths` matches (see
+    /// [`EndpointRateLimit`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub endpoint_rate_limits: Vec<EndpointRateLimit>,
 
     /// Optional CORS settings: when present the gateway answers preflight
     /// requests and decorates responses with `Access-Control-*` headers
@@ -1089,6 +1099,9 @@ impl ApiDefinition {
         }
         for (index, mock) in self.mock_responses.iter().enumerate() {
             mock.validate(&self.api_id, index)?;
+        }
+        for (index, rule) in self.endpoint_rate_limits.iter().enumerate() {
+            rule.validate(&self.api_id, index)?;
         }
         if let Some(cors) = &self.cors {
             cors.validate(&self.api_id)?;
@@ -1847,6 +1860,40 @@ mod tests {
             headers: Default::default(),
         }];
         assert!(def.validate().is_err());
+    }
+
+    #[test]
+    fn endpoint_rate_limits_parse_and_validate() {
+        let json = r#"{
+            "api_id": "e",
+            "name": "e",
+            "listen_path": "/e/",
+            "target_url": "http://e.internal",
+            "endpoint_rate_limits": [
+                {"pattern": "^/e/search", "methods": ["POST"],
+                 "rate": {"requests": 10, "per_seconds": 60}}
+            ]
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        assert_eq!(def.endpoint_rate_limits[0].rate.requests, 10);
+
+        // Stays off the wire when empty (old records unaffected).
+        let bare = serde_json::to_string(&parse(minimal_json())).expect("serializes");
+        assert!(!bare.contains("endpoint_rate_limits"));
+
+        // A broken rule fails validation, naming the list.
+        let mut def = parse(minimal_json());
+        def.endpoint_rate_limits = vec![super::EndpointRateLimit {
+            pattern: "^/x$".into(),
+            methods: vec![],
+            rate: crate::session::RateLimit {
+                requests: 0,
+                per_seconds: 60,
+            },
+        }];
+        let err = def.validate().unwrap_err().to_string();
+        assert!(err.contains("endpoint_rate_limits[0]"), "got: {err}");
     }
 
     #[test]

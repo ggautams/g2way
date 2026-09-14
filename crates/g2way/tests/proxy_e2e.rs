@@ -632,6 +632,89 @@ async fn rate_limit_end_to_end() {
 }
 
 #[tokio::test]
+async fn endpoint_rate_limit_end_to_end() {
+    let upstream = spawn_echo_upstream().await;
+    // Keyless API: endpoint limits need no session, so they must work
+    // without any key provisioned and without an Authorization header.
+    let def = serde_json::from_str::<ApiDefinition>(&format!(
+        r#"{{
+            "api_id": "erl", "name": "erl", "listen_path": "/erl/",
+            "target_url": "http://{upstream}",
+            "auth": {{"mode": "keyless"}},
+            "endpoint_rate_limits": [
+                {{"pattern": "^/erl/limited",
+                  "rate": {{"requests": 2, "per_seconds": 60}}}}
+            ]
+        }}"#
+    ))
+    .expect("definition");
+    let (gw, _stop) = spawn_gateway(vec![def]).await;
+
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let call = |path: &'static str| {
+        let client = client.clone();
+        async move {
+            client
+                .get(format!("http://{gw}{path}").parse().expect("url"))
+                .await
+                .expect("response")
+        }
+    };
+
+    for _ in 0..2 {
+        assert_eq!(call("/erl/limited").await.status(), StatusCode::OK);
+    }
+    let resp = call("/erl/limited").await;
+    assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(
+        resp.headers()
+            .get("x-ratelimit-limit")
+            .expect("limit header")
+            .as_bytes(),
+        b"2"
+    );
+    assert!(resp.headers().contains_key("x-ratelimit-reset"));
+    assert!(resp.headers().contains_key("retry-after"));
+
+    // Unmatched paths on the same API stay unlimited.
+    assert_eq!(call("/erl/other").await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn endpoint_rate_limit_applies_on_ignored_auth_paths() {
+    let upstream = spawn_echo_upstream().await;
+    // Token-auth API whose webhook path skips auth: no session exists for
+    // requests to it, but the aggregate endpoint limit must still bite.
+    let def = serde_json::from_str::<ApiDefinition>(&format!(
+        r#"{{
+            "api_id": "erlw", "name": "erlw", "listen_path": "/erlw/",
+            "target_url": "http://{upstream}",
+            "ignore_auth_paths": [{{"pattern": "^/erlw/webhook$"}}],
+            "endpoint_rate_limits": [
+                {{"pattern": "^/erlw/webhook$",
+                  "rate": {{"requests": 2, "per_seconds": 60}}}}
+            ]
+        }}"#
+    ))
+    .expect("definition");
+    let (gw, _stop) = spawn_gateway(vec![def]).await;
+
+    let (status, _) = http_get(&format!("http://{gw}/erlw/elsewhere")).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "API is protected");
+
+    for _ in 0..2 {
+        let (status, _) = http_get(&format!("http://{gw}/erlw/webhook")).await;
+        assert_eq!(status, StatusCode::OK, "ignored path needs no credentials");
+    }
+    let (status, _) = http_get(&format!("http://{gw}/erlw/webhook")).await;
+    assert_eq!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS,
+        "endpoint limit still applies without a session"
+    );
+}
+
+#[tokio::test]
 async fn basic_auth_end_to_end() {
     use base64::Engine as _;
     use g2_core::session::{hash_key, session_storage_key};

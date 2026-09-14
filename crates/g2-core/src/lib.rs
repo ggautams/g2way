@@ -39,7 +39,7 @@ pub use api_definition::{
     JwtSigningMethod, DEFAULT_ORG_ID,
 };
 pub use config::{AnalyticsSinkKind, ClientCertMode, GatewayConfig, SpikeGuardConfig, TlsConfig};
-pub use endpoints::{MockResponse, PathRule};
+pub use endpoints::{EndpointRateLimit, MockResponse, PathRule};
 pub use error::Error;
 pub use graphql::{GraphQlConfig, GraphQlExecutionMode, PersistedQuery, PlaygroundConfig};
 pub use policy::Policy;

@@ -88,7 +88,7 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 - [x] OAuth2/OIDC: external-IdP token validation (discovery + JWKS,
       iss/aud checks, client-id→policy mapping; `docs/oidc.md`)
 - [x] HMAC request signatures (draft-cavage, `docs/hmac.md`)
-- [ ] Per-endpoint rate limits
+- [x] Per-endpoint rate limits (aggregate, API-level; `docs/endpoint-rate-limits.md`)
 - [ ] WebSocket/SSE passthrough; gRPC passthrough
 - [ ] Plugin system (WASM pre/post hooks — needs an ADR first)
 - [ ] Service discovery; request/response body transforms
@@ -891,3 +891,27 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   suite) + `hmac_auth_end_to_end` e2e. Not done (deliberate): rsa-sha256
   signatures, `(created)`/`(expires)`, body-digest verification. Next:
   M8+ per-endpoint rate limits.
+- **2026-09-01 (3)** — M8+ per-endpoint rate limits landed
+  (`docs/endpoint-rate-limits.md`), **API-level/aggregate flavor only**
+  (user-confirmed scope; a key-level `access_rights[].endpoints`
+  flavor is a possible future box). `ApiDefinition.endpoint_rate_limits:
+  Vec<EndpointRateLimit {pattern, methods, rate: RateLimit}>`
+  (g2-core::endpoints, PathRule conventions: unanchored regex on the full
+  client path, empty methods = all, zero rate rejected) + a
+  `VersionOverrides` arm (wholesale; per-version counters). Runtime extends
+  `RateLimitLayer` (no new layer): compiled `EndpointLimits` checked
+  **before** the `SessionContext` early-return, so keyless APIs and
+  `ignore_auth_paths` matches — previously entirely unlimited — are now
+  covered; router gating became `auth.is_some() || endpoint_limits.is_some()`
+  and the `cache_scope` param was renamed `scope` (now also namespaces
+  endpoint counters: `g2:{org}:endpointrl:{scope}:{index}`, index-keyed —
+  reordering rules resets windows, documented). First match wins (mock
+  precedent); denial = the same 429 + `X-RateLimit-*`/`Retry-After`; fail
+  open on storage errors; endpoint-denied requests consume no session
+  allowance (tested); spike guard deliberately covers only session checks.
+  No Storage changes (`check_rate` on a new key), no ADR. Tests: 9 new
+  layer units (incl. aggregate-across-identities and denial-spares-session
+  proofs), router build test, 2 e2e (keyless 429 + ignored-path 429);
+  `BrokenLimits` test double hoisted to module scope for reuse. Next: M8+
+  WebSocket/SSE passthrough + gRPC passthrough (also unblocks M9 GraphQL
+  subscriptions).

@@ -54,8 +54,9 @@ use crate::{ChainService, ProxyBody};
 ///    unconfigured). Above auth so oversized requests are rejected before
 ///    any credential work.
 /// 10. [`AuthLayer`] — token auth (absent for keyless APIs).
-/// 11. [`RateLimitLayer`] — session rate/quota enforcement (absent for
-///     keyless APIs, which have no session to read limits from).
+/// 11. [`RateLimitLayer`] — endpoint rate limits plus session rate/quota
+///     enforcement (absent only for keyless APIs without endpoint rate
+///     limits: session limits need a session, endpoint limits do not).
 /// 12. [`GraphQlLayer`] — GraphQL protections, playground, and persisted
 ///     queries (absent when unconfigured). Below auth/rate-limit so the
 ///     per-key grants are resolved, the playground stays credentialed, and

@@ -18,7 +18,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::api_definition::{CacheConfig, CircuitBreakerConfig, HealthCheckConfig};
-use crate::endpoints::{MockResponse, PathRule};
+use crate::endpoints::{EndpointRateLimit, MockResponse, PathRule};
 use crate::graphql::GraphQlConfig;
 use crate::transform::{HeaderTransforms, UrlRewriteRule};
 use crate::{ApiDefinition, Error};
@@ -125,6 +125,12 @@ pub struct VersionOverrides {
     /// Replacement mock-response rules for this version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mock_responses: Option<Vec<MockResponse>>,
+
+    /// Replacement endpoint rate limits for this version (replaced
+    /// wholesale). Each version's counters live under their own scope, so
+    /// versions never share allowances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endpoint_rate_limits: Option<Vec<EndpointRateLimit>>,
 
     /// Replacement upstream health-check settings for this version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -263,6 +269,9 @@ impl VersioningConfig {
         }
         if let Some(v) = &overrides.mock_responses {
             def.mock_responses = v.clone();
+        }
+        if let Some(v) = &overrides.endpoint_rate_limits {
+            def.endpoint_rate_limits = v.clone();
         }
         if let Some(v) = &overrides.health_check {
             def.health_check = Some(v.clone());
@@ -550,6 +559,51 @@ mod tests {
         let cfg = versioning(r#"{"versions": {"v2": {"graphql": {"schema": "type Query {"}}}}"#);
         let err = cfg.validate(&base).unwrap_err().to_string();
         assert!(err.contains("version `v2`"), "got: {err}");
+    }
+
+    #[test]
+    fn endpoint_rate_limit_override_replaces_the_base_and_is_validated() {
+        let cfg = versioning(
+            r#"{
+                "versions": {
+                    "v1": {},
+                    "v2": {"endpoint_rate_limits": [
+                        {"pattern": "^/v/search",
+                         "rate": {"requests": 3, "per_seconds": 30}}
+                    ]}
+                }
+            }"#,
+        );
+        let mut base = base();
+        base.endpoint_rate_limits = vec![EndpointRateLimit {
+            pattern: "^/v/".into(),
+            methods: vec![],
+            rate: crate::session::RateLimit {
+                requests: 100,
+                per_seconds: 60,
+            },
+        }];
+        base.versioning = Some(cfg.clone());
+        base.validate().expect("valid");
+
+        let v1 = cfg.apply(&base, "v1").expect("v1 configured");
+        assert_eq!(v1.endpoint_rate_limits, base.endpoint_rate_limits);
+
+        let v2 = cfg.apply(&base, "v2").expect("v2 configured");
+        assert_eq!(v2.endpoint_rate_limits.len(), 1);
+        assert_eq!(v2.endpoint_rate_limits[0].rate.requests, 3);
+
+        let broken = versioning(
+            r#"{"versions": {"v2": {"endpoint_rate_limits": [
+                {"pattern": "(", "rate": {"requests": 3, "per_seconds": 30}}
+            ]}}}"#,
+        );
+        let err = broken.validate(&base).unwrap_err().to_string();
+        assert!(err.contains("version `v2`"), "got: {err}");
+        assert!(
+            err.contains("endpoint_rate_limits[0].pattern"),
+            "got: {err}"
+        );
     }
 
     #[test]

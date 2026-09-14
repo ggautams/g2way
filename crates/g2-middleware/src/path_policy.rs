@@ -15,7 +15,8 @@
 //!    one message, so callers cannot probe which list produced a rejection.
 //! 3. **Ignore**: a request matching `ignore_auth_paths` is stamped with
 //!    [`AuthBypass`] and forwarded without authentication (and therefore
-//!    without rate limiting, which needs a session).
+//!    without session rate limiting, which needs a session — API-level
+//!    endpoint rate limits still apply, they count aggregate traffic).
 //!
 //! Patterns are compiled once at route-build time; the hot path only runs
 //! prebuilt automata (the `regex` crate is linear-time, so hostile paths

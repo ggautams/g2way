@@ -8,7 +8,7 @@ use g2_core::{ApiDefinition, Error};
 use g2_middleware::SharedJwksFetch;
 use g2_middleware::{
     AnalyticsHandle, AnalyticsLayer, AuthLayer, CacheLayer, ChainBuilder, ChainService, CorsLayer,
-    GraphQlLayer, HeaderTransformLayer, HttpMetrics, IpFilterLayer, MetricsLayer,
+    EndpointLimits, GraphQlLayer, HeaderTransformLayer, HttpMetrics, IpFilterLayer, MetricsLayer,
     MockResponseLayer, PathPolicyLayer, RateLimitLayer, RequestContext, RequestSizeLimitLayer,
     SpikeGuard, StatsLayer, StatsRegistry, TraceLayer, VersionDispatch,
 };
@@ -20,17 +20,17 @@ use crate::forward::{Forward, Forwarder, HttpJwksFetch, UpstreamTarget};
 /// place the inner half of a chain is configured, shared by the unversioned
 /// [`ChainBuilder::build`] path and each version of a versioned API.
 ///
-/// `cache_scope` namespaces the response cache: the API id for an
-/// unversioned API, `{api_id}:{version}` per version of a versioned one —
-/// versions can differ in upstream and transforms, so they must never share
-/// cached responses.
+/// `scope` namespaces the response cache and the endpoint rate-limit
+/// counters: the API id for an unversioned API, `{api_id}:{version}` per
+/// version of a versioned one — versions can differ in upstream, transforms
+/// and limits, so they must never share cached responses or counters.
 fn inner_layers(
     builder: ChainBuilder,
     def: &ApiDefinition,
     storage: &SharedStorage,
     jwks_fetch: &SharedJwksFetch,
     spike_guard: Option<&Arc<SpikeGuard>>,
-    cache_scope: &str,
+    scope: &str,
 ) -> Result<ChainBuilder, Error> {
     let auth = AuthLayer::from_config(
         &def.auth,
@@ -39,16 +39,21 @@ fn inner_layers(
         &def.org_id,
         Some(Arc::clone(jwks_fetch)),
     )?;
-    // Keyless APIs carry no session, so there are no limits to read;
-    // every credentialed API gets the limiter (it is a no-op for
-    // sessions without rate/quota).
-    let rate_limit = auth.as_ref().map(|_| {
-        RateLimitLayer::new(
+    let endpoint_limits =
+        EndpointLimits::from_config(&def.endpoint_rate_limits, &def.api_id, &def.org_id, scope)?;
+    // Every credentialed API gets the limiter (it is a no-op for sessions
+    // without rate/quota); a keyless API gets it only when it declares
+    // endpoint limits, which need no session.
+    let rate_limit = if auth.is_some() || endpoint_limits.is_some() {
+        Some(RateLimitLayer::new(
             &def.api_id,
             Arc::clone(storage),
             spike_guard.map(Arc::clone),
-        )
-    });
+            endpoint_limits,
+        ))
+    } else {
+        None
+    };
     let transform_headers = def
         .transform_headers
         .as_ref()
@@ -71,7 +76,7 @@ fn inner_layers(
     let cache = def
         .cache
         .as_ref()
-        .map(|c| CacheLayer::new(c, cache_scope, &def.org_id, Arc::clone(storage)));
+        .map(|c| CacheLayer::new(c, scope, &def.org_id, Arc::clone(storage)));
     Ok(builder
         .path_policy(path_policy)
         .size_limit(size_limit)
@@ -166,14 +171,14 @@ impl Route {
                     if let Some(health) = &vdef.health_check {
                         crate::health::spawn_checker(forwarder, &vtarget, health);
                     }
-                    let cache_scope = format!("{}:{name}", vdef.api_id);
+                    let scope = format!("{}:{name}", vdef.api_id);
                     let inner = inner_layers(
                         ChainBuilder::new(ctx.clone()),
                         &vdef,
                         storage,
                         &jwks_fetch,
                         spike_guard,
-                        &cache_scope,
+                        &scope,
                     )?
                     .build_inner(Forward::new(forwarder, vtarget));
                     chains.insert(name.clone(), inner);
@@ -410,6 +415,23 @@ mod tests {
             assert!(t.match_path("/svc").is_some());
             assert!(t.match_path("/svc/x").is_some());
         }
+    }
+
+    #[test]
+    fn keyless_definition_with_endpoint_limits_builds_a_route() {
+        // Keyless APIs normally get no RateLimitLayer; endpoint limits must
+        // still build one (behavior is covered by the e2e suite).
+        let mut d = def("erl", "/erl/", "http://u.internal");
+        d.endpoint_rate_limits = vec![g2_core::EndpointRateLimit {
+            pattern: "^/erl/limited".into(),
+            methods: vec![],
+            rate: g2_core::session::RateLimit {
+                requests: 1,
+                per_seconds: 60,
+            },
+        }];
+        let table = table(vec![d]).expect("build");
+        assert!(table.match_path("/erl/limited").is_some());
     }
 
     #[test]

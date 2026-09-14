@@ -58,7 +58,7 @@ pub use jwks::{JwksFetch, JwksFetchFuture, SharedJwksFetch};
 pub use metrics::{HttpMetrics, MetricsLayer};
 pub use mock::{Mock, MockResponseLayer};
 pub use path_policy::{PathPolicy, PathPolicyLayer};
-pub use rate_limit::{RateLimit, RateLimitLayer};
+pub use rate_limit::{EndpointLimits, RateLimit, RateLimitLayer};
 pub use set_context::{SetContext, SetContextLayer};
 pub use size_limit::{
     is_request_too_large, RequestSizeLimit, RequestSizeLimitLayer, RequestTooLarge,
