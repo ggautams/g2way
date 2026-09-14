@@ -7,11 +7,11 @@ use std::sync::Arc;
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::SharedJwksFetch;
 use g2_middleware::{
-    AnalyticsHandle, AnalyticsLayer, AuthLayer, CacheLayer, ChainBuilder, ChainService, CorsLayer,
-    EndpointLimits, GraphQlLayer, HeaderTransformLayer, HookKind, HttpMetrics, IpFilterLayer,
-    MetricsLayer, MockResponseLayer, PathPolicyLayer, PluginLayer, RateLimitLayer, RequestContext,
-    RequestSizeLimitLayer, SharedPluginLoader, SpikeGuard, StatsLayer, StatsRegistry, TraceLayer,
-    VersionDispatch,
+    AnalyticsHandle, AnalyticsLayer, AuthLayer, BodyTransformLayer, CacheLayer, ChainBuilder,
+    ChainService, CorsLayer, EndpointLimits, GraphQlLayer, HeaderTransformLayer, HookKind,
+    HttpMetrics, IpFilterLayer, MetricsLayer, MockResponseLayer, PathPolicyLayer, PluginLayer,
+    RateLimitLayer, RequestContext, RequestSizeLimitLayer, SharedPluginLoader, SpikeGuard,
+    StatsLayer, StatsRegistry, TraceLayer, VersionDispatch,
 };
 use g2_storage::SharedStorage;
 
@@ -103,6 +103,12 @@ fn inner_layers(
         .as_ref()
         .map(|t| HeaderTransformLayer::from_config(t, &def.api_id))
         .transpose()?;
+    let transform_body = def
+        .transform_body
+        .as_ref()
+        .map(|t| BodyTransformLayer::from_config(t, def.max_request_body_bytes, &def.api_id))
+        .transpose()?
+        .flatten();
     let path_policy = PathPolicyLayer::from_config(
         &def.allow_paths,
         &def.block_paths,
@@ -142,6 +148,7 @@ fn inner_layers(
         .plugins_post(plugins_post)
         .graphql(graphql)
         .transform_headers(transform_headers)
+        .transform_body(transform_body)
         .mock(mock)
         .cache(cache))
 }

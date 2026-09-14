@@ -97,8 +97,8 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
       ADR-0005, `docs/plugins.md`)
 - [x] Service discovery (HTTP+JSON polling of a catalog endpoint;
       live target swaps via ArcSwap — ADR-0006, `docs/service-discovery.md`)
-- [ ] Request/response body transforms (template-engine decision made:
-      minijinja — pure Rust, serde-native, fits MSRV/no-cmake)
+- [x] Request/response body transforms (minijinja templates, endpoint-scoped
+      rules — ADR-0007, `docs/body-transforms.md`)
 
 ## M9 — GraphQL
 
@@ -1051,3 +1051,32 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   SRV/k8s-Endpoints sources, poll jitter, catalog-metadata weighting.
   Next: M8+ body transforms (minijinja), or an M9 GraphQL box
   (subscriptions unblocked).
+- **2026-09-01 (8)** — **M8+ complete.** Body transforms landed (ADR-0007,
+  `docs/body-transforms.md`): `ApiDefinition.transform_body {request,
+  response: [{pattern, methods, template, content_type}],
+  max_response_body_bytes}` — endpoint-scoped like `mock_responses`
+  (full-client-path regex, first match wins; response rules match the
+  *request's* method/path), inline minijinja templates (no file/base64
+  modes), `VersionOverrides` arm. Context is named-key, not
+  body-at-root: `body` (JSON or none), `raw`, `_g2 {method, path,
+  query, headers, session.alias, status}`. Runtime `BodyTransformLayer`
+  at **slot 16** (below header transforms: rejections untransformed,
+  mocks/cache-hits transformed; doc renumbered 1–19): per-API
+  `Environment<'static>` built at route-build (`add_template_owned`
+  compiles at insert), fuel-bounded rendering (1M units — **no timeout
+  machinery**, render is pure computation), **fail closed** (413 request
+  over-cap / 500 render fail / 502 response over-cap-or-fail; ADR-0005 §4
+  redaction rationale). First feature buffering *response* bodies (scoped
+  ADR-0001 amendment: matching endpoints only); 1xx skipped so upgrade
+  tunnels survive; trailers re-emitted via a two-frame `BufferedBody`
+  (grpc-status intact); retry gate untouched. `size_limit` grew
+  `is_over_limit` (graphql's LengthLimitError walk hoisted). New dep
+  minijinja 2 (`builtins,serde,json,fuel`; no `multi_template` — include/
+  extends are config-time errors). **Gotchas:** bare `{{ true }}` renders
+  `True` (Python-style) — docs steer JSON output to `| tojson`;
+  `{{ 1 / 0 }}` is `inf`, not an error. Tests: 6 g2-core units + 16
+  layer units + 2 chain-ordering + 4-case `transform_body_e2e.rs`.
+  **Env note:** target/ hit ENOSPC mid-build (accumulated 139G!) →
+  `cargo clean` + cold rebuild this session; the plan is to `cargo clean`
+  at session end going forward. Next: an M9 GraphQL box — subscriptions
+  over WebSocket (unblocked) or schema sync from introspection.

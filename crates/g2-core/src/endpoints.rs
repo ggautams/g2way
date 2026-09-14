@@ -234,7 +234,12 @@ pub fn endpoint_rate_limit_storage_key(org_id: &str, scope: &str, index: usize) 
     format!("g2:{org_id}:endpointrl:{scope}:{index}")
 }
 
-fn validate_pattern(pattern: &str, api: &str, list: &str, index: usize) -> Result<(), Error> {
+pub(crate) fn validate_pattern(
+    pattern: &str,
+    api: &str,
+    list: &str,
+    index: usize,
+) -> Result<(), Error> {
     regex::Regex::new(pattern)
         .map(|_| ())
         .map_err(|err| Error::InvalidApiDefinition {
@@ -243,7 +248,12 @@ fn validate_pattern(pattern: &str, api: &str, list: &str, index: usize) -> Resul
         })
 }
 
-fn validate_methods(methods: &[String], api: &str, list: &str, index: usize) -> Result<(), Error> {
+pub(crate) fn validate_methods(
+    methods: &[String],
+    api: &str,
+    list: &str,
+    index: usize,
+) -> Result<(), Error> {
     for method in methods {
         if !TRANSFORM_METHODS
             .iter()

@@ -47,6 +47,13 @@ apollo-compiler = "1"
 # need cmake (the rust:1-slim Docker build stage has gcc but no cmake).
 wasmtime = { version = "33", default-features = false, features = ["runtime", "cranelift", "std"] }
 
+# Body-transform template engine (ADR-0007). Pure Rust, MSRV 1.70, no native
+# deps (the rust:1-slim Docker build stage has no cmake). Trimmed features:
+# no `multi_template` on purpose — templates are self-contained
+# (`include`/`extends` become config-time syntax errors); `json` supplies the
+# `tojson` filter; `fuel` bounds render cost per request.
+minijinja = { version = "2", default-features = false, features = ["builtins", "serde", "json", "fuel"] }
+
 # Data / config
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

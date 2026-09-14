@@ -40,6 +40,7 @@ pub mod size_limit;
 pub mod spike;
 pub mod stats;
 pub mod trace;
+pub mod transform_body;
 pub mod transform_headers;
 pub mod versioning;
 
@@ -71,6 +72,7 @@ pub use size_limit::{
 pub use spike::SpikeGuard;
 pub use stats::{ApiStats, ApiStatsSnapshot, StatsLayer, StatsRegistry};
 pub use trace::{Trace, TraceLayer};
+pub use transform_body::{BodyTransformLayer, BodyTransformer};
 pub use transform_headers::{HeaderTransformLayer, HeaderTransformer};
 pub use versioning::VersionDispatch;
 

@@ -22,6 +22,7 @@
 
 pub mod analytics;
 pub mod api_definition;
+pub mod body_transform;
 pub mod config;
 pub mod endpoints;
 mod error;
@@ -39,6 +40,7 @@ pub use api_definition::{
     ApiDefinition, AuthConfig, CacheConfig, CircuitBreakerConfig, DiscoveredEntry,
     HealthCheckConfig, HmacAlgorithm, JwtSigningMethod, ServiceDiscoveryConfig, DEFAULT_ORG_ID,
 };
+pub use body_transform::{BodyTransformRule, BodyTransforms};
 pub use config::{AnalyticsSinkKind, ClientCertMode, GatewayConfig, SpikeGuardConfig, TlsConfig};
 pub use endpoints::{EndpointRateLimit, MockResponse, PathRule};
 pub use error::Error;

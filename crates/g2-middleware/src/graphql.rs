@@ -21,10 +21,11 @@
 //!    control, depth limits, per-key field permissions — before the
 //!    original bytes are forwarded upstream unchanged.
 //!
-//! This is the only layer that buffers a request body. The buffering is
-//! bounded (the API's `max_request_body_bytes`, else 1 MiB) and the exact
-//! bytes are re-emitted, so the upstream sees the request unmodified; see
-//! ADR-0004 for the retry-semantics discussion.
+//! Like [`transform_body`](crate::transform_body), this layer buffers a
+//! request body. The buffering is bounded (the API's
+//! `max_request_body_bytes`, else 1 MiB) and the exact bytes are
+//! re-emitted, so the upstream sees the request unmodified; see ADR-0004
+//! for the retry-semantics discussion.
 //!
 //! Everything derivable from configuration — the compiled schema, the
 //! playground HTML, persisted-path regexes and pre-parsed operations — is
@@ -59,7 +60,6 @@ use regex::Regex;
 use tower::{Layer, Service};
 
 use crate::response::json_error;
-use crate::size_limit::is_request_too_large;
 use crate::{ProxyBody, SessionContext};
 
 /// Bound on the buffered GraphQL request body when the API sets no
@@ -464,19 +464,7 @@ async fn extract_query(
 /// own buffering cap ([`Limited`]) both answer `413`; anything else is a
 /// client disconnect or transport error.
 fn body_read_error(err: &(dyn std::error::Error + 'static)) -> Response<ProxyBody> {
-    let over_own_cap = {
-        let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
-        let mut found = false;
-        while let Some(e) = current {
-            if e.is::<http_body_util::LengthLimitError>() {
-                found = true;
-                break;
-            }
-            current = e.source();
-        }
-        found
-    };
-    if is_request_too_large(err) || over_own_cap {
+    if crate::size_limit::is_over_limit(err) {
         json_error(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
     } else {
         graphql_errors(StatusCode::BAD_REQUEST, ["failed to read the request body"])

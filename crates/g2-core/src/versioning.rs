@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::api_definition::{
     CacheConfig, CircuitBreakerConfig, HealthCheckConfig, ServiceDiscoveryConfig,
 };
+use crate::body_transform::BodyTransforms;
 use crate::endpoints::{EndpointRateLimit, MockResponse, PathRule};
 use crate::graphql::GraphQlConfig;
 use crate::plugins::PluginsConfig;
@@ -104,6 +105,11 @@ pub struct VersionOverrides {
     /// Replacement header transforms for this version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform_headers: Option<HeaderTransforms>,
+
+    /// Replacement body transforms for this version (both rule lists and
+    /// the response cap — replaced wholesale).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform_body: Option<BodyTransforms>,
 
     /// Replacement URL rewrite rules for this version.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -278,6 +284,9 @@ impl VersioningConfig {
         if let Some(v) = &overrides.transform_headers {
             def.transform_headers = Some(v.clone());
         }
+        if let Some(v) = &overrides.transform_body {
+            def.transform_body = Some(v.clone());
+        }
         if let Some(v) = &overrides.url_rewrites {
             def.url_rewrites = v.clone();
         }
@@ -437,6 +446,42 @@ mod tests {
         assert_eq!(v2.auth, base.auth);
 
         assert!(cfg.apply(&base, "v3").is_none());
+    }
+
+    #[test]
+    fn transform_body_override_replaces_wholesale() {
+        let mut base = base();
+        base.transform_body = Some(
+            serde_json::from_str(
+                r#"{"request": [{"pattern": "^/a$", "template": "base"}],
+                    "response": [{"pattern": "^/a$", "template": "base"}]}"#,
+            )
+            .expect("parses"),
+        );
+
+        let cfg = versioning(
+            r#"{"versions": {
+                "v1": {},
+                "v2": {"transform_body": {"request": [{"pattern": "^/b$", "template": "v2"}]}}
+            }}"#,
+        );
+        cfg.validate(&base).expect("valid");
+
+        let v1 = cfg.apply(&base, "v1").expect("configured");
+        assert_eq!(v1.transform_body, base.transform_body, "inherited");
+
+        let v2 = cfg.apply(&base, "v2").expect("configured");
+        let block = v2.transform_body.expect("overridden");
+        assert_eq!(block.request.len(), 1);
+        assert_eq!(block.request[0].template, "v2");
+        assert!(block.response.is_empty(), "response rules replaced away");
+
+        // A broken override fails like any invalid effective definition.
+        let cfg = versioning(
+            r#"{"versions": {"v2": {"transform_body": {"request": [{"pattern": "(", "template": "x"}]}}}}"#,
+        );
+        let err = cfg.validate(&base).unwrap_err().to_string();
+        assert!(err.contains("version `v2`"), "got: {err}");
     }
 
     #[test]

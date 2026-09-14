@@ -63,6 +63,25 @@ pub fn is_request_too_large(err: &(dyn std::error::Error + 'static)) -> bool {
     false
 }
 
+/// Whether `err`'s source chain carries either over-limit marker: this
+/// layer's mid-stream [`RequestTooLarge`] or a buffering layer's
+/// [`http_body_util::LengthLimitError`] (from `Limited`). Body-buffering
+/// layers use this to answer `413`/`502` for oversized payloads instead of
+/// mistaking them for transport errors.
+pub(crate) fn is_over_limit(err: &(dyn std::error::Error + 'static)) -> bool {
+    if is_request_too_large(err) {
+        return true;
+    }
+    let mut current: Option<&(dyn std::error::Error + 'static)> = Some(err);
+    while let Some(err) = current {
+        if err.is::<http_body_util::LengthLimitError>() {
+            return true;
+        }
+        current = err.source();
+    }
+    false
+}
+
 /// A request body that fails with [`RequestTooLarge`] once more than
 /// `remaining` bytes have been produced.
 struct LimitedBody {

@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use http::Uri;
 use serde::{Deserialize, Serialize};
 
+use crate::body_transform::BodyTransforms;
 use crate::endpoints::{EndpointRateLimit, MockResponse, PathRule};
 use crate::graphql::GraphQlConfig;
 use crate::plugins::PluginsConfig;
@@ -1146,6 +1147,18 @@ pub struct ApiDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transform_headers: Option<HeaderTransforms>,
 
+    /// Optional minijinja body transforms for matching request and response
+    /// bodies (see [`BodyTransforms`]). Matching bodies are buffered whole —
+    /// requests up to [`max_request_body_bytes`](Self::max_request_body_bytes)
+    /// (else 1 MiB, over → `413`), responses up to the block's
+    /// `max_response_body_bytes` (over → `502`) — and transforms fail closed:
+    /// a failing render answers `500` (request) or `502` (response) rather
+    /// than passing the original body through. Templates see JSON-parsed
+    /// bodies only (`body` is `none` for non-JSON payloads; `raw` always
+    /// carries the text). Design: ADR-0007.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform_body: Option<BodyTransforms>,
+
     /// Regex URL rewrite rules, tried in order against the full client
     /// request path; the first match decides the upstream path (see
     /// [`UrlRewriteRule`]). Requests matching no rule follow the normal
@@ -1415,6 +1428,9 @@ impl ApiDefinition {
         if let Some(transforms) = &self.transform_headers {
             transforms.validate(&self.api_id)?;
         }
+        if let Some(transforms) = &self.transform_body {
+            transforms.validate(&self.api_id)?;
+        }
         for (index, rule) in self.url_rewrites.iter().enumerate() {
             rule.validate(&self.api_id, index)?;
         }
@@ -1542,6 +1558,25 @@ mod tests {
             def.target_url = bad.into();
             assert!(def.validate().is_err(), "expected `{bad}` to be rejected");
         }
+    }
+
+    #[test]
+    fn transform_body_is_validated() {
+        let mut def = parse(minimal_json());
+        def.transform_body = Some(
+            serde_json::from_str(r#"{"request": [{"pattern": "^/x$", "template": "{{ raw }}"}]}"#)
+                .expect("parses"),
+        );
+        def.validate().expect("valid transform_body");
+
+        def.transform_body = Some(
+            serde_json::from_str(
+                r#"{"request": [{"pattern": "^/x$", "template": "{{ unclosed"}]}"#,
+            )
+            .expect("parses"),
+        );
+        let err = def.validate().unwrap_err().to_string();
+        assert!(err.contains("transform_body.request[0]"), "got: {err}");
     }
 
     #[test]

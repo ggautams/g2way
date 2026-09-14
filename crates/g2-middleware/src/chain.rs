@@ -23,6 +23,7 @@ use crate::set_context::SetContextLayer;
 use crate::size_limit::RequestSizeLimitLayer;
 use crate::stats::StatsLayer;
 use crate::trace::TraceLayer;
+use crate::transform_body::BodyTransformLayer;
 use crate::transform_headers::HeaderTransformLayer;
 use crate::{ChainService, ProxyBody};
 
@@ -80,24 +81,31 @@ use crate::{ChainService, ProxyBody};
 ///     responses (absent when unconfigured). Below auth/rate-limit so
 ///     gateway rejections are not transformed; above [`ApiIdHeaderLayer`] so
 ///     a transform can never spoof the anti-spoof api-id header.
-/// 16. [`MockResponseLayer`] — gateway-answered mock responses (absent when
+/// 16. [`BodyTransformLayer`] — per-API minijinja body transforms on
+///     matching request and response bodies (absent when unconfigured).
+///     Below auth/rate-limit so gateway rejections keep their bodies;
+///     directly below the header transforms so the two transform kinds
+///     travel together (on requests a body rule's `content_type` wins over
+///     a header-transform `add`; on responses a header-transform `add`
+///     wins), and above mocks/cache like them.
+/// 17. [`MockResponseLayer`] — gateway-answered mock responses (absent when
 ///     unconfigured). Below auth/rate-limit (mocks on a protected API stay
 ///     protected) and below the header transforms, so mock responses get
 ///     the API's response transforms like any upstream response.
-/// 17. [`CacheLayer`] — shared response caching for safe requests (absent
+/// 18. [`CacheLayer`] — shared response caching for safe requests (absent
 ///     when unconfigured). Below auth/rate-limit so cache hits still
 ///     require credentials and consume rate, below the header transforms so
 ///     the stored copy is the raw upstream response (transforms re-apply
 ///     live on every hit), and below mocks so mock responses — already
 ///     gateway-local — are never cached.
-/// 18. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound
+/// 19. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound
 ///     request. Innermost, so neither transforms nor plugins can spoof it.
 ///
 /// [`Self::build`] composes the full stack for an unversioned API. A
 /// versioned API splits the stack around its version dispatcher instead:
 /// [`Self::build_outer`] composes the shared, version-independent layers
 /// (items 1–7) around the dispatcher, and [`Self::build_inner`] composes
-/// the per-version layers (items 8–18) around each version's forwarder.
+/// the per-version layers (items 8–19) around each version's forwarder.
 /// The three methods must keep the ordering above consistent.
 #[derive(Debug, Clone)]
 pub struct ChainBuilder {
@@ -116,6 +124,7 @@ pub struct ChainBuilder {
     plugins_post: Option<PluginLayer>,
     graphql: Option<GraphQlLayer>,
     transform_headers: Option<HeaderTransformLayer>,
+    transform_body: Option<BodyTransformLayer>,
     mock: Option<MockResponseLayer>,
     cache: Option<CacheLayer>,
 }
@@ -140,6 +149,7 @@ impl ChainBuilder {
             plugins_post: None,
             graphql: None,
             transform_headers: None,
+            transform_body: None,
             mock: None,
             cache: None,
         }
@@ -246,6 +256,13 @@ impl ChainBuilder {
         self
     }
 
+    /// Adds minijinja body transforms (`None` is a no-op).
+    #[must_use]
+    pub fn transform_body(mut self, transform_body: Option<BodyTransformLayer>) -> Self {
+        self.transform_body = transform_body;
+        self
+    }
+
     /// Adds gateway-answered mock responses (`None` is a no-op).
     #[must_use]
     pub fn mock(mut self, mock: Option<MockResponseLayer>) -> Self {
@@ -288,6 +305,7 @@ impl ChainBuilder {
             .option_layer(self.plugins_post)
             .option_layer(self.graphql)
             .option_layer(self.transform_headers)
+            .option_layer(self.transform_body)
             .option_layer(self.mock)
             .option_layer(self.cache)
             .layer(ApiIdHeaderLayer::new())
@@ -344,6 +362,7 @@ impl ChainBuilder {
             .option_layer(self.plugins_post)
             .option_layer(self.graphql)
             .option_layer(self.transform_headers)
+            .option_layer(self.transform_body)
             .option_layer(self.mock)
             .option_layer(self.cache)
             .layer(ApiIdHeaderLayer::new())
@@ -443,6 +462,111 @@ mod tests {
             resp.headers().get("x-gateway").expect("added").as_bytes(),
             b"g2way"
         );
+    }
+
+    #[tokio::test]
+    async fn body_transform_runs_inside_header_transforms() {
+        use http_body_util::BodyExt;
+
+        let headers: g2_core::HeaderTransforms = serde_json::from_str(
+            r#"{
+                "request": {"add": {"X-Env": "prod"}},
+                "response": {"add": {"Content-Type": "text/headers-win"}}
+            }"#,
+        )
+        .expect("valid transform JSON");
+        let bodies: g2_core::BodyTransforms = serde_json::from_str(
+            r#"{
+                "request": [{"pattern": "", "template": "{{ _g2.headers['x-env'] }}"}],
+                "response": [{"pattern": "", "template": "{{ raw }}|reshaped"}]
+            }"#,
+        )
+        .expect("valid transform JSON");
+
+        /// Echoes the request body back as the response body.
+        async fn echo_body(req: Request<ProxyBody>) -> Result<Response<ProxyBody>, Infallible> {
+            let bytes = req.into_body().collect().await.expect("collect").to_bytes();
+            Ok(Response::new(ProxyBody::new(Full::new(bytes))))
+        }
+
+        let chain = ChainBuilder::new(RequestContext::new("users-api", "acme"))
+            .transform_headers(Some(
+                HeaderTransformLayer::from_config(&headers, "users-api").expect("compiles"),
+            ))
+            .transform_body(
+                BodyTransformLayer::from_config(&bodies, None, "users-api").expect("compiles"),
+            )
+            .build(tower::service_fn(echo_body));
+
+        let resp = chain
+            .oneshot(Request::new(body("orig")))
+            .await
+            .expect("infallible");
+        // Response body transform applied; header transforms run after it on
+        // the way out, so their Content-Type wins over the body rule's.
+        assert_eq!(
+            resp.headers()
+                .get(http::header::CONTENT_TYPE)
+                .expect("content type")
+                .as_bytes(),
+            b"text/headers-win"
+        );
+        let out = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect")
+            .to_bytes();
+        // "prod" proves the request body transform saw the header
+        // transform's addition (the header layer runs first on the way in,
+        // and the echo upstream reflected the transformed request body);
+        // "|reshaped" proves the response rule ran on the way out.
+        assert_eq!(&out[..], b"prod|reshaped");
+    }
+
+    #[tokio::test]
+    async fn mock_responses_get_body_transforms() {
+        use http_body_util::BodyExt;
+
+        use crate::mock::MockResponseLayer;
+
+        let bodies: g2_core::BodyTransforms = serde_json::from_str(
+            r#"{"response": [{"pattern": "", "template": "{\"mocked\": {{ body.pong | tojson }}}"}]}"#,
+        )
+        .expect("valid transform JSON");
+        let mock = MockResponseLayer::from_config(
+            &[g2_core::MockResponse {
+                pattern: "^/ping$".into(),
+                methods: vec![],
+                status: 200,
+                body: r#"{"pong": true}"#.into(),
+                headers: Default::default(),
+            }],
+            "users-api",
+        )
+        .expect("compiles")
+        .expect("non-empty");
+
+        let chain = ChainBuilder::new(RequestContext::new("users-api", "acme"))
+            .transform_body(
+                BodyTransformLayer::from_config(&bodies, None, "users-api").expect("compiles"),
+            )
+            .mock(Some(mock))
+            .build(tower::service_fn(echo_forward));
+
+        let req = Request::builder()
+            .uri("/ping")
+            .body(body(""))
+            .expect("request");
+        let resp = chain.oneshot(req).await.expect("infallible");
+        assert_eq!(resp.status(), http::StatusCode::OK);
+        let out = resp
+            .into_body()
+            .collect()
+            .await
+            .expect("collect")
+            .to_bytes();
+        assert_eq!(&out[..], br#"{"mocked": true}"#);
     }
 
     #[tokio::test]
