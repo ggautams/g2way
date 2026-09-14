@@ -82,6 +82,6 @@ bytes + teardown), the default-off downgrade to plain HTTP, and an SSE
 stream that outlives `upstream_timeout_ms` while provably streaming (the
 client receives event one while the upstream still withholds event two).
 
-gRPC passthrough is **not** part of this feature — it needs end-to-end
-HTTP/2 (h2c prior knowledge or ALPN upstream) and trailer forwarding, and
-is tracked as its own roadmap item.
+gRPC passthrough is a separate feature: it needs end-to-end HTTP/2 and
+trailer forwarding rather than upgrade tunneling, and is enabled per API
+with `upstream_http2` — see `docs/grpc.md`.

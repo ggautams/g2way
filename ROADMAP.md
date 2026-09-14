@@ -91,8 +91,8 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 - [x] Per-endpoint rate limits (aggregate, API-level; `docs/endpoint-rate-limits.md`)
 - [x] WebSocket/SSE passthrough (`Connection: Upgrade` tunneling via per-API
       `enable_upgrades`; `docs/websockets.md`)
-- [ ] gRPC passthrough (needs end-to-end HTTP/2: h2c/ALPN upstream client +
-      trailer forwarding — the forwarder pins upstream requests to HTTP/1.1)
+- [x] gRPC passthrough (end-to-end HTTP/2 via per-API `upstream_http2`:
+      h2c/ALPN upstream client + trailer forwarding; `docs/grpc.md`)
 - [ ] Plugin system (WASM pre/post hooks — needs an ADR first)
 - [ ] Service discovery; request/response body transforms
 
@@ -946,3 +946,35 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   (`streaming_e2e.rs`: raw-handshake echo tunnel incl. teardown,
   default-off downgrade, SSE streaming proof). M9 GraphQL subscriptions
   are now unblocked. Next: M8+ gRPC passthrough, or the plugin-system ADR.
+- **2026-09-01 (5)** — M8+ gRPC passthrough landed (`docs/grpc.md`).
+  Config: `ApiDefinition.upstream_http2` (default off, user-confirmed
+  shape over an `h2c://` scheme) + a `VersionOverrides` arm —
+  when set, ALL the API's upstream traffic is HTTP/2: `http://` targets
+  via h2c prior knowledge, `https://` via ALPN offering only `h2` (no h1
+  fallback). Runtime: `Forwarder` now holds **two** pooled clients
+  (hyper's legacy client pins protocol per pool — `http2_only(true)` is
+  what makes plaintext connections h2c); `with_tls_config` **clones** the
+  rustls config because hyper-rustls's `enable_http2()` mutates its ALPN
+  list (a shared config would poison the h1 connector); selection is
+  `Forwarder::client_for(&UpstreamTarget)` off a new build-time
+  `UpstreamTarget.http2` flag (hot-path rule). `forward()` stamps
+  `Version::HTTP_2` on the h2 path and re-adds `te: trailers` after
+  hop-by-hop stripping (upgrade-header re-add pattern; only the
+  `trailers` token — RFC 9113 §8.2.2 — so `te: gzip` stays stripped).
+  Health probes switched to `client_for` (an h2-only upstream rejects
+  h1 probes → would evict every address of exactly these APIs); JWKS
+  fetch stays h1. Trailers needed **zero body work** — `ProxyBody` and
+  every wrapper already forward trailer frames; the client-facing side
+  already spoke h2 (auto-builder preface sniffing + TLS ALPN since M8).
+  Validation rejects `upstream_http2`+`enable_upgrades` (no 101 over
+  h2); cache/retries need no gating (gRPC is POST: never cached, never
+  retried); breaker is blind to `grpc-status` trailers (documented).
+  Cargo: hyper-rustls grew its `http2` feature — the only dep change.
+  Tests: 4 g2-core units, 4 forward.rs units (h2c version/te/trailers,
+  default-off pin, ALPN-h2-only TLS upstream, te-gzip), `grpc_e2e.rs`
+  (grpc-shaped call with trailer assert through a real gateway,
+  default-off h1 proof, versioned API mixing h1+h2 upstreams). Not done
+  (deliberate): gRPC-Web/transcoding, message-level anything, examples/
+  Makefile grpc upstream (e2e is the reference). M9 GraphQL
+  subscriptions remain unblocked. Next: plugin-system ADR (WASM
+  pre/post hooks) or service discovery / body transforms.

@@ -93,7 +93,9 @@ pub(crate) fn spawn_checker(
         .map(|addr| probe_uri(addr, &cfg.path))
         .collect();
     Some(handle.spawn(run_checker(
-        forwarder.client().clone(),
+        // Probes must speak the target's protocol: a pure-HTTP/2 upstream
+        // rejects HTTP/1.1 probes, which would evict every address.
+        forwarder.client_for(target).clone(),
         Arc::downgrade(target),
         state,
         uris,

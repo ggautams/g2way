@@ -969,6 +969,19 @@ pub struct ApiDefinition {
     #[serde(default, skip_serializing_if = "is_false")]
     pub enable_upgrades: bool,
 
+    /// When `true`, every upstream request for this API is sent over
+    /// HTTP/2: plaintext `http://` targets speak h2c (prior knowledge —
+    /// the upstream must accept HTTP/2 directly, there is no HTTP/1.1
+    /// fallback), and `https://` targets offer only `h2` via ALPN. This is
+    /// what makes gRPC passthrough work end to end (response trailers such
+    /// as `grpc-status` are forwarded), but it applies to *all* the API's
+    /// upstream traffic, gRPC or not. Cannot be combined with
+    /// [`Self::enable_upgrades`]: an HTTP/1.1 `Connection: Upgrade` cannot
+    /// cross an HTTP/2-only upstream connection. When `false` (the
+    /// default) upstream requests are HTTP/1.1.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub upstream_http2: bool,
+
     /// Optional response caching: safe-method (`GET`/`HEAD`/`OPTIONS`) `2xx`
     /// upstream responses are stored in shared storage for a per-API TTL and
     /// replayed without contacting the upstream (see [`CacheConfig`]).
@@ -1142,6 +1155,13 @@ impl ApiDefinition {
                 "`upstream_retries` must be at most 10, got {}",
                 self.upstream_retries
             )));
+        }
+        if self.upstream_http2 && self.enable_upgrades {
+            return Err(fail(
+                "`upstream_http2` cannot be combined with `enable_upgrades`: an HTTP/1.1 \
+                 `Connection: Upgrade` cannot cross an HTTP/2-only upstream connection"
+                    .into(),
+            ));
         }
         if let Some(cache) = &self.cache {
             cache.validate(&self.api_id)?;
@@ -2115,6 +2135,35 @@ mod tests {
         let json = serde_json::to_string(&def).expect("serializes");
         let back: ApiDefinition = serde_json::from_str(&json).expect("parses");
         assert!(back.enable_upgrades);
+    }
+
+    #[test]
+    fn upstream_http2_defaults_off_and_round_trips() {
+        let def = parse(minimal_json());
+        assert!(
+            !def.upstream_http2,
+            "HTTP/2 upstreams must be an explicit opt-in"
+        );
+        // The default-off flag stays off the wire (old records unaffected).
+        let bare = serde_json::to_string(&def).expect("serializes");
+        assert!(!bare.contains("upstream_http2"), "serialized when unset");
+
+        let mut def = parse(minimal_json());
+        def.upstream_http2 = true;
+        def.validate().expect("valid");
+        let json = serde_json::to_string(&def).expect("serializes");
+        let back: ApiDefinition = serde_json::from_str(&json).expect("parses");
+        assert!(back.upstream_http2);
+    }
+
+    #[test]
+    fn upstream_http2_rejects_enable_upgrades() {
+        let mut def = parse(minimal_json());
+        def.upstream_http2 = true;
+        def.enable_upgrades = true;
+        let err = def.validate().unwrap_err().to_string();
+        assert!(err.contains("upstream_http2"), "got: {err}");
+        assert!(err.contains("enable_upgrades"), "got: {err}");
     }
 
     #[test]

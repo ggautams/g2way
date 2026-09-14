@@ -150,6 +150,11 @@ pub struct VersionOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enable_upgrades: Option<bool>,
 
+    /// Replacement HTTP/2-upstream flag for this version (`false` reverts
+    /// the version to HTTP/1.1 upstream requests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_http2: Option<bool>,
+
     /// Replacement response-cache settings for this version. Each version
     /// caches under its own scope, so versions never share entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -289,6 +294,9 @@ impl VersioningConfig {
         }
         if let Some(v) = overrides.enable_upgrades {
             def.enable_upgrades = v;
+        }
+        if let Some(v) = overrides.upstream_http2 {
+            def.upstream_http2 = v;
         }
         if let Some(v) = &overrides.cache {
             def.cache = Some(v.clone());
@@ -522,6 +530,28 @@ mod tests {
         cfg.validate(&base).expect("valid");
         assert!(cfg.apply(&base, "v1").expect("configured").enable_upgrades);
         assert!(!cfg.apply(&base, "v2").expect("configured").enable_upgrades);
+    }
+
+    #[test]
+    fn upstream_http2_override_replaces_the_base_flag() {
+        let mut base = base();
+        base.upstream_http2 = true;
+
+        let cfg = versioning(r#"{"versions": {"v1": {}, "v2": {"upstream_http2": false}}}"#);
+        cfg.validate(&base).expect("valid");
+        assert!(cfg.apply(&base, "v1").expect("configured").upstream_http2);
+        assert!(!cfg.apply(&base, "v2").expect("configured").upstream_http2);
+    }
+
+    #[test]
+    fn upstream_http2_override_conflicting_with_base_upgrades_names_the_version() {
+        let mut base = base();
+        base.enable_upgrades = true;
+
+        let cfg = versioning(r#"{"versions": {"v1": {}, "v2": {"upstream_http2": true}}}"#);
+        let err = cfg.validate(&base).unwrap_err().to_string();
+        assert!(err.contains("v2"), "got: {err}");
+        assert!(err.contains("upstream_http2"), "got: {err}");
     }
 
     #[test]

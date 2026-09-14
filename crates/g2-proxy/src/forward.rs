@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{ClientAddr, ConnectionInfo, ProxyBody};
-use http::header::{HeaderValue, CONNECTION, UPGRADE};
+use http::header::{HeaderValue, CONNECTION, TE, UPGRADE};
 use http::uri::{Authority, Scheme, Uri};
 use http::{Method, Request, Response, StatusCode, Version};
 use http_body::Body as _;
@@ -104,6 +104,10 @@ pub struct UpstreamTarget {
     /// Whether `Connection: Upgrade` requests (WebSocket) are tunneled
     /// through to the upstream instead of being downgraded to plain HTTP.
     pub(crate) upgrades_enabled: bool,
+    /// Whether upstream requests are sent over HTTP/2 (h2c prior knowledge
+    /// on `http://`, ALPN `h2` on `https://`) instead of HTTP/1.1 — the
+    /// gRPC-passthrough switch. Picks the forwarder's HTTP/2-only client.
+    pub(crate) http2: bool,
 }
 
 impl UpstreamTarget {
@@ -165,6 +169,7 @@ impl UpstreamTarget {
             breaker,
             retries: def.upstream_retries,
             upgrades_enabled: def.enable_upgrades,
+            http2: def.upstream_http2,
         })
     }
 
@@ -217,15 +222,21 @@ impl UpstreamTarget {
     }
 }
 
-/// Process-wide handle to the pooled upstream HTTP client.
+/// Process-wide handle to the pooled upstream HTTP clients.
 ///
-/// Cheap to clone — clones share one connection pool — so a single
+/// Cheap to clone — clones share the connection pools — so a single
 /// `Forwarder` created at startup is passed to every
 /// [`RouteTable::build`](crate::RouteTable::build), and upstream connections
 /// survive config hot reloads.
+///
+/// Two pools live here because hyper's client pins its protocol per pool:
+/// the default HTTP/1.1 client, and an HTTP/2-only client for APIs with
+/// `upstream_http2` (h2c prior knowledge on `http://`, ALPN offering only
+/// `h2` on `https://`).
 #[derive(Debug, Clone)]
 pub struct Forwarder {
     client: UpstreamClient,
+    h2_client: UpstreamClient,
 }
 
 impl Forwarder {
@@ -256,19 +267,45 @@ impl Forwarder {
     /// given rustls configuration (custom CA roots, for instance).
     #[must_use]
     pub fn with_tls_config(tls: rustls::ClientConfig) -> Self {
-        let connector = HttpsConnectorBuilder::new()
-            .with_tls_config(tls)
+        // Each connector gets its own copy of the TLS config: the builder's
+        // protocol selection writes the config's ALPN list (`enable_http1`
+        // leaves it empty, `enable_http2` sets `["h2"]`), so sharing one
+        // config would poison the other connector's negotiation.
+        let h1_connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls.clone())
             .https_or_http()
             .enable_http1()
             .build();
+        let h2_connector = HttpsConnectorBuilder::new()
+            .with_tls_config(tls)
+            .https_or_http()
+            .enable_http2()
+            .build();
         Self {
-            client: Client::builder(TokioExecutor::new()).build(connector),
+            client: Client::builder(TokioExecutor::new()).build(h1_connector),
+            // `http2_only` is what turns plaintext connections into h2c
+            // prior-knowledge ones; TLS connections already negotiate `h2`
+            // via the connector's ALPN.
+            h2_client: Client::builder(TokioExecutor::new())
+                .http2_only(true)
+                .build(h2_connector),
         }
     }
 
-    /// The shared pooled client (health-check probes reuse it).
+    /// The shared HTTP/1.1 pooled client (JWKS fetches reuse it).
     pub(crate) fn client(&self) -> &UpstreamClient {
         &self.client
+    }
+
+    /// The pooled client matching `target`'s upstream protocol. Forwarding
+    /// and health-check probes both pick their client here, so an HTTP/2
+    /// API's probes reach upstreams that reject HTTP/1.1.
+    pub(crate) fn client_for(&self, target: &UpstreamTarget) -> &UpstreamClient {
+        if target.http2 {
+            &self.h2_client
+        } else {
+            &self.client
+        }
     }
 }
 
@@ -341,10 +378,11 @@ pub(crate) struct Forward {
 }
 
 impl Forward {
-    /// Creates the forwarding service for `target` using `forwarder`'s client.
+    /// Creates the forwarding service for `target` using `forwarder`'s
+    /// client for the target's upstream protocol.
     pub(crate) fn new(forwarder: &Forwarder, target: Arc<UpstreamTarget>) -> Self {
         Self {
-            client: forwarder.client.clone(),
+            client: forwarder.client_for(&target).clone(),
             target,
         }
     }
@@ -501,9 +539,32 @@ async fn forward(
         None
     };
     // The upstream connection is negotiated by the client independently
-    // of the client-facing protocol version.
-    parts.version = Version::HTTP_11;
+    // of the client-facing protocol version; the version stamped here only
+    // has to match the chosen client's protocol.
+    parts.version = if target.http2 {
+        Version::HTTP_2
+    } else {
+        Version::HTTP_11
+    };
+    // gRPC requires `te: trailers` end to end, but `te` is hop-by-hop and
+    // about to be stripped. It is also the only `te` value HTTP/2 permits
+    // (RFC 9113 §8.2.2), so anything else stays stripped.
+    let keep_te = target.http2
+        && parts
+            .headers
+            .get(TE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(',')
+                    .any(|token| token.trim().eq_ignore_ascii_case("trailers"))
+            });
     rewrite::prepare_upstream_headers(&mut parts.headers, target, client_ip, tls);
+    if keep_te {
+        parts
+            .headers
+            .insert(TE, HeaderValue::from_static("trailers"));
+    }
     if let Some((protocol, _)) = &upgrade {
         // Hop-by-hop stripping just removed the upgrade headers; a request
         // asking the upstream to switch protocols must carry them.
@@ -743,6 +804,215 @@ mod tests {
             .expect("request");
         let resp = svc.oneshot(req).await.expect("infallible");
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    }
+
+    /// Echoes the request's protocol version and `te` header into response
+    /// headers, and answers with a gRPC-shaped body: one data frame followed
+    /// by a `grpc-status: 0` trailer frame.
+    async fn grpc_style_service(
+        req: Request<hyper::body::Incoming>,
+    ) -> Result<
+        Response<
+            http_body_util::StreamBody<
+                futures_util::stream::Iter<
+                    std::vec::IntoIter<Result<http_body::Frame<bytes::Bytes>, Infallible>>,
+                >,
+            >,
+        >,
+        Infallible,
+    > {
+        let version = format!("{:?}", req.version());
+        let te = req
+            .headers()
+            .get(TE)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or("<none>")
+            .to_owned();
+        let mut trailers = http::HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let frames = vec![
+            Ok(http_body::Frame::data(bytes::Bytes::from_static(
+                b"grpc ok",
+            ))),
+            Ok(http_body::Frame::trailers(trailers)),
+        ];
+        let body = http_body_util::StreamBody::new(futures_util::stream::iter(frames));
+        Ok(Response::builder()
+            .header("x-seen-version", version)
+            .header("x-seen-te", te)
+            .body(body)
+            .expect("response"))
+    }
+
+    /// Serves [`grpc_style_service`] over plaintext HTTP/2 (h2c prior
+    /// knowledge only — an HTTP/1.1 request fails the connection).
+    async fn spawn_h2c_upstream() -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            hyper::service::service_fn(grpc_style_service),
+                        )
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    /// Serves [`grpc_style_service`] over plain HTTP/1.1.
+    async fn spawn_h1_echo_upstream() -> SocketAddr {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            TokioIo::new(stream),
+                            hyper::service::service_fn(grpc_style_service),
+                        )
+                        .await;
+                });
+            }
+        });
+        addr
+    }
+
+    fn plain_target(addr: SocketAddr, upstream_http2: bool) -> Arc<UpstreamTarget> {
+        let def: ApiDefinition = serde_json::from_str(&format!(
+            r#"{{"api_id":"grpc","name":"grpc","listen_path":"/grpc/",
+                "target_url":"http://127.0.0.1:{}","upstream_http2":{upstream_http2}}}"#,
+            addr.port()
+        ))
+        .expect("def");
+        Arc::new(UpstreamTarget::build(&def).expect("target"))
+    }
+
+    #[tokio::test]
+    async fn h2c_upstream_gets_http2_te_and_returns_trailers() {
+        let addr = spawn_h2c_upstream().await;
+        let svc = Forward::new(&Forwarder::new(), plain_target(addr, true));
+
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/grpc/pkg.Svc/Method")
+            .header(TE, "trailers")
+            .body(ProxyBody::empty())
+            .expect("request");
+        let resp = svc.oneshot(req).await.expect("infallible");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-seen-version"], "HTTP/2.0");
+        assert_eq!(resp.headers()["x-seen-te"], "trailers");
+        let collected = resp.into_body().collect().await.expect("body");
+        let trailers = collected.trailers().cloned().expect("trailers forwarded");
+        assert_eq!(trailers["grpc-status"], "0");
+        assert_eq!(&collected.to_bytes()[..], b"grpc ok");
+    }
+
+    #[tokio::test]
+    async fn h2_flag_off_keeps_upstream_http11_and_strips_te() {
+        let addr = spawn_h1_echo_upstream().await;
+        let svc = Forward::new(&Forwarder::new(), plain_target(addr, false));
+
+        let req = Request::builder()
+            .uri("/grpc/x")
+            .header(TE, "trailers")
+            .body(ProxyBody::empty())
+            .expect("request");
+        let resp = svc.oneshot(req).await.expect("infallible");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-seen-version"], "HTTP/1.1");
+        assert_eq!(resp.headers()["x-seen-te"], "<none>");
+    }
+
+    #[tokio::test]
+    async fn te_without_trailers_token_is_not_resurrected() {
+        let addr = spawn_h2c_upstream().await;
+        let svc = Forward::new(&Forwarder::new(), plain_target(addr, true));
+
+        let req = Request::builder()
+            .uri("/grpc/x")
+            .header(TE, "gzip")
+            .body(ProxyBody::empty())
+            .expect("request");
+        let resp = svc.oneshot(req).await.expect("infallible");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-seen-te"], "<none>");
+    }
+
+    #[tokio::test]
+    async fn https_upstream_negotiates_h2_via_alpn() {
+        // An upstream that only accepts `h2` over TLS: negotiation succeeds
+        // only when the forwarder's HTTP/2 connector offers it via ALPN.
+        let certified = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("self-signed cert");
+        let cert_der = certified.cert.der().clone();
+        let key_der =
+            rustls::pki_types::PrivateKeyDer::Pkcs8(certified.key_pair.serialize_der().into());
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert_der.clone()).expect("trust anchor");
+        let mut server_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert_der], key_der)
+            .expect("server config");
+        server_config.alpn_protocols = vec![b"h2".to_vec()];
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(stream).await else {
+                        return;
+                    };
+                    let _ = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+                        .serve_connection(
+                            TokioIo::new(tls),
+                            hyper::service::service_fn(grpc_style_service),
+                        )
+                        .await;
+                });
+            }
+        });
+
+        let def: ApiDefinition = serde_json::from_str(&format!(
+            r#"{{"api_id":"grpcs","name":"grpcs","listen_path":"/grpcs/",
+                "target_url":"https://localhost:{}","upstream_http2":true}}"#,
+            addr.port()
+        ))
+        .expect("def");
+        let target = Arc::new(UpstreamTarget::build(&def).expect("target"));
+        let tls = rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let svc = Forward::new(&Forwarder::with_tls_config(tls), target);
+
+        let req = Request::builder()
+            .uri("/grpcs/x")
+            .header(TE, "trailers")
+            .body(ProxyBody::empty())
+            .expect("request");
+        let resp = svc.oneshot(req).await.expect("infallible");
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-seen-version"], "HTTP/2.0");
+        let collected = resp.into_body().collect().await.expect("body");
+        assert_eq!(
+            collected.trailers().expect("trailers forwarded")["grpc-status"],
+            "0"
+        );
     }
 
     #[test]
