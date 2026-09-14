@@ -59,6 +59,8 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["loggin
 
 # Crypto / hashing
 sha2 = "0.10"
+hmac = "0.12"
+httpdate = "1"
 hex = "0.4"
 rand = "0.9"
 jsonwebtoken = { version = "10", features = ["rust_crypto"] }

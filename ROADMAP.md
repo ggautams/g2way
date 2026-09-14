@@ -87,7 +87,7 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 - [x] TLS termination & mTLS client certificates (ADR-0003, `docs/tls.md`)
 - [x] OAuth2/OIDC: external-IdP token validation (discovery + JWKS,
       iss/aud checks, client-id→policy mapping; `docs/oidc.md`)
-- [ ] HMAC request signatures
+- [x] HMAC request signatures (draft-cavage, `docs/hmac.md`)
 - [ ] Per-endpoint rate limits
 - [ ] WebSocket/SSE passthrough; gRPC passthrough
 - [ ] Plugin system (WASM pre/post hooks — needs an ADR first)
@@ -861,3 +861,33 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   unchanged); ES256 is a cheap follow-up. No ADR (JWKS precedent), no
   OpenAPI changes (inline variant). Next: M8+ HMAC request signatures or
   per-endpoint rate limits.
+- **2026-09-01 (2)** — M8+ HMAC request signatures landed (`docs/hmac.md`,
+  draft-cavage HTTP Signatures). `AuthConfig::Hmac
+  {allowed_algorithms (default all of hmac-sha256/384/512; **no sha1** —
+  hardening deviation), allowed_clock_skew_secs (default 300; explicit
+  `null` disables — the field is deliberately **not** skip-serialized so
+  `null` survives round-trips; while set, `date` must be among the *signed*
+  headers or 403)}`. Session model: `KeySession.hmac:
+  Option<HmacData{secret}>` mirroring `BasicAuthData` — but the secret is
+  a **plaintext live credential** (HMAC needs it verbatim; session.rs
+  module doc updated; admin GET returns it — redaction is a flagged
+  follow-up). keyId → `hash_key("hmac:{keyId}")`, provisioning = ordinary
+  `PUT /g2/keys/hmac:{keyId}`, zero admin changes (mtls pattern). Parsing/
+  signing-string/verify live in new `g2-middleware::hmac` (pure & sync;
+  params case-sensitive, unknown ignored, duplicates malformed;
+  `(request-target)` byte-exact **full client path** incl. listen path —
+  auth precedes the forwarder's strip; multi-values joined `", "`;
+  percent-encoded signatures accepted for client compat).
+  `authenticate_hmac` follows basic's shape: 401 only for unparseable
+  credentials, single no-oracle 403 for the rest, dummy-HMAC for unknown
+  keyIds (µs, inline — no spawn_blocking), `verify_slice` is already
+  constant-time so **no direct `subtle` dep**. New workspace deps `hmac`,
+  `httpdate` (both were already transitive). OpenAPI: `HmacAlgorithm` +
+  `HmacData` registered (named types referenced by inline variants DO need
+  it — the oidc "no changes" note is not a precedent for those). Gotcha:
+  crate-root `mod hmac` shadows the `hmac` crate in use paths (the
+  session-5 `mod redis` lesson) → `::hmac::…` throughout. Tests: 24 unit
+  (g2-core config/session, hmac module KATs from RFC 4231, per-mode auth
+  suite) + `hmac_auth_end_to_end` e2e. Not done (deliberate): rsa-sha256
+  signatures, `(created)`/`(expires)`, body-digest verification. Next:
+  M8+ per-endpoint rate limits.

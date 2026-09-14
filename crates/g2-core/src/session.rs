@@ -10,7 +10,9 @@
 //! Raw API keys are never persisted. Storage and admin operations address a
 //! session by the lowercase-hex SHA-256 of the raw key ([`hash_key`]), stored
 //! under `g2:{org_id}:apikey:{key_hash}` ([`session_storage_key`]). A leaked
-//! storage dump therefore reveals no usable credentials.
+//! storage dump therefore reveals no usable credentials — with one exception:
+//! [`HmacData::secret`] is a shared secret HMAC verification needs verbatim,
+//! so hmac-mode sessions store it in plaintext.
 
 use std::collections::BTreeMap;
 
@@ -65,6 +67,20 @@ pub struct BasicAuthData {
     /// bcrypt hash of the user's password (a full `$2b$…` hash string).
     /// The plaintext password is never persisted.
     pub password_hash: String,
+}
+
+/// HMAC signing credentials attached to a session.
+///
+/// Present only on sessions addressed by a `keyId` (hmac mode); each
+/// request's `Signature` header is verified against `secret`.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HmacData {
+    /// Shared secret, HMAC'd as its raw UTF-8 bytes (so ordinary client
+    /// snippets work verbatim; arbitrary binary secrets are not supported). Unlike a
+    /// bcrypt hash, this is a live credential stored in plaintext — HMAC
+    /// verification needs the secret itself.
+    pub secret: String,
 }
 
 /// One GraphQL type and the fields of it a grant refers to.
@@ -198,6 +214,12 @@ pub struct KeySession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub basic_auth: Option<BasicAuthData>,
 
+    /// HMAC signing credentials, set only on sessions used with the hmac
+    /// mode. `None` means this session cannot authenticate via request
+    /// signatures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hmac: Option<HmacData>,
+
     /// Policies applied to this key (see [`crate::Policy`]). When
     /// non-empty, the referenced policy's rate/quota/access **replace**
     /// this session's own at auth time ([`Self::apply_policy`]).
@@ -222,6 +244,7 @@ impl Default for KeySession {
             active: true,
             access: BTreeMap::new(),
             basic_auth: None,
+            hmac: None,
             apply_policies: Vec::new(),
         }
     }
@@ -267,6 +290,11 @@ impl KeySession {
         if let Some(basic) = &self.basic_auth {
             if basic.password_hash.trim().is_empty() {
                 return Err(fail("`basic_auth.password_hash` must not be empty"));
+            }
+        }
+        if let Some(hmac) = &self.hmac {
+            if hmac.secret.trim().is_empty() {
+                return Err(fail("`hmac.secret` must not be empty"));
             }
         }
         if self.apply_policies.len() > 1 {
@@ -424,6 +452,9 @@ mod tests {
             basic_auth: Some(BasicAuthData {
                 password_hash: "$2b$12$abcdefghijklmnopqrstuv".into(),
             }),
+            hmac: Some(HmacData {
+                secret: "signing-secret".into(),
+            }),
             apply_policies: vec!["free-tier".into()],
         };
         session.validate().expect("full session is valid");
@@ -441,6 +472,7 @@ mod tests {
             "quota",
             "expires_at",
             "basic_auth",
+            "hmac",
             "apply_policies",
         ] {
             assert!(
@@ -640,6 +672,18 @@ mod tests {
         };
         let err = session.validate().unwrap_err();
         assert!(err.to_string().contains("password_hash"), "got: {err}");
+    }
+
+    #[test]
+    fn empty_hmac_secret_is_rejected() {
+        let session = KeySession {
+            hmac: Some(HmacData {
+                secret: "  ".into(),
+            }),
+            ..KeySession::default()
+        };
+        let err = session.validate().unwrap_err();
+        assert!(err.to_string().contains("hmac.secret"), "got: {err}");
     }
 
     #[test]

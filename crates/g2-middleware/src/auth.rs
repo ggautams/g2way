@@ -36,6 +36,16 @@
 //!   signed but nobody provisioned is still rejected. Requires the gateway
 //!   listener to terminate TLS with `client_cert_mode: optional` or
 //!   `required` (see `docs/tls.md`).
+//! - **`hmac`** — draft-cavage HTTP request signatures:
+//!   `Authorization: Signature keyId="…",algorithm="hmac-sha256",…`. The
+//!   keyId (hashed under an `hmac:` namespace, like basic auth's usernames)
+//!   resolves to a stored session whose `hmac.secret` the signature is
+//!   verified against (constant-time; SHA-2 algorithms only): the signing
+//!   string is rebuilt from the signed headers the credential names
+//!   (default `date`, `(request-target)` supported — see the crate-private
+//!   `hmac` module). While the definition bounds clock skew,
+//!   `date` must be among the signed headers and the request's `Date` must
+//!   parse and sit within the bound.
 //!
 //! Stored sessions referencing a policy (`apply_policies`) get the
 //! policy's rate/quota/access applied before the access check — one extra
@@ -58,16 +68,21 @@
 //!   `WWW-Authenticate: Basic realm="…"` challenge. For mtls: the
 //!   connection carried no verified client certificate (a plaintext
 //!   listener, or `client_cert_mode: optional` with a certificate-less
-//!   client).
+//!   client). For hmac: no parseable `Signature` credential (missing
+//!   header, wrong scheme, malformed parameter list, missing required
+//!   parameter, undecodable base64).
 //! - `403` — token unknown or fails verification, wrong password, session
 //!   inactive/expired, the session does not grant this API, or its policy
 //!   is missing or inactive. For oidc this also covers every claims
 //!   rejection (wrong or missing `iss`/`aud`/`exp`, unknown `kid`, wrong
 //!   algorithm) and every policy-mapping rejection (policy claim missing
-//!   or unmapped). One message for all of these: which one it was must not
-//!   leak to the caller (details are logged). Unknown basic-auth users
-//!   still cost one bcrypt verify (against a dummy hash) so response
-//!   timing does not reveal whether a username exists.
+//!   or unmapped). For hmac: bad signature, disallowed algorithm, a signed
+//!   header absent from the request, or `Date` missing/unparseable/outside
+//!   the allowed skew. One message for all of these: which one it was must
+//!   not leak to the caller (details are logged). Unknown basic-auth users
+//!   still cost one bcrypt verify (against a dummy hash) and unknown hmac
+//!   keyIds one HMAC (against a dummy secret) so response timing does not
+//!   reveal whether an identity exists.
 //! - `503` — the storage backend errored; the request may be retried.
 //! - `500` — the stored session or policy record is corrupt (not valid
 //!   JSON, disagrees with its storage key, references multiple policies)
@@ -86,7 +101,7 @@ use base64::Engine as _;
 use g2_core::api_definition::DEFAULT_JWKS_REFRESH_SECS;
 use g2_core::policy::policy_storage_key;
 use g2_core::session::{hash_key, session_storage_key};
-use g2_core::{AuthConfig, Error, JwtSigningMethod, KeySession, Policy};
+use g2_core::{AuthConfig, Error, HmacAlgorithm, JwtSigningMethod, KeySession, Policy};
 use g2_storage::SharedStorage;
 use http::header::{HeaderName, HeaderValue};
 use http::{header, Request, Response, StatusCode};
@@ -111,6 +126,16 @@ const BASIC_CHALLENGE_MSG: &str = "invalid basic auth credentials";
 /// costs the same as a wrong-password one (no user-enumeration timing
 /// oracle). Guarded well-formed by a unit test.
 const DUMMY_BCRYPT_HASH: &str = "$2b$12$3neaCJyNondMOTlK7AuGBOMBGI0j/gZ3YsMVx1VJl.1cBJI5DVA32";
+
+/// Message for every hmac 401: the request carried no parseable
+/// draft-cavage `Signature` credential (missing header, wrong scheme,
+/// malformed parameter list, undecodable base64).
+const SIGNATURE_401_MSG: &str = "invalid signature authorization header";
+
+/// Secret unknown hmac keyIds are "verified" against, so a wrong-keyId
+/// request costs the same one HMAC as a wrong-signature one (no
+/// key-enumeration timing oracle — [`DUMMY_BCRYPT_HASH`]'s counterpart).
+const DUMMY_HMAC_SECRET: &[u8] = b"g2way-dummy-hmac-secret";
 
 /// Everything one API's auth needs, precomputed at route-build time.
 struct AuthState {
@@ -169,6 +194,15 @@ enum Mode {
     /// fingerprint (from the request's `ConnectionInfo` extension) in
     /// storage.
     Mtls { storage: SharedStorage },
+    /// `hmac`: verify the request's draft-cavage `Signature` header against
+    /// the keyId's stored session secret.
+    Hmac {
+        /// Algorithms the definition accepts (at most three; linear scan).
+        allowed_algorithms: Vec<HmacAlgorithm>,
+        /// Maximum `Date`-header skew in seconds; `None` disables the check.
+        allowed_clock_skew: Option<u64>,
+        storage: SharedStorage,
+    },
 }
 
 /// The oidc mode's client-id→policy mapping, present when configured.
@@ -196,6 +230,7 @@ impl std::fmt::Debug for AuthState {
             Mode::Oidc { .. } => "oidc",
             Mode::Basic { .. } => "basic",
             Mode::Mtls { .. } => "mtls",
+            Mode::Hmac { .. } => "hmac",
         };
         f.debug_struct("AuthState")
             .field("api_id", &self.api_id)
@@ -363,6 +398,14 @@ impl AuthLayer {
                 Mode::Basic { challenge, storage }
             }
             AuthConfig::Mtls {} => Mode::Mtls { storage },
+            AuthConfig::Hmac {
+                allowed_algorithms,
+                allowed_clock_skew_secs,
+            } => Mode::Hmac {
+                allowed_algorithms: allowed_algorithms.clone(),
+                allowed_clock_skew: *allowed_clock_skew_secs,
+                storage,
+            },
         };
         Ok(Some(Self {
             state: Arc::new(AuthState {
@@ -526,6 +569,11 @@ async fn authenticate(
             // key can never collide with a certificate identity.
             authenticate_stored_token(state, storage, &format!("mtls:{fingerprint}")).await
         }
+        Mode::Hmac {
+            allowed_algorithms,
+            allowed_clock_skew,
+            storage,
+        } => authenticate_hmac(state, storage, allowed_algorithms, *allowed_clock_skew, req).await,
     }
 }
 
@@ -611,6 +659,138 @@ async fn authenticate_basic(
     let session = resolve_policy(state, storage, session).await?;
     if !session.allows_api(&state.api_id) {
         return Err(json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG));
+    }
+    Ok(SessionContext::new(session, key_hash))
+}
+
+/// `hmac` mode: verify the request's draft-cavage `Signature` header
+/// against the shared secret of the keyId's stored [`KeySession`].
+///
+/// Order is cheapest-and-oracle-free first: parse (401), algorithm and
+/// clock-skew checks and the signing string (all 403, none need the
+/// secret), then the one storage lookup and the constant-time HMAC verify.
+async fn authenticate_hmac(
+    state: &AuthState,
+    storage: &SharedStorage,
+    allowed_algorithms: &[HmacAlgorithm],
+    allowed_clock_skew: Option<u64>,
+    req: &Request<ProxyBody>,
+) -> Result<SessionContext, Response<ProxyBody>> {
+    let params = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(crate::hmac::parse_signature_header)
+        .ok_or_else(|| json_error(StatusCode::UNAUTHORIZED, SIGNATURE_401_MSG))?;
+    let forbidden = || json_error(StatusCode::FORBIDDEN, FORBIDDEN_MSG);
+
+    let Some(algorithm) = allowed_algorithms
+        .iter()
+        .copied()
+        .find(|a| a.as_str().eq_ignore_ascii_case(&params.algorithm))
+    else {
+        tracing::debug!(
+            api_id = %state.api_id,
+            algorithm = %params.algorithm,
+            "hmac signature algorithm not allowed"
+        );
+        return Err(forbidden());
+    };
+
+    if let Some(max_skew) = allowed_clock_skew {
+        // An unsigned `Date` is attacker-controlled: the skew check only
+        // proves freshness when `date` is among the signed headers.
+        if !params.headers.iter().any(|name| name == "date") {
+            tracing::debug!(
+                api_id = %state.api_id,
+                "hmac clock-skew check requires `date` among the signed headers"
+            );
+            return Err(forbidden());
+        }
+        let date_secs = req
+            .headers()
+            .get(header::DATE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| httpdate::parse_http_date(value).ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|since_epoch| since_epoch.as_secs());
+        let Some(date_secs) = date_secs else {
+            tracing::debug!(api_id = %state.api_id, "hmac `Date` header missing or unparseable");
+            return Err(forbidden());
+        };
+        let skew = unix_now_secs().abs_diff(date_secs);
+        if skew > max_skew {
+            tracing::debug!(
+                api_id = %state.api_id,
+                skew_secs = skew,
+                max_skew_secs = max_skew,
+                "hmac `Date` header outside the allowed clock skew"
+            );
+            return Err(forbidden());
+        }
+    }
+
+    let Some(signing_string) =
+        crate::hmac::build_signing_string(req.method(), req.uri(), req.headers(), &params.headers)
+    else {
+        tracing::debug!(api_id = %state.api_id, "hmac signed header absent from the request");
+        return Err(forbidden());
+    };
+
+    // The `hmac:` prefix keeps keyIds in their own hash namespace, like
+    // `basic:{username}` and `mtls:{fingerprint}`.
+    let key_hash = hash_key(&format!("hmac:{}", params.key_id));
+    let storage_key = session_storage_key(&state.org_id, &key_hash);
+    let record = storage.get(&storage_key).await.map_err(|e| {
+        tracing::error!(api_id = %state.api_id, error = %e, "auth storage lookup failed");
+        json_error(StatusCode::SERVICE_UNAVAILABLE, "key storage unavailable")
+    })?;
+    let session: Option<KeySession> = match record {
+        None => None,
+        Some(record) => Some(serde_json::from_str(&record).map_err(|e| {
+            tracing::error!(
+                api_id = %state.api_id,
+                key_hash = %key_hash,
+                error = %e,
+                "stored key session is not valid JSON"
+            );
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "malformed key session record",
+            )
+        })?),
+    };
+
+    // An unknown keyId or a session without hmac data still costs one HMAC
+    // (against the dummy secret), so timing does not reveal whether the
+    // keyId exists. Inline, not spawn_blocking: HMAC is microseconds,
+    // unlike bcrypt.
+    let secret = session
+        .as_ref()
+        .and_then(|s| s.hmac.as_ref())
+        .map_or(DUMMY_HMAC_SECRET, |h| h.secret.as_bytes());
+    let verified = crate::hmac::verify(
+        algorithm,
+        secret,
+        signing_string.as_bytes(),
+        &params.signature,
+    );
+
+    let Some(session) = session else {
+        return Err(forbidden());
+    };
+    if !(verified
+        && session.hmac.is_some()
+        && session.active
+        && !session.is_expired(unix_now_secs()))
+    {
+        return Err(forbidden());
+    }
+    // Policy resolution must precede the access check: the policy's ACL
+    // replaces the session's own.
+    let session = resolve_policy(state, storage, session).await?;
+    if !session.allows_api(&state.api_id) {
+        return Err(forbidden());
     }
     Ok(SessionContext::new(session, key_hash))
 }
@@ -2503,6 +2683,349 @@ zejNikfS+pmVClGnwinccPXH8iP0UEaUKtEiumnjePyzogqb5YiPlOi33djLFq+0
             assert_eq!(strip_basic("basic"), None); // no space: not a scheme
             assert_eq!(strip_basic("Bearer abc"), None);
             assert_eq!(strip_basic("Basicabc"), None);
+        }
+    }
+
+    mod hmac {
+        use g2_core::HmacData;
+
+        use super::*;
+
+        const SECRET: &str = "test-signing-secret";
+        const KEY_ID: &str = "mykey";
+
+        fn cfg(algorithms: Vec<HmacAlgorithm>, skew: Option<u64>) -> AuthConfig {
+            AuthConfig::Hmac {
+                allowed_algorithms: algorithms,
+                allowed_clock_skew_secs: skew,
+            }
+        }
+
+        fn default_cfg() -> AuthConfig {
+            cfg(
+                vec![
+                    HmacAlgorithm::HmacSha256,
+                    HmacAlgorithm::HmacSha384,
+                    HmacAlgorithm::HmacSha512,
+                ],
+                Some(300),
+            )
+        }
+
+        async fn seed_key(storage: &MemoryStorage, key_id: &str, secret: &str, base: KeySession) {
+            let session = KeySession {
+                hmac: Some(HmacData {
+                    secret: secret.into(),
+                }),
+                ..base
+            };
+            seed(storage, &format!("hmac:{key_id}"), &session).await;
+        }
+
+        fn sign(secret: &str, algorithm: HmacAlgorithm, message: &str) -> Vec<u8> {
+            fn tag<M: ::hmac::Mac + ::hmac::digest::KeyInit>(
+                secret: &str,
+                message: &str,
+            ) -> Vec<u8> {
+                let mut mac = <M as ::hmac::Mac>::new_from_slice(secret.as_bytes()).expect("key");
+                mac.update(message.as_bytes());
+                mac.finalize().into_bytes().to_vec()
+            }
+            match algorithm {
+                HmacAlgorithm::HmacSha256 => tag::<::hmac::Hmac<sha2::Sha256>>(secret, message),
+                HmacAlgorithm::HmacSha384 => tag::<::hmac::Hmac<sha2::Sha384>>(secret, message),
+                HmacAlgorithm::HmacSha512 => tag::<::hmac::Hmac<sha2::Sha512>>(secret, message),
+            }
+        }
+
+        fn auth_header(
+            key_id: &str,
+            algorithm: HmacAlgorithm,
+            headers: &str,
+            signature: &[u8],
+        ) -> HeaderValue {
+            let sig = base64::engine::general_purpose::STANDARD.encode(signature);
+            format!(
+                "Signature keyId=\"{key_id}\",algorithm=\"{}\",headers=\"{headers}\",\
+                 signature=\"{sig}\"",
+                algorithm.as_str()
+            )
+            .parse()
+            .expect("header value")
+        }
+
+        fn now_date() -> String {
+            httpdate::fmt_http_date(SystemTime::now())
+        }
+
+        /// A GET for `uri` signed over `(request-target) date` with `date`.
+        fn signed_request(
+            key_id: &str,
+            secret: &str,
+            algorithm: HmacAlgorithm,
+            uri: &str,
+            date: &str,
+        ) -> Request<ProxyBody> {
+            let signing_string = format!("get {uri}\ndate: {date}");
+            let signature = sign(secret, algorithm, &signing_string);
+            let mut req = request(uri);
+            req.headers_mut()
+                .insert("date", date.parse().expect("date value"));
+            req.headers_mut().insert(
+                "authorization",
+                auth_header(key_id, algorithm, "(request-target) date", &signature),
+            );
+            req
+        }
+
+        async fn call(
+            cfg: &AuthConfig,
+            storage: MemoryStorage,
+            req: Request<ProxyBody>,
+        ) -> Response<ProxyBody> {
+            service(cfg, storage)
+                .oneshot(req)
+                .await
+                .expect("infallible")
+        }
+
+        #[tokio::test]
+        async fn valid_signature_passes_for_each_algorithm() {
+            for algorithm in [
+                HmacAlgorithm::HmacSha256,
+                HmacAlgorithm::HmacSha384,
+                HmacAlgorithm::HmacSha512,
+            ] {
+                let storage = MemoryStorage::new();
+                let session = KeySession {
+                    alias: Some("signer".into()),
+                    ..KeySession::default()
+                };
+                seed_key(&storage, KEY_ID, SECRET, session).await;
+
+                let req = signed_request(KEY_ID, SECRET, algorithm, "/x?q=1", &now_date());
+                let resp = call(&default_cfg(), storage, req).await;
+                assert_eq!(resp.status(), StatusCode::OK, "{}", algorithm.as_str());
+                assert_eq!(
+                    resp.headers()
+                        .get("x-echo-alias")
+                        .expect("alias")
+                        .as_bytes(),
+                    b"signer"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn missing_or_malformed_credential_is_401() {
+            let malformed: Vec<Option<HeaderValue>> = vec![
+                None,
+                Some("Bearer abc".parse().expect("value")),
+                // Missing the required `signature` parameter.
+                Some(
+                    "Signature keyId=\"k\",algorithm=\"hmac-sha256\""
+                        .parse()
+                        .expect("value"),
+                ),
+                // Undecodable base64.
+                Some(
+                    "Signature keyId=\"k\",algorithm=\"hmac-sha256\",signature=\"!!\""
+                        .parse()
+                        .expect("value"),
+                ),
+            ];
+            for value in malformed {
+                let mut req = request("/x");
+                if let Some(value) = &value {
+                    req.headers_mut().insert("authorization", value.clone());
+                }
+                let resp = call(&default_cfg(), MemoryStorage::new(), req).await;
+                assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{value:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn unknown_key_id_and_session_without_hmac_data_are_403() {
+            let storage = MemoryStorage::new();
+            // `no-hmac` exists but carries no hmac credential data.
+            seed(&storage, "hmac:no-hmac", &KeySession::default()).await;
+
+            for key_id in ["unknown", "no-hmac"] {
+                let req =
+                    signed_request(key_id, SECRET, HmacAlgorithm::HmacSha256, "/x", &now_date());
+                let resp = call(&default_cfg(), storage.clone(), req).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "keyId `{key_id}`");
+            }
+        }
+
+        #[tokio::test]
+        async fn wrong_secret_and_tampered_request_are_403() {
+            let storage = MemoryStorage::new();
+            seed_key(&storage, KEY_ID, SECRET, KeySession::default()).await;
+
+            let wrong = signed_request(
+                KEY_ID,
+                "wrong-secret",
+                HmacAlgorithm::HmacSha256,
+                "/x",
+                &now_date(),
+            );
+            let resp = call(&default_cfg(), storage.clone(), wrong).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "wrong secret");
+
+            // Signed for /x, sent to /y: the request-target no longer matches.
+            let mut tampered =
+                signed_request(KEY_ID, SECRET, HmacAlgorithm::HmacSha256, "/x", &now_date());
+            *tampered.uri_mut() = "/y".parse().expect("uri");
+            let resp = call(&default_cfg(), storage.clone(), tampered).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "tampered target");
+
+            // Signed Date differs from the sent Date.
+            let mut resigned =
+                signed_request(KEY_ID, SECRET, HmacAlgorithm::HmacSha256, "/x", &now_date());
+            resigned.headers_mut().insert(
+                "date",
+                httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(30))
+                    .parse()
+                    .expect("date value"),
+            );
+            let resp = call(&default_cfg(), storage, resigned).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "tampered date");
+        }
+
+        #[tokio::test]
+        async fn disallowed_algorithm_is_403() {
+            let storage = MemoryStorage::new();
+            seed_key(&storage, KEY_ID, SECRET, KeySession::default()).await;
+
+            let only_sha256 = cfg(vec![HmacAlgorithm::HmacSha256], Some(300));
+            let req = signed_request(KEY_ID, SECRET, HmacAlgorithm::HmacSha512, "/x", &now_date());
+            let resp = call(&only_sha256, storage, req).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn clock_skew_violations_are_403() {
+            let storage = MemoryStorage::new();
+            seed_key(&storage, KEY_ID, SECRET, KeySession::default()).await;
+
+            // Stale Date (valid signature over it).
+            let stale = httpdate::fmt_http_date(SystemTime::now() - Duration::from_secs(3_600));
+            let req = signed_request(KEY_ID, SECRET, HmacAlgorithm::HmacSha256, "/x", &stale);
+            let resp = call(&default_cfg(), storage.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "stale date");
+
+            // Skew configured but `date` not among the signed headers: 403
+            // even though the signature itself verifies.
+            let signature = sign(SECRET, HmacAlgorithm::HmacSha256, "get /x");
+            let mut req = request("/x");
+            req.headers_mut().insert(
+                "authorization",
+                auth_header(
+                    KEY_ID,
+                    HmacAlgorithm::HmacSha256,
+                    "(request-target)",
+                    &signature,
+                ),
+            );
+            let resp = call(&default_cfg(), storage, req).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "unsigned date");
+        }
+
+        #[tokio::test]
+        async fn null_skew_accepts_dateless_signed_requests() {
+            let storage = MemoryStorage::new();
+            seed_key(&storage, KEY_ID, SECRET, KeySession::default()).await;
+
+            let no_skew = cfg(vec![HmacAlgorithm::HmacSha256], None);
+            let signature = sign(SECRET, HmacAlgorithm::HmacSha256, "get /x");
+            let mut req = request("/x");
+            req.headers_mut().insert(
+                "authorization",
+                auth_header(
+                    KEY_ID,
+                    HmacAlgorithm::HmacSha256,
+                    "(request-target)",
+                    &signature,
+                ),
+            );
+            let resp = call(&no_skew, storage, req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+        }
+
+        #[tokio::test]
+        async fn custom_signed_header_is_covered() {
+            let storage = MemoryStorage::new();
+            seed_key(&storage, KEY_ID, SECRET, KeySession::default()).await;
+
+            let date = now_date();
+            let signing_string = format!("get /x\ndate: {date}\nx-custom: v1");
+            let signature = sign(SECRET, HmacAlgorithm::HmacSha256, &signing_string);
+            let header = auth_header(
+                KEY_ID,
+                HmacAlgorithm::HmacSha256,
+                "(request-target) date x-custom",
+                &signature,
+            );
+
+            let mut req = request("/x");
+            req.headers_mut()
+                .insert("date", date.parse().expect("date value"));
+            req.headers_mut()
+                .insert("x-custom", HeaderValue::from_static("v1"));
+            req.headers_mut().insert("authorization", header.clone());
+            let resp = call(&default_cfg(), storage.clone(), req).await;
+            assert_eq!(resp.status(), StatusCode::OK);
+
+            // The same credential without the named header present: 403.
+            let mut req = request("/x");
+            req.headers_mut()
+                .insert("date", date.parse().expect("date value"));
+            req.headers_mut().insert("authorization", header);
+            let resp = call(&default_cfg(), storage, req).await;
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        }
+
+        #[tokio::test]
+        async fn inactive_expired_and_unauthorized_api_are_403() {
+            let storage = MemoryStorage::new();
+            seed_key(
+                &storage,
+                "inactive",
+                SECRET,
+                KeySession {
+                    active: false,
+                    ..KeySession::default()
+                },
+            )
+            .await;
+            seed_key(
+                &storage,
+                "expired",
+                SECRET,
+                KeySession {
+                    expires_at: Some(1), // 1970: long past
+                    ..KeySession::default()
+                },
+            )
+            .await;
+            seed_key(
+                &storage,
+                "other-api",
+                SECRET,
+                KeySession {
+                    access: [("not-this-api".to_owned(), Default::default())].into(),
+                    ..KeySession::default()
+                },
+            )
+            .await;
+
+            for key_id in ["inactive", "expired", "other-api"] {
+                let req =
+                    signed_request(key_id, SECRET, HmacAlgorithm::HmacSha256, "/x", &now_date());
+                let resp = call(&default_cfg(), storage.clone(), req).await;
+                assert_eq!(resp.status(), StatusCode::FORBIDDEN, "keyId `{key_id}`");
+            }
         }
     }
 

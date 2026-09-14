@@ -56,6 +56,22 @@ fn default_oidc_policy_claim() -> String {
     DEFAULT_OIDC_POLICY_CLAIM.to_owned()
 }
 
+/// Seconds of `Date`-header clock skew the hmac mode tolerates when a
+/// definition does not set `allowed_clock_skew_secs`.
+pub const DEFAULT_HMAC_CLOCK_SKEW_SECS: u64 = 300;
+
+fn default_hmac_clock_skew() -> Option<u64> {
+    Some(DEFAULT_HMAC_CLOCK_SKEW_SECS)
+}
+
+fn default_hmac_algorithms() -> Vec<HmacAlgorithm> {
+    vec![
+        HmacAlgorithm::HmacSha256,
+        HmacAlgorithm::HmacSha384,
+        HmacAlgorithm::HmacSha512,
+    ]
+}
+
 /// Realm the basic-auth mode advertises in `WWW-Authenticate` challenges
 /// when a definition does not name one.
 pub const DEFAULT_BASIC_AUTH_REALM: &str = "g2way";
@@ -308,6 +324,37 @@ pub enum JwtSigningMethod {
     Rs256,
 }
 
+/// HMAC digest algorithms supported by [`AuthConfig::Hmac`].
+///
+/// Serialized with the draft-cavage wire names (`hmac-sha256`, …), which are
+/// also what the `Signature` header's `algorithm` parameter carries.
+/// `hmac-sha1` is deliberately unsupported (a hardening choice).
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HmacAlgorithm {
+    /// HMAC over SHA-256 (`hmac-sha256`).
+    HmacSha256,
+    /// HMAC over SHA-384 (`hmac-sha384`).
+    HmacSha384,
+    /// HMAC over SHA-512 (`hmac-sha512`).
+    HmacSha512,
+}
+
+impl HmacAlgorithm {
+    /// The draft-cavage algorithm name (`"hmac-sha256"`, …) — the serialized
+    /// form, for matching a `Signature` header's `algorithm` parameter
+    /// without allocating.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::HmacSha256 => "hmac-sha256",
+            Self::HmacSha384 => "hmac-sha384",
+            Self::HmacSha512 => "hmac-sha512",
+        }
+    }
+}
+
 /// How clients authenticate to one API.
 ///
 /// The default is [`AuthConfig::AuthToken`] reading the `Authorization`
@@ -462,6 +509,34 @@ pub enum AuthConfig {
     /// terminate TLS with `client_cert_mode: optional` or `required`; see
     /// `docs/tls.md`.
     Mtls {},
+
+    /// HMAC request-signature auth (draft-cavage HTTP Signatures):
+    /// `Authorization: Signature keyId="…",algorithm="hmac-sha256",
+    /// headers="(request-target) date",signature="…"`.
+    ///
+    /// The `keyId` resolves (hashed, under an `hmac:` namespace) to a stored
+    /// [`KeySession`](crate::KeySession) whose
+    /// [`hmac`](crate::session::HmacData) data carries the shared secret the
+    /// signature is verified with; provisioning is the admin key CRUD with
+    /// the raw key `hmac:{keyId}`. Credentials are read from the
+    /// `Authorization` header only (where the `Signature` scheme lives).
+    Hmac {
+        /// Algorithms accepted from the `Signature` header. Defaults to all
+        /// three SHA-2 variants; `hmac-sha1` is deliberately unsupported.
+        #[serde(default = "default_hmac_algorithms")]
+        allowed_algorithms: Vec<HmacAlgorithm>,
+
+        /// Maximum seconds the request's `Date` header may differ from the
+        /// gateway clock. Defaults to [`DEFAULT_HMAC_CLOCK_SKEW_SECS`]; an
+        /// explicit `null` disables the check. While enabled, `date` must be
+        /// among the signed headers (an unsigned `Date` is
+        /// attacker-controlled, so a skew check on it would prove nothing).
+        ///
+        /// Never skip-serialized: `null` is a meaningful third state
+        /// (disabled), distinct from absent (default 300).
+        #[serde(default = "default_hmac_clock_skew")]
+        allowed_clock_skew_secs: Option<u64>,
+    },
 }
 
 impl Default for AuthConfig {
@@ -487,6 +562,7 @@ impl AuthConfig {
             Self::Oidc { .. } => "oidc",
             Self::BasicAuth { .. } => "basic_auth",
             Self::Mtls {} => "mtls",
+            Self::Hmac { .. } => "hmac",
         }
     }
 
@@ -679,6 +755,30 @@ impl AuthConfig {
             // certs enabled is process-level config the definition cannot
             // see; the auth layer rejects at request time instead.
             Self::Mtls {} => Ok(()),
+            Self::Hmac {
+                allowed_algorithms,
+                allowed_clock_skew_secs,
+            } => {
+                if allowed_algorithms.is_empty() {
+                    return Err(fail("`auth.allowed_algorithms` must not be empty".into()));
+                }
+                let mut seen = allowed_algorithms.clone();
+                seen.sort_unstable_by_key(|a| a.as_str());
+                seen.dedup();
+                if seen.len() != allowed_algorithms.len() {
+                    return Err(fail(
+                        "`auth.allowed_algorithms` must not repeat entries".into(),
+                    ));
+                }
+                if *allowed_clock_skew_secs == Some(0) {
+                    return Err(fail(
+                        "`auth.allowed_clock_skew_secs` must be at least 1 \
+                         (use null to disable the Date check)"
+                            .into(),
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -1574,6 +1674,92 @@ mod tests {
             def.auth = AuthConfig::BasicAuth { realm: bad.into() };
             assert!(def.validate().is_err(), "expected realm `{bad:?}` rejected");
         }
+    }
+
+    #[test]
+    fn hmac_json_defaults_and_round_trips() {
+        let json = r#"{
+            "api_id": "h",
+            "name": "h",
+            "listen_path": "/h/",
+            "target_url": "http://h.internal",
+            "auth": { "mode": "hmac" }
+        }"#;
+        let def = parse(json);
+        def.validate().expect("valid");
+        assert_eq!(
+            def.auth,
+            AuthConfig::Hmac {
+                allowed_algorithms: vec![
+                    HmacAlgorithm::HmacSha256,
+                    HmacAlgorithm::HmacSha384,
+                    HmacAlgorithm::HmacSha512,
+                ],
+                allowed_clock_skew_secs: Some(DEFAULT_HMAC_CLOCK_SKEW_SECS),
+            }
+        );
+        assert_eq!(def.auth.mode_name(), "hmac");
+        // The wire names are the draft-cavage algorithm names, and the skew
+        // field is never skip-serialized (an explicit `null` — disabled —
+        // must not round-trip back into the 300s default).
+        let out = serde_json::to_string(&def.auth).expect("serialize");
+        assert!(out.contains("hmac-sha256"), "got: {out}");
+        assert!(
+            out.contains("\"allowed_clock_skew_secs\":300"),
+            "got: {out}"
+        );
+    }
+
+    #[test]
+    fn hmac_explicit_null_skew_disables_and_round_trips() {
+        let auth: AuthConfig = serde_json::from_str(
+            r#"{ "mode": "hmac", "allowed_clock_skew_secs": null,
+                 "allowed_algorithms": ["hmac-sha256"] }"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            auth,
+            AuthConfig::Hmac {
+                allowed_algorithms: vec![HmacAlgorithm::HmacSha256],
+                allowed_clock_skew_secs: None,
+            }
+        );
+        let out = serde_json::to_string(&auth).expect("serialize");
+        let back: AuthConfig = serde_json::from_str(&out).expect("round-trips");
+        assert_eq!(back, auth, "null skew must survive a round-trip");
+    }
+
+    #[test]
+    fn hmac_invalid_settings_are_rejected() {
+        let mut def = parse(minimal_json());
+        def.auth = AuthConfig::Hmac {
+            allowed_algorithms: vec![],
+            allowed_clock_skew_secs: Some(300),
+        };
+        assert!(def.validate().is_err(), "empty algorithm list rejected");
+
+        def.auth = AuthConfig::Hmac {
+            allowed_algorithms: vec![HmacAlgorithm::HmacSha256, HmacAlgorithm::HmacSha256],
+            allowed_clock_skew_secs: Some(300),
+        };
+        assert!(def.validate().is_err(), "duplicate algorithms rejected");
+
+        def.auth = AuthConfig::Hmac {
+            allowed_algorithms: vec![HmacAlgorithm::HmacSha256],
+            allowed_clock_skew_secs: Some(0),
+        };
+        assert!(
+            def.validate().is_err(),
+            "zero skew rejected (null disables)"
+        );
+
+        assert!(
+            serde_json::from_str::<AuthConfig>(
+                r#"{ "mode": "hmac", "allowed_algorithms": ["hmac-sha1"] }"#
+            )
+            .is_err(),
+            "hmac-sha1 is not a valid algorithm"
+        );
     }
 
     #[test]

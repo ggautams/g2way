@@ -26,6 +26,7 @@ pub mod chain;
 pub mod context;
 pub mod cors;
 pub mod graphql;
+pub(crate) mod hmac;
 pub mod ip_filter;
 pub mod jwks;
 pub mod metrics;

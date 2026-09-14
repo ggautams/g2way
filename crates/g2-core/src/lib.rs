@@ -35,7 +35,7 @@ pub mod versioning;
 
 pub use analytics::AnalyticsRecord;
 pub use api_definition::{
-    ApiDefinition, AuthConfig, CacheConfig, CircuitBreakerConfig, HealthCheckConfig,
+    ApiDefinition, AuthConfig, CacheConfig, CircuitBreakerConfig, HealthCheckConfig, HmacAlgorithm,
     JwtSigningMethod, DEFAULT_ORG_ID,
 };
 pub use config::{AnalyticsSinkKind, ClientCertMode, GatewayConfig, SpikeGuardConfig, TlsConfig};
@@ -44,6 +44,6 @@ pub use error::Error;
 pub use graphql::{GraphQlConfig, GraphQlExecutionMode, PersistedQuery, PlaygroundConfig};
 pub use policy::Policy;
 pub use security::CorsConfig;
-pub use session::{BasicAuthData, KeySession};
+pub use session::{BasicAuthData, HmacData, KeySession};
 pub use transform::{HeaderTransform, HeaderTransforms, UrlRewriteRule};
 pub use versioning::{VersionLocation, VersionOverrides, VersioningConfig};

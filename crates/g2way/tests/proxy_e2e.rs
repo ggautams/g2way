@@ -686,6 +686,91 @@ async fn basic_auth_end_to_end() {
 }
 
 #[tokio::test]
+async fn hmac_auth_end_to_end() {
+    use base64::Engine as _;
+    use g2_core::session::{hash_key, session_storage_key};
+    use hmac::Mac as _;
+
+    const SECRET: &str = "e2e-signing-secret";
+
+    // Sign `(request-target) date` the way a draft-cavage client does.
+    fn signature_header(secret: &str, path: &str, date: &str) -> String {
+        let signing_string = format!("get {path}\ndate: {date}");
+        let mut mac =
+            hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).expect("key length");
+        mac.update(signing_string.as_bytes());
+        let sig = base64::engine::general_purpose::STANDARD.encode(mac.finalize().into_bytes());
+        format!(
+            "Signature keyId=\"mykey\",algorithm=\"hmac-sha256\",\
+             headers=\"(request-target) date\",signature=\"{sig}\""
+        )
+    }
+
+    let upstream = spawn_echo_upstream().await;
+    let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+    let session = g2_core::KeySession {
+        hmac: Some(g2_core::HmacData {
+            secret: SECRET.into(),
+        }),
+        ..g2_core::KeySession::default()
+    };
+    storage
+        .set(
+            &session_storage_key("default", &hash_key("hmac:mykey")),
+            &serde_json::to_string(&session).expect("json"),
+            None,
+        )
+        .await
+        .expect("seed key");
+
+    let def = serde_json::from_str::<ApiDefinition>(&format!(
+        r#"{{"api_id":"hm","name":"hm","listen_path":"/hm/","target_url":"http://{upstream}","auth":{{"mode":"hmac"}}}}"#
+    ))
+    .expect("definition");
+    let (gw, _stop) = spawn_gateway_with_storage(vec![def], storage).await;
+    let client: Client<_, Empty<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+
+    // No credential → 401.
+    let resp = client
+        .get(format!("http://{gw}/hm/x").parse().expect("url"))
+        .await
+        .expect("request");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    // Correctly signed request (current Date) → proxied.
+    let date = httpdate::fmt_http_date(std::time::SystemTime::now());
+    let req = Request::get(format!("http://{gw}/hm/x"))
+        .header("date", &date)
+        .header("authorization", signature_header(SECRET, "/hm/x", &date))
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let resp = client.request(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Wrong secret → 403.
+    let req = Request::get(format!("http://{gw}/hm/x"))
+        .header("date", &date)
+        .header(
+            "authorization",
+            signature_header("wrong-secret", "/hm/x", &date),
+        )
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let resp = client.request(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+    // Validly signed but stale Date (outside the default 300s skew) → 403.
+    let stale = httpdate::fmt_http_date(std::time::SystemTime::now() - Duration::from_secs(3_600));
+    let req = Request::get(format!("http://{gw}/hm/x"))
+        .header("date", &stale)
+        .header("authorization", signature_header(SECRET, "/hm/x", &stale))
+        .body(Empty::<Bytes>::new())
+        .expect("request");
+    let resp = client.request(req).await.expect("response");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
 async fn shuts_down_on_signal_and_refuses_new_connections() {
     let (gw, stop) = spawn_gateway(vec![]).await;
     let (status, _) = http_get(&format!("http://{gw}/hello")).await;

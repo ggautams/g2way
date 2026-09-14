@@ -66,6 +66,7 @@ impl Modify for SecurityAddon {
         g2_core::ApiDefinition,
         g2_core::AuthConfig,
         g2_core::JwtSigningMethod,
+        g2_core::HmacAlgorithm,
         g2_core::HeaderTransforms,
         g2_core::HeaderTransform,
         g2_core::UrlRewriteRule,
@@ -89,6 +90,7 @@ impl Modify for SecurityAddon {
         g2_core::session::ApiAccess,
         g2_core::session::TypeFields,
         g2_core::session::BasicAuthData,
+        g2_core::session::HmacData,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -153,6 +155,8 @@ mod tests {
             "PlaygroundConfig",
             "PersistedQuery",
             "TypeFields",
+            "HmacAlgorithm",
+            "HmacData",
         ] {
             assert!(schemas.contains_key(schema), "schema `{schema}` missing");
         }
