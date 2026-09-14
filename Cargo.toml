@@ -27,7 +27,7 @@ g2-admin = { path = "crates/g2-admin" }
 g2-telemetry = { path = "crates/g2-telemetry" }
 
 # Async runtime & HTTP
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "fs"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "fs", "io-util"] }
 hyper = { version = "1", features = ["http1", "http2", "server", "client"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "client-legacy", "http1", "http2", "tokio"] }
 http = "1"

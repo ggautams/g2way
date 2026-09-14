@@ -957,6 +957,18 @@ pub struct ApiDefinition {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub upstream_retries: u32,
 
+    /// When `true`, HTTP/1.1 `Connection: Upgrade` requests (WebSocket being
+    /// the common protocol) are passed through: the upgrade headers are
+    /// forwarded, and when the upstream answers `101 Switching Protocols` the
+    /// gateway tunnels the connection's raw bytes in both directions for its
+    /// remaining lifetime. The upgrade *request* still runs the full
+    /// middleware chain (auth, rate limits, path lists), but bytes inside an
+    /// established tunnel are opaque to the gateway. When `false` (the
+    /// default) the upgrade headers are stripped like any other hop-by-hop
+    /// header and the request is proxied as plain HTTP.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub enable_upgrades: bool,
+
     /// Optional response caching: safe-method (`GET`/`HEAD`/`OPTIONS`) `2xx`
     /// upstream responses are stored in shared storage for a per-API TTL and
     /// replayed without contacting the upstream (see [`CacheConfig`]).
@@ -983,6 +995,12 @@ pub struct ApiDefinition {
 #[expect(clippy::trivially_copy_pass_by_ref, reason = "serde requires &T")]
 fn is_zero(n: &u32) -> bool {
     *n == 0
+}
+
+/// Serde helper: keeps default-off flags off the wire.
+#[expect(clippy::trivially_copy_pass_by_ref, reason = "serde requires &T")]
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Storage key holding one API definition: `g2:{org_id}:apidef:{api_id}`.
@@ -2081,6 +2099,22 @@ mod tests {
         def.upstream_retries = 11;
         let err = def.validate().unwrap_err().to_string();
         assert!(err.contains("upstream_retries"), "got: {err}");
+    }
+
+    #[test]
+    fn enable_upgrades_defaults_off_and_round_trips() {
+        let def = parse(minimal_json());
+        assert!(!def.enable_upgrades, "upgrades must be an explicit opt-in");
+        // The default-off flag stays off the wire (old records unaffected).
+        let bare = serde_json::to_string(&def).expect("serializes");
+        assert!(!bare.contains("enable_upgrades"), "serialized when unset");
+
+        let mut def = parse(minimal_json());
+        def.enable_upgrades = true;
+        def.validate().expect("valid");
+        let json = serde_json::to_string(&def).expect("serializes");
+        let back: ApiDefinition = serde_json::from_str(&json).expect("parses");
+        assert!(back.enable_upgrades);
     }
 
     #[test]

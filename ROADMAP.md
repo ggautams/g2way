@@ -89,7 +89,10 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
       iss/aud checks, client-id→policy mapping; `docs/oidc.md`)
 - [x] HMAC request signatures (draft-cavage, `docs/hmac.md`)
 - [x] Per-endpoint rate limits (aggregate, API-level; `docs/endpoint-rate-limits.md`)
-- [ ] WebSocket/SSE passthrough; gRPC passthrough
+- [x] WebSocket/SSE passthrough (`Connection: Upgrade` tunneling via per-API
+      `enable_upgrades`; `docs/websockets.md`)
+- [ ] gRPC passthrough (needs end-to-end HTTP/2: h2c/ALPN upstream client +
+      trailer forwarding — the forwarder pins upstream requests to HTTP/1.1)
 - [ ] Plugin system (WASM pre/post hooks — needs an ADR first)
 - [ ] Service discovery; request/response body transforms
 
@@ -104,8 +107,8 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 - [x] Persisted GraphQL-as-REST endpoints (method/path → operation, variable
       substitution from headers and path params)
 - [ ] Schema sync from upstream introspection (admin-triggered + periodic)
-- [ ] GraphQL subscriptions over WebSocket (blocked on the M8+ WebSocket
-      passthrough box)
+- [ ] GraphQL subscriptions over WebSocket (unblocked 2026-09-01 by the M8+
+      WebSocket passthrough)
 - [ ] Universal Data Graph: gateway-executed stitching of REST/GraphQL upstreams
       (needs an execution-engine ADR)
 - [ ] Federation: supergraph/subgraph support
@@ -915,3 +918,31 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   `BrokenLimits` test double hoisted to module scope for reuse. Next: M8+
   WebSocket/SSE passthrough + gRPC passthrough (also unblocks M9 GraphQL
   subscriptions).
+- **2026-09-01 (4)** — M8+ WebSocket/SSE passthrough landed
+  (`docs/websockets.md`); the "WebSocket/SSE; gRPC" box was **split** — gRPC
+  passthrough is its own box (needs end-to-end h2: h2c/ALPN upstream client
+  + trailer forwarding; the forwarder still pins upstream requests to
+  HTTP/1.1). Config: `ApiDefinition.enable_upgrades` (default **off** —
+  hop-by-hop stripping keeps downgrading upgrades to plain HTTP unless the
+  API opts in) + a `VersionOverrides` arm. Server: the accept loop now uses
+  hyper-util `serve_connection_with_upgrades` (`UpgradeableConnection`
+  implements `GracefulConnection`, so the drain plumbing is unchanged —
+  but established tunnels are deliberately **not** part of the drain).
+  Forwarder: when the API opted in, the client sent `Upgrade`, and hyper
+  stamped an `OnUpgrade` request extension (absent on h2 requests — the
+  natural h1-only gate), the upgrade headers are re-added after hop-by-hop
+  stripping; an upstream 101 spawns a `copy_bidirectional` tunnel task
+  joining both `OnUpgrade`s (the legacy client drives h1 connections
+  `with_upgrades()` internally — same path reqwest relies on). A 101 with
+  no client upgrade in flight → 502. The handshake runs the full chain
+  (auth/limits/analytics see a normal GET) and `upstream_timeout_ms`
+  covers only the handshake. SSE needed **zero code**: bodies already
+  stream and the timeout only bounds response headers — proven by a new
+  e2e where the client receives event 1 while the upstream deliberately
+  withholds event 2, and the stream survives past the timeout. Doc warns:
+  don't enable `cache` on SSE APIs (the tee buffers up to `max_body_bytes`
+  for a body that never completes). New workspace tokio feature `io-util`.
+  Tests: 2 forwarder units (flag plumbing, unsolicited-101→502) + 3 e2e
+  (`streaming_e2e.rs`: raw-handshake echo tunnel incl. teardown,
+  default-off downgrade, SSE streaming proof). M9 GraphQL subscriptions
+  are now unblocked. Next: M8+ gRPC passthrough, or the plugin-system ADR.

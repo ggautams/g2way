@@ -16,13 +16,14 @@ use std::time::Duration;
 
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{ClientAddr, ConnectionInfo, ProxyBody};
+use http::header::{HeaderValue, CONNECTION, UPGRADE};
 use http::uri::{Authority, Scheme, Uri};
 use http::{Method, Request, Response, StatusCode, Version};
 use http_body::Body as _;
 use hyper_rustls::{ConfigBuilderExt as _, HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
-use hyper_util::rt::TokioExecutor;
+use hyper_util::rt::{TokioExecutor, TokioIo};
 use tower::Service;
 
 /// The pooled upstream client: TLS-capable, with plain `http://` requests
@@ -100,6 +101,9 @@ pub struct UpstreamTarget {
     /// Additional forwarding attempts after a transport failure, for
     /// idempotent empty-body requests only.
     pub(crate) retries: u32,
+    /// Whether `Connection: Upgrade` requests (WebSocket) are tunneled
+    /// through to the upstream instead of being downgraded to plain HTTP.
+    pub(crate) upgrades_enabled: bool,
 }
 
 impl UpstreamTarget {
@@ -160,6 +164,7 @@ impl UpstreamTarget {
             health,
             breaker,
             retries: def.upstream_retries,
+            upgrades_enabled: def.enable_upgrades,
         })
     }
 
@@ -480,10 +485,33 @@ async fn forward(
     if let Some(method) = &target.method_override {
         parts.method = method.clone();
     }
+    // An upgrade passthrough is attempted only when the API opted in, the
+    // client asked (an `Upgrade` header), and the client connection can
+    // actually switch protocols (hyper stamped an `OnUpgrade` extension —
+    // absent on HTTP/2 requests, whose streams cannot carry an HTTP/1.1
+    // upgrade). Everything else proxies as plain HTTP.
+    let upgrade = if target.upgrades_enabled {
+        parts.headers.get(UPGRADE).cloned().and_then(|protocol| {
+            parts
+                .extensions
+                .remove::<hyper::upgrade::OnUpgrade>()
+                .map(|client| (protocol, client))
+        })
+    } else {
+        None
+    };
     // The upstream connection is negotiated by the client independently
     // of the client-facing protocol version.
     parts.version = Version::HTTP_11;
     rewrite::prepare_upstream_headers(&mut parts.headers, target, client_ip, tls);
+    if let Some((protocol, _)) = &upgrade {
+        // Hop-by-hop stripping just removed the upgrade headers; a request
+        // asking the upstream to switch protocols must carry them.
+        parts
+            .headers
+            .insert(CONNECTION, HeaderValue::from_static("upgrade"));
+        parts.headers.insert(UPGRADE, protocol.clone());
+    }
     // Retrying is safe only when the attempt can be replayed: an idempotent
     // method (after any transform) whose body is already fully drained —
     // i.e. empty. All attempts share the one per-API timeout budget below.
@@ -521,8 +549,24 @@ async fn forward(
                     breaker.record_success();
                 }
             }
-            rewrite::strip_hop_by_hop_headers(resp.headers_mut());
-            resp.map(ProxyBody::new)
+            if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
+                match upgrade {
+                    Some((_, client)) => upgrade_response(api_id, client, resp),
+                    // The upstream switched protocols unasked (the forwarded
+                    // request carried no upgrade headers): there is no client
+                    // side to splice it to, so the exchange is unusable.
+                    None => {
+                        tracing::warn!(%api_id, "upstream answered 101 to a non-upgrade request");
+                        error_response(
+                            StatusCode::BAD_GATEWAY,
+                            "unexpected upgrade response from upstream",
+                        )
+                    }
+                }
+            } else {
+                rewrite::strip_hop_by_hop_headers(resp.headers_mut());
+                resp.map(ProxyBody::new)
+            }
         }
         // A request body that blew its API's size limit fails the upstream
         // send from the inside; surface that as 413, not a bogus 502. The
@@ -554,6 +598,55 @@ async fn forward(
     // layers can attribute latency to the upstream leg.
     resp.extensions_mut()
         .insert(g2_middleware::UpstreamLatency(upstream_elapsed));
+    resp
+}
+
+/// Accepts an upstream `101 Switching Protocols` answer to a tunneled
+/// upgrade request: spawns the task that splices the two connections
+/// together once both sides complete their protocol switch, and returns the
+/// `101` (upgrade headers intact) that makes hyper hand the client
+/// connection over to that task.
+///
+/// The tunnel outlives the request: it runs until either side closes (or
+/// the process exits — tunnels are not part of the graceful drain), and the
+/// bytes inside it are opaque to the gateway. The per-API upstream timeout
+/// only ever covered the upgrade handshake, which has completed here.
+fn upgrade_response(
+    api_id: &str,
+    client: hyper::upgrade::OnUpgrade,
+    mut resp: Response<hyper::body::Incoming>,
+) -> Response<ProxyBody> {
+    let protocol = resp.headers().get(UPGRADE).cloned();
+    let upstream = hyper::upgrade::on(&mut resp);
+    let api_id = api_id.to_owned();
+    tokio::spawn(async move {
+        // The client side resolves once hyper has written the 101 returned
+        // below; the upstream side is typically ready already.
+        let (client_io, upstream_io) = match tokio::try_join!(client, upstream) {
+            Ok(io) => io,
+            Err(err) => {
+                tracing::debug!(%api_id, error = %err, "connection upgrade failed");
+                return;
+            }
+        };
+        let (mut client_io, mut upstream_io) = (TokioIo::new(client_io), TokioIo::new(upstream_io));
+        match tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await {
+            Ok((sent, received)) => {
+                tracing::debug!(%api_id, sent, received, "upgrade tunnel closed");
+            }
+            Err(err) => tracing::debug!(%api_id, error = %err, "upgrade tunnel ended with error"),
+        }
+    });
+    // The upgrade headers are hop-by-hop but load-bearing on a 101: put
+    // them back after the standard strip so the client completes its
+    // protocol switch.
+    rewrite::strip_hop_by_hop_headers(resp.headers_mut());
+    let mut resp = resp.map(ProxyBody::new);
+    resp.headers_mut()
+        .insert(CONNECTION, HeaderValue::from_static("upgrade"));
+    if let Some(protocol) = protocol {
+        resp.headers_mut().insert(UPGRADE, protocol);
+    }
     resp
 }
 
@@ -1023,6 +1116,79 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[test]
+    fn upgrades_enabled_flag_comes_from_the_definition() {
+        let def: ApiDefinition = serde_json::from_str(
+            r#"{"api_id":"u","name":"u","listen_path":"/u/",
+                "target_url":"http://u.internal","enable_upgrades":true}"#,
+        )
+        .expect("def");
+        assert!(
+            UpstreamTarget::build(&def)
+                .expect("target")
+                .upgrades_enabled
+        );
+        let def: ApiDefinition = serde_json::from_str(
+            r#"{"api_id":"u","name":"u","listen_path":"/u/","target_url":"http://u.internal"}"#,
+        )
+        .expect("def");
+        assert!(
+            !UpstreamTarget::build(&def)
+                .expect("target")
+                .upgrades_enabled
+        );
+    }
+
+    #[tokio::test]
+    async fn unsolicited_upstream_101_maps_to_502() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        // A raw upstream that answers 101 to every request, upgrade or not.
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    let _ = stream.read(&mut buf).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 101 Switching Protocols\r\n\
+                              connection: upgrade\r\nupgrade: rawproto\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+
+        // The request never asked to upgrade (no `Upgrade` header, no
+        // `OnUpgrade` extension), so the 101 is unusable.
+        let target = build_target(&format!(
+            r#"{{"api_id":"u","name":"u","listen_path":"/u/",
+                "target_url":"http://{addr}","enable_upgrades":true}}"#
+        ));
+        let svc = Forward::new(&Forwarder::new(), target);
+        let resp = svc
+            .oneshot(
+                Request::builder()
+                    .uri("/u/x")
+                    .body(ProxyBody::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("infallible");
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let body = resp.into_body().collect().await.expect("body").to_bytes();
+        assert!(
+            std::str::from_utf8(&body)
+                .expect("utf8")
+                .contains("upgrade"),
+            "error names the upgrade: {body:?}"
+        );
     }
 
     #[tokio::test]

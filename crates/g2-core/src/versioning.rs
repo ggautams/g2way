@@ -145,6 +145,11 @@ pub struct VersionOverrides {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upstream_retries: Option<u32>,
 
+    /// Replacement `Connection: Upgrade` passthrough flag for this version
+    /// (`false` disables upgrade tunneling for the version).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enable_upgrades: Option<bool>,
+
     /// Replacement response-cache settings for this version. Each version
     /// caches under its own scope, so versions never share entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -281,6 +286,9 @@ impl VersioningConfig {
         }
         if let Some(v) = overrides.upstream_retries {
             def.upstream_retries = v;
+        }
+        if let Some(v) = overrides.enable_upgrades {
+            def.enable_upgrades = v;
         }
         if let Some(v) = &overrides.cache {
             def.cache = Some(v.clone());
@@ -503,6 +511,17 @@ mod tests {
         assert!(err.contains("version `v2`"), "got: {err}");
         let cfg = versioning(r#"{"versions": {"v2": {"upstream_retries": 99}}}"#);
         assert!(cfg.validate(&base).is_err());
+    }
+
+    #[test]
+    fn enable_upgrades_override_replaces_the_base_flag() {
+        let mut base = base();
+        base.enable_upgrades = true;
+
+        let cfg = versioning(r#"{"versions": {"v1": {}, "v2": {"enable_upgrades": false}}}"#);
+        cfg.validate(&base).expect("valid");
+        assert!(cfg.apply(&base, "v1").expect("configured").enable_upgrades);
+        assert!(!cfg.apply(&base, "v2").expect("configured").enable_upgrades);
     }
 
     #[test]

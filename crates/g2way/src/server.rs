@@ -173,7 +173,11 @@ where
         async move { Ok::<_, Infallible>(gateway.handle(req, remote_addr, conn_info).await) }
     });
     let builder = auto::Builder::new(TokioExecutor::new());
-    let conn = builder.serve_connection(io, service);
+    // Upgrade-capable serving: on a `101 Switching Protocols` response hyper
+    // hands the raw connection to whoever awaits the request's `OnUpgrade`
+    // extension (the forwarder's tunnel task, for APIs with
+    // `enable_upgrades`). Plain requests are served exactly as before.
+    let conn = builder.serve_connection_with_upgrades(io, service);
     watcher.watch(conn.into_owned()).await
 }
 
