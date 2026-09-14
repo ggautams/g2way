@@ -410,14 +410,13 @@ mod tests {
             )
             .expect("def");
             let stats = Arc::new(StatsRegistry::new());
+            let forwarder = Forwarder::new();
             let table = RouteTable::build(
                 vec![def],
-                &Forwarder::new(),
-                &shared,
-                None,
-                Some(&stats),
-                None,
-                None,
+                &g2_proxy::RouteResources {
+                    stats: Some(&stats),
+                    ..g2_proxy::RouteResources::new(&forwarder, &shared)
+                },
             )
             .expect("table");
             let gateway = Arc::new(Gateway::new(table));

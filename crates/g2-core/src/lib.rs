@@ -27,6 +27,7 @@ pub mod endpoints;
 mod error;
 pub mod graphql;
 pub mod loader;
+pub mod plugins;
 pub mod policy;
 pub mod security;
 pub mod session;
@@ -42,6 +43,7 @@ pub use config::{AnalyticsSinkKind, ClientCertMode, GatewayConfig, SpikeGuardCon
 pub use endpoints::{EndpointRateLimit, MockResponse, PathRule};
 pub use error::Error;
 pub use graphql::{GraphQlConfig, GraphQlExecutionMode, PersistedQuery, PlaygroundConfig};
+pub use plugins::{PluginRef, PluginsConfig};
 pub use policy::Policy;
 pub use security::CorsConfig;
 pub use session::{BasicAuthData, HmacData, KeySession};

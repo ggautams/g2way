@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::endpoints::{EndpointRateLimit, MockResponse, PathRule};
 use crate::graphql::GraphQlConfig;
+use crate::plugins::PluginsConfig;
 use crate::security::{self, CorsConfig};
 use crate::transform::{self, HeaderTransforms, UrlRewriteRule};
 use crate::versioning::VersioningConfig;
@@ -1002,6 +1003,13 @@ pub struct ApiDefinition {
     /// Unset = plain HTTP proxying.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphQlConfig>,
+
+    /// Optional WASM plugin hooks: guest modules run before authentication
+    /// (`pre`) and after authentication/rate limiting (`post`), able to
+    /// mutate request headers or answer the request themselves (see
+    /// [`PluginsConfig`]). Unset = no plugins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<PluginsConfig>,
 }
 
 /// Serde helper: keeps default-zero counters off the wire.
@@ -1168,6 +1176,9 @@ impl ApiDefinition {
         }
         if let Some(graphql) = &self.graphql {
             graphql.validate(&self.api_id)?;
+        }
+        if let Some(plugins) = &self.plugins {
+            plugins.validate(&self.api_id)?;
         }
         // Last, so per-version effective definitions are validated only
         // after the base fields have passed (errors then name the version).

@@ -14,7 +14,7 @@ use bytes::Bytes;
 use g2_core::config::{ClientCertMode, TlsConfig};
 use g2_core::session::{cert_fingerprint_hex, hash_key, session_storage_key};
 use g2_core::{ApiDefinition, KeySession, DEFAULT_ORG_ID};
-use g2_proxy::{Forwarder, Gateway, RouteTable};
+use g2_proxy::{Forwarder, Gateway, RouteResources, RouteTable};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
@@ -178,7 +178,7 @@ async fn spawn_tls_gateway(
     storage: g2_storage::SharedStorage,
     tls_cfg: &TlsConfig,
 ) -> (SocketAddr, oneshot::Sender<()>) {
-    let table = RouteTable::build(defs, &Forwarder::new(), &storage, None, None, None, None)
+    let table = RouteTable::build(defs, &RouteResources::new(&Forwarder::new(), &storage))
         .expect("route table");
     let gateway = Arc::new(Gateway::new(table));
     let acceptor = g2way::tls::build_acceptor(tls_cfg).expect("acceptor");

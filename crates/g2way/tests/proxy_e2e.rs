@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use g2_core::ApiDefinition;
-use g2_proxy::{Forwarder, Gateway, RouteTable};
+use g2_proxy::{Forwarder, Gateway, RouteResources, RouteTable};
 use http::{Request, Response, StatusCode};
 use http_body_util::{BodyExt, Empty, Full};
 use hyper::body::Incoming;
@@ -55,7 +55,7 @@ async fn spawn_gateway_with_storage(
     defs: Vec<ApiDefinition>,
     storage: g2_storage::SharedStorage,
 ) -> (SocketAddr, oneshot::Sender<()>) {
-    let table = RouteTable::build(defs, &Forwarder::new(), &storage, None, None, None, None)
+    let table = RouteTable::build(defs, &RouteResources::new(&Forwarder::new(), &storage))
         .expect("route table");
     let gateway = Arc::new(Gateway::new(table));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))

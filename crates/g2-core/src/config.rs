@@ -193,6 +193,12 @@ pub struct GatewayConfig {
     /// TLS termination for the proxy listener. `None` — the default — means
     /// the listener speaks plain HTTP (see [`TlsConfig`] and `docs/tls.md`).
     pub tls: Option<TlsConfig>,
+
+    /// Directory holding the guest WASM modules referenced by API
+    /// definitions' `plugins.*.path` (see `docs/plugins.md`). `None` — the
+    /// default — disables plugins: a definition that references one then
+    /// fails to load.
+    pub plugins_dir: Option<PathBuf>,
 }
 
 impl Default for GatewayConfig {
@@ -208,6 +214,7 @@ impl Default for GatewayConfig {
             otlp_endpoint: None,
             analytics_sink: None,
             tls: None,
+            plugins_dir: None,
         }
     }
 }

@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use g2_core::ApiDefinition;
-use g2_proxy::{Forwarder, Gateway, RouteTable};
+use g2_proxy::{Forwarder, Gateway, RouteResources, RouteTable};
 use http::{HeaderValue, Request, Response, StatusCode};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -94,7 +94,7 @@ async fn spawn_h1_upstream() -> SocketAddr {
 /// trigger.
 async fn spawn_gateway(defs: Vec<ApiDefinition>) -> (SocketAddr, oneshot::Sender<()>) {
     let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
-    let table = RouteTable::build(defs, &Forwarder::new(), &storage, None, None, None, None)
+    let table = RouteTable::build(defs, &RouteResources::new(&Forwarder::new(), &storage))
         .expect("route table");
     let gateway = Arc::new(Gateway::new(table));
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))

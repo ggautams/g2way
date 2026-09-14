@@ -7,6 +7,7 @@ members = [
     "crates/g2-middleware",
     "crates/g2-admin",
     "crates/g2-telemetry",
+    "crates/g2-plugin",
     "crates/g2way",
 ]
 
@@ -25,6 +26,7 @@ g2-proxy = { path = "crates/g2-proxy" }
 g2-middleware = { path = "crates/g2-middleware" }
 g2-admin = { path = "crates/g2-admin" }
 g2-telemetry = { path = "crates/g2-telemetry" }
+g2-plugin = { path = "crates/g2-plugin" }
 
 # Async runtime & HTTP
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "sync", "fs", "io-util"] }
@@ -39,6 +41,11 @@ axum = "0.8"
 
 # GraphQL (schema/query parsing and spec validation — ADR-0004)
 apollo-compiler = "1"
+
+# WASM plugin runtime (ADR-0005). Pinned to major 33: 34+ raises wasmtime's
+# MSRV past our `rust-version = 1.85`. Trimmed features only — none of these
+# need cmake (the rust:1-slim Docker build stage has gcc but no cmake).
+wasmtime = { version = "33", default-features = false, features = ["runtime", "cranelift", "std"] }
 
 # Data / config
 serde = { version = "1", features = ["derive"] }
@@ -95,6 +102,9 @@ clap = { version = "4", features = ["derive", "env"] }
 # Dev-dependencies
 tempfile = "3"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
+# Tests author WASM guest plugins as inline WAT text — no wasm32 toolchain
+# needed for `make check` (ADR-0005).
+wat = "1"
 
 [workspace.lints.rust]
 missing_docs = "warn"

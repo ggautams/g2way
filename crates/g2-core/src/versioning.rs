@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::api_definition::{CacheConfig, CircuitBreakerConfig, HealthCheckConfig};
 use crate::endpoints::{EndpointRateLimit, MockResponse, PathRule};
 use crate::graphql::GraphQlConfig;
+use crate::plugins::PluginsConfig;
 use crate::transform::{HeaderTransforms, UrlRewriteRule};
 use crate::{ApiDefinition, Error};
 
@@ -164,6 +165,11 @@ pub struct VersionOverrides {
     /// playground, persisted queries — replaced wholesale).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub graphql: Option<GraphQlConfig>,
+
+    /// Replacement WASM plugin hooks for this version (both hook lists —
+    /// replaced wholesale).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugins: Option<PluginsConfig>,
 }
 
 impl VersioningConfig {
@@ -303,6 +309,9 @@ impl VersioningConfig {
         }
         if let Some(v) = &overrides.graphql {
             def.graphql = Some(v.clone());
+        }
+        if let Some(v) = &overrides.plugins {
+            def.plugins = Some(v.clone());
         }
         Some(def)
     }

@@ -11,8 +11,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use g2_middleware::SpikeGuard;
-use g2_proxy::{Forwarder, Gateway, RouteTable};
+use g2_middleware::{SharedPluginLoader, SpikeGuard};
+use g2_proxy::{Forwarder, Gateway, RouteResources, RouteTable};
 use g2_storage::SharedStorage;
 
 /// Everything a route-table rebuild needs, captured once at startup.
@@ -45,6 +45,11 @@ pub struct ReloadContext {
     /// Producer handle of the analytics channel, if an analytics sink is
     /// configured (one process-wide worker; shared across reloads).
     pub analytics: Option<g2_middleware::AnalyticsHandle>,
+
+    /// WASM plugin loader, if a plugins directory is configured (one
+    /// process-wide engine and epoch ticker; shared across reloads —
+    /// modules are recompiled per rebuild, which is config-time work).
+    pub plugin_loader: Option<SharedPluginLoader>,
 }
 
 impl ReloadContext {
@@ -62,12 +67,14 @@ impl ReloadContext {
         let defs = g2_core::loader::merge_sources(file_defs, storage_defs)?;
         Ok(RouteTable::build(
             defs,
-            &self.forwarder,
-            &self.storage,
-            self.spike_guard.as_ref(),
-            self.stats.as_ref(),
-            self.metrics.as_ref(),
-            self.analytics.as_ref(),
+            &RouteResources {
+                spike_guard: self.spike_guard.as_ref(),
+                stats: self.stats.as_ref(),
+                metrics: self.metrics.as_ref(),
+                analytics: self.analytics.as_ref(),
+                plugin_loader: self.plugin_loader.as_ref(),
+                ..RouteResources::new(&self.forwarder, &self.storage)
+            },
         )?)
     }
 }
@@ -123,6 +130,7 @@ mod tests {
             stats: None,
             metrics: None,
             analytics: None,
+            plugin_loader: None,
         }
     }
 

@@ -83,6 +83,12 @@ struct Cli {
     #[arg(long, env = "G2_TLS_CLIENT_CERT_MODE")]
     tls_client_cert_mode: Option<ClientCertMode>,
 
+    /// Directory of guest WASM modules referenced by API definitions'
+    /// `plugins` blocks (overrides the config file). Without one, plugins
+    /// are disabled and definitions declaring them fail to load.
+    #[arg(long, env = "G2_PLUGINS_DIR")]
+    plugins_dir: Option<PathBuf>,
+
     /// Log output format: `json` (default) or `pretty`.
     #[arg(long, env = "G2_LOG_FORMAT", default_value = "json")]
     log_format: LogFormat,
@@ -132,6 +138,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(analytics_sink) = cli.analytics_sink {
         config.analytics_sink = Some(analytics_sink);
+    }
+    if let Some(plugins_dir) = cli.plugins_dir {
+        config.plugins_dir = Some(plugins_dir);
     }
     if cli.tls_cert.is_some() || cli.tls_key.is_some() || cli.tls_client_ca.is_some() {
         let tls = config.tls.get_or_insert_with(Default::default);
@@ -240,6 +249,19 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             analytics_worker = Some((stop_tx, worker));
         }
 
+        // The WASM plugin host builds before the first route table: a
+        // gateway configured with an unusable plugins directory must fail
+        // fast (the per-module failures surface later, per build).
+        let plugin_loader: Option<g2_middleware::SharedPluginLoader> = match &config.plugins_dir {
+            Some(dir) => {
+                let host = g2_plugin::PluginHost::new(dir)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                tracing::info!(plugins_dir = %dir.display(), "WASM plugin host enabled");
+                Some(Arc::new(host))
+            }
+            None => None,
+        };
+
         let stats = Arc::new(g2_middleware::StatsRegistry::new());
         // Both definition sources (files + storage, ADR-0002) are loaded
         // through the reload context, at startup and on every reload nudge.
@@ -252,6 +274,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             stats: Some(Arc::clone(&stats)),
             metrics,
             analytics,
+            plugin_loader,
         };
         let gateway = Arc::new(Gateway::new(reload_ctx.build_table().await?));
         tracing::info!(apps_dir = %config.apps_dir.display(), "API definitions loaded");

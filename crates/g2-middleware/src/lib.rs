@@ -32,6 +32,7 @@ pub mod jwks;
 pub mod metrics;
 pub mod mock;
 pub mod path_policy;
+pub mod plugin;
 pub mod rate_limit;
 pub mod response;
 pub mod set_context;
@@ -58,6 +59,10 @@ pub use jwks::{JwksFetch, JwksFetchFuture, SharedJwksFetch};
 pub use metrics::{HttpMetrics, MetricsLayer};
 pub use mock::{Mock, MockResponseLayer};
 pub use path_policy::{PathPolicy, PathPolicyLayer};
+pub use plugin::{
+    HookInvocation, HookKind, HookOutcome, Plugin, PluginExec, PluginLayer, PluginLoader,
+    SharedPluginExec, SharedPluginLoader,
+};
 pub use rate_limit::{EndpointLimits, RateLimit, RateLimitLayer};
 pub use set_context::{SetContext, SetContextLayer};
 pub use size_limit::{

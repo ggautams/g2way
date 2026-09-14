@@ -11,6 +11,7 @@ rust-version.workspace = true
 g2-admin.workspace = true
 g2-core.workspace = true
 g2-middleware.workspace = true
+g2-plugin.workspace = true
 g2-proxy.workspace = true
 g2-storage.workspace = true
 g2-telemetry.workspace = true
@@ -36,6 +37,7 @@ bytes.workspace = true
 futures-util.workspace = true
 http-body-util.workspace = true
 serde_json.workspace = true
+wat.workspace = true
 
 [lints]
 workspace = true

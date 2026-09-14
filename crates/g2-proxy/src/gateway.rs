@@ -179,8 +179,11 @@ mod tests {
         storage: &g2_storage::SharedStorage,
     ) -> Gateway {
         Gateway::new(
-            RouteTable::build(defs, &Forwarder::new(), storage, None, None, None, None)
-                .expect("table"),
+            RouteTable::build(
+                defs,
+                &crate::RouteResources::new(&Forwarder::new(), storage),
+            )
+            .expect("table"),
         )
     }
 
@@ -414,12 +417,7 @@ mod tests {
 
         let table = RouteTable::build(
             vec![def_to("echo", "/echo/", &format!("http://{upstream}"))],
-            &Forwarder::new(),
-            &memory_storage(),
-            None,
-            None,
-            None,
-            None,
+            &crate::RouteResources::new(&Forwarder::new(), &memory_storage()),
         )
         .expect("table");
         gw.reload(table);

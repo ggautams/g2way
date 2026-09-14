@@ -93,7 +93,8 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
       `enable_upgrades`; `docs/websockets.md`)
 - [x] gRPC passthrough (end-to-end HTTP/2 via per-API `upstream_http2`:
       h2c/ALPN upstream client + trailer forwarding; `docs/grpc.md`)
-- [ ] Plugin system (WASM pre/post hooks — needs an ADR first)
+- [x] Plugin system (WASM pre/post hooks — wasmtime, custom JSON ABI;
+      ADR-0005, `docs/plugins.md`)
 - [ ] Service discovery; request/response body transforms
 
 ## M9 — GraphQL
@@ -978,3 +979,38 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   Makefile grpc upstream (e2e is the reference). M9 GraphQL
   subscriptions remain unblocked. Next: plugin-system ADR (WASM
   pre/post hooks) or service discovery / body transforms.
+- **2026-09-01 (6)** — M8+ WASM plugin system landed (ADR-0005,
+  `docs/plugins.md`), user-confirmed scope: custom ABI (not proxy-wasm/
+  component model), v1 powers = header mutation + short-circuit responses,
+  no body access. New crate **g2-plugin** (wasmtime 33 — pinned: 34+ raises
+  MSRV past rust-version 1.85; `default-features=false`, no cmake/zstd in
+  the tree, Docker build verified); g2-middleware gained `PluginLayer` +
+  `PluginExec`/`PluginLoader` traits (jwks-style inversion — middleware and
+  proxy crates never compile wasmtime; the binary builds `PluginHost`, like
+  the rustls acceptor). ABI v1: freestanding module (zero imports — an
+  empty `Linker` enforces no-WASI), exports `memory`/`g2_abi_version`/
+  `g2_alloc`/`g2_hook(ptr,len)->i64` packed ptr/len; JSON in/out; no
+  `g2_free` (fresh `Store` per invocation, dropped wholesale). Limits:
+  epoch-deadline timeout (default 50ms, process-wide 5ms ticker thread on
+  a Weak — JWKS-refresher lifecycle) + `StoreLimits` memory cap (16 MiB,
+  `trap_on_grow_failure`). **Fail closed** (500) on trap/timeout/bad
+  output — deliberate inversion of the limiter's fail-open, reasoned in
+  ADR-0005 §4. Chain: pre = slot 10 (directly above auth), post = slot 13
+  (below rate-limit); doc renumbered 1–18; both per-version
+  (`VersionOverrides.plugins`), both under the api-id anti-spoof stamp.
+  Config: `plugins{pre,post:[{name,path,config,timeout_ms,
+  max_memory_bytes}]}` + gateway `plugins_dir`/`--plugins-dir`; paths
+  shape-checked at validate, canonicalize+containment (symlink-proof) at
+  load; broken module fails build loudly, reload keeps old table.
+  **`RouteTable::build` params-struct refactor done** (the session-3 wish):
+  `RouteResources` struct, all 9 call sites converted. Tests: WAT-authored
+  guests via the `wat` dev-dep (no wasm32 toolchain in `make check`) — 18
+  g2-plugin units (incl. infinite-loop-traps-at-50ms, needle-scan guest
+  proving real input delivery), layer/chain tests with fakes, 7-case
+  `plugin_e2e.rs` (incl. shipped-example test pinning
+  `examples/plugins/header_tag.wat`'s hand-counted data length). Verified
+  live: real gateway + `--plugins-dir` injected/stripped headers through
+  the example plugin. Not done (deliberate): body access, response-header
+  mutation on continue, base64 bodies, compile cache across reloads —
+  ADR-0005 consequences list. Next: M8+ service discovery /
+  body transforms, or an M9 GraphQL box (subscriptions unblocked).

@@ -36,4 +36,4 @@ pub mod router;
 
 pub use forward::{Forwarder, UpstreamAddr, UpstreamTarget};
 pub use gateway::{Gateway, ProxyBody};
-pub use router::{Route, RouteTable};
+pub use router::{Route, RouteResources, RouteTable};

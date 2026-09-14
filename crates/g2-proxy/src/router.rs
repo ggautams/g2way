@@ -8,13 +8,57 @@ use g2_core::{ApiDefinition, Error};
 use g2_middleware::SharedJwksFetch;
 use g2_middleware::{
     AnalyticsHandle, AnalyticsLayer, AuthLayer, CacheLayer, ChainBuilder, ChainService, CorsLayer,
-    EndpointLimits, GraphQlLayer, HeaderTransformLayer, HttpMetrics, IpFilterLayer, MetricsLayer,
-    MockResponseLayer, PathPolicyLayer, RateLimitLayer, RequestContext, RequestSizeLimitLayer,
-    SpikeGuard, StatsLayer, StatsRegistry, TraceLayer, VersionDispatch,
+    EndpointLimits, GraphQlLayer, HeaderTransformLayer, HookKind, HttpMetrics, IpFilterLayer,
+    MetricsLayer, MockResponseLayer, PathPolicyLayer, PluginLayer, RateLimitLayer, RequestContext,
+    RequestSizeLimitLayer, SharedPluginLoader, SpikeGuard, StatsLayer, StatsRegistry, TraceLayer,
+    VersionDispatch,
 };
 use g2_storage::SharedStorage;
 
 use crate::forward::{Forward, Forwarder, HttpJwksFetch, UpstreamTarget};
+
+/// Process-wide resources a route(-table) build draws on. All of them
+/// outlive any single table: connection pools, storage, guards, counters,
+/// instruments and the plugin engine survive hot reloads.
+///
+/// Optional fields default to `None` via [`RouteResources::new`]; call
+/// sites needing more use struct-update syntax on top of it.
+#[derive(Clone, Copy)]
+pub struct RouteResources<'a> {
+    /// Shared upstream client (connection pools, TLS config).
+    pub forwarder: &'a Forwarder,
+    /// Session/config storage used by auth, rate limiting and caching.
+    pub storage: &'a SharedStorage,
+    /// Pod-local spike guard fronting the distributed rate limiter.
+    pub spike_guard: Option<&'a Arc<SpikeGuard>>,
+    /// Per-API request counter registry (survives reloads).
+    pub stats: Option<&'a Arc<StatsRegistry>>,
+    /// Process-wide OpenTelemetry instruments.
+    pub metrics: Option<&'a Arc<HttpMetrics>>,
+    /// Handle feeding the process-wide analytics worker.
+    pub analytics: Option<&'a AnalyticsHandle>,
+    /// Loader turning `plugins` config into runnable WASM hooks; `None`
+    /// when the gateway has no plugins directory (definitions declaring
+    /// plugins then fail the build).
+    pub plugin_loader: Option<&'a SharedPluginLoader>,
+}
+
+impl<'a> RouteResources<'a> {
+    /// Resources with every optional facility disabled — the minimal build
+    /// (and what most tests want).
+    #[must_use]
+    pub fn new(forwarder: &'a Forwarder, storage: &'a SharedStorage) -> Self {
+        Self {
+            forwarder,
+            storage,
+            spike_guard: None,
+            stats: None,
+            metrics: None,
+            analytics: None,
+            plugin_loader: None,
+        }
+    }
+}
 
 /// Sets the per-version (inner) layers on `builder` from `def` — the one
 /// place the inner half of a chain is configured, shared by the unversioned
@@ -27,11 +71,11 @@ use crate::forward::{Forward, Forwarder, HttpJwksFetch, UpstreamTarget};
 fn inner_layers(
     builder: ChainBuilder,
     def: &ApiDefinition,
-    storage: &SharedStorage,
+    res: &RouteResources<'_>,
     jwks_fetch: &SharedJwksFetch,
-    spike_guard: Option<&Arc<SpikeGuard>>,
     scope: &str,
 ) -> Result<ChainBuilder, Error> {
+    let storage = res.storage;
     let auth = AuthLayer::from_config(
         &def.auth,
         Arc::clone(storage),
@@ -48,7 +92,7 @@ fn inner_layers(
         Some(RateLimitLayer::new(
             &def.api_id,
             Arc::clone(storage),
-            spike_guard.map(Arc::clone),
+            res.spike_guard.map(Arc::clone),
             endpoint_limits,
         ))
     } else {
@@ -77,11 +121,25 @@ fn inner_layers(
         .cache
         .as_ref()
         .map(|c| CacheLayer::new(c, scope, &def.org_id, Arc::clone(storage)));
+    let (plugins_pre, plugins_post) = match &def.plugins {
+        Some(plugins) => (
+            PluginLayer::from_config(HookKind::Pre, &plugins.pre, res.plugin_loader, &def.api_id)?,
+            PluginLayer::from_config(
+                HookKind::Post,
+                &plugins.post,
+                res.plugin_loader,
+                &def.api_id,
+            )?,
+        ),
+        None => (None, None),
+    };
     Ok(builder
         .path_policy(path_policy)
         .size_limit(size_limit)
+        .plugins_pre(plugins_pre)
         .auth(auth)
         .rate_limit(rate_limit)
+        .plugins_post(plugins_post)
         .graphql(graphql)
         .transform_headers(transform_headers)
         .mock(mock)
@@ -116,15 +174,8 @@ impl std::fmt::Debug for Route {
 }
 
 impl Route {
-    fn build(
-        def: ApiDefinition,
-        forwarder: &Forwarder,
-        storage: &SharedStorage,
-        spike_guard: Option<&Arc<SpikeGuard>>,
-        stats: Option<&Arc<StatsRegistry>>,
-        metrics: Option<&Arc<HttpMetrics>>,
-        analytics: Option<&AnalyticsHandle>,
-    ) -> Result<Self, Error> {
+    fn build(def: ApiDefinition, res: &RouteResources<'_>) -> Result<Self, Error> {
+        let forwarder = res.forwarder;
         let target = Arc::new(UpstreamTarget::build(&def)?);
         // Shared by every version's auth layer; JWKS documents ride the same
         // pooled client as proxied traffic and health probes.
@@ -145,9 +196,15 @@ impl Route {
         };
         let outer = ChainBuilder::new(ctx.clone())
             .trace(Some(TraceLayer::new(ctx.clone(), span_name)))
-            .metrics(metrics.map(|m| MetricsLayer::new(Arc::clone(m), &ctx, span_name)))
-            .stats(stats.map(|r| StatsLayer::new(r.for_api(&def.api_id))))
-            .analytics(analytics.map(|h| AnalyticsLayer::new(h.clone(), ctx.clone())))
+            .metrics(
+                res.metrics
+                    .map(|m| MetricsLayer::new(Arc::clone(m), &ctx, span_name)),
+            )
+            .stats(res.stats.map(|r| StatsLayer::new(r.for_api(&def.api_id))))
+            .analytics(
+                res.analytics
+                    .map(|h| AnalyticsLayer::new(h.clone(), ctx.clone())),
+            )
             .ip_filter(ip_filter)
             .cors(cors);
         let chain = match &def.versioning {
@@ -155,7 +212,7 @@ impl Route {
                 if let Some(health) = &def.health_check {
                     crate::health::spawn_checker(forwarder, &target, health);
                 }
-                inner_layers(outer, &def, storage, &jwks_fetch, spike_guard, &def.api_id)?
+                inner_layers(outer, &def, res, &jwks_fetch, &def.api_id)?
                     .build(Forward::new(forwarder, Arc::clone(&target)))
             }
             // A versioned API gets one inner chain per version — each built
@@ -175,9 +232,8 @@ impl Route {
                     let inner = inner_layers(
                         ChainBuilder::new(ctx.clone()),
                         &vdef,
-                        storage,
+                        res,
                         &jwks_fetch,
-                        spike_guard,
                         &scope,
                     )?
                     .build_inner(Forward::new(forwarder, vtarget));
@@ -228,40 +284,20 @@ pub struct RouteTable {
 impl RouteTable {
     /// Builds a table from definitions, skipping inactive ones. Each route's
     /// middleware chain is composed here, around a forwarding service using
-    /// `forwarder`'s shared client; token-auth APIs look sessions up in
-    /// `storage`. `spike_guard` is the optional process-wide pod-local
-    /// guard shared by every route's rate limiter, `stats` the optional
-    /// process-wide counter registry (shared across reloads so counters
-    /// survive table swaps), `metrics` the optional process-wide
-    /// OpenTelemetry instruments every route records into, and `analytics`
-    /// the optional handle feeding the process-wide analytics worker.
+    /// the shared client in `res` — see [`RouteResources`] for everything a
+    /// build draws on.
     ///
     /// # Errors
     ///
     /// Returns [`Error::InvalidApiDefinition`] if any definition (active or
-    /// not) fails validation — a broken definition should fail loudly at load
-    /// time, not silently at request time.
-    pub fn build(
-        defs: Vec<ApiDefinition>,
-        forwarder: &Forwarder,
-        storage: &SharedStorage,
-        spike_guard: Option<&Arc<SpikeGuard>>,
-        stats: Option<&Arc<StatsRegistry>>,
-        metrics: Option<&Arc<HttpMetrics>>,
-        analytics: Option<&AnalyticsHandle>,
-    ) -> Result<Self, Error> {
+    /// not) fails validation or a referenced plugin fails to load — a broken
+    /// definition should fail loudly at load time, not silently at request
+    /// time.
+    pub fn build(defs: Vec<ApiDefinition>, res: &RouteResources<'_>) -> Result<Self, Error> {
         let mut routes = Vec::with_capacity(defs.len());
         for def in defs {
             let active = def.active;
-            let route = Route::build(
-                def,
-                forwarder,
-                storage,
-                spike_guard,
-                stats,
-                metrics,
-                analytics,
-            )?;
+            let route = Route::build(def, res)?;
             if active {
                 routes.push(Arc::new(route));
             } else {
@@ -303,7 +339,7 @@ mod tests {
 
     fn table(defs: Vec<ApiDefinition>) -> Result<RouteTable, Error> {
         let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
-        RouteTable::build(defs, &Forwarder::new(), &storage, None, None, None, None)
+        RouteTable::build(defs, &RouteResources::new(&Forwarder::new(), &storage))
     }
 
     #[tokio::test]
@@ -348,16 +384,8 @@ mod tests {
         ))
         .expect("def");
         let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
-        let table = RouteTable::build(
-            vec![def],
-            &Forwarder::new(),
-            &storage,
-            None,
-            None,
-            None,
-            None,
-        )
-        .expect("build");
+        let table = RouteTable::build(vec![def], &RouteResources::new(&Forwarder::new(), &storage))
+            .expect("build");
 
         // Eager fetch plus at least one 1s periodic tick.
         tokio::time::timeout(Duration::from_secs(10), async {

@@ -17,6 +17,7 @@ use crate::ip_filter::IpFilterLayer;
 use crate::metrics::MetricsLayer;
 use crate::mock::MockResponseLayer;
 use crate::path_policy::PathPolicyLayer;
+use crate::plugin::PluginLayer;
 use crate::rate_limit::RateLimitLayer;
 use crate::set_context::SetContextLayer;
 use crate::size_limit::RequestSizeLimitLayer;
@@ -53,38 +54,50 @@ use crate::{ChainService, ProxyBody};
 /// 9. [`RequestSizeLimitLayer`] — request body size limit (absent when
 ///    unconfigured). Above auth so oversized requests are rejected before
 ///    any credential work.
-/// 10. [`AuthLayer`] — token auth (absent for keyless APIs).
-/// 11. [`RateLimitLayer`] — endpoint rate limits plus session rate/quota
+/// 10. [`PluginLayer`] (pre) — WASM pre hooks (absent when unconfigured).
+///     Directly above auth so hooks can inject or transform credentials
+///     before they are checked, and below the path/size policies so
+///     statically-rejected requests buy no plugin CPU. Below CORS, so a
+///     hook's short-circuit response still gets CORS decoration.
+/// 11. [`AuthLayer`] — token auth (absent for keyless APIs).
+/// 12. [`RateLimitLayer`] — endpoint rate limits plus session rate/quota
 ///     enforcement (absent only for keyless APIs without endpoint rate
 ///     limits: session limits need a session, endpoint limits do not).
-/// 12. [`GraphQlLayer`] — GraphQL protections, playground, and persisted
+/// 13. [`PluginLayer`] (post) — WASM post hooks (absent when unconfigured).
+///     Below auth/rate-limit so hooks see the authenticated session and
+///     401/403/429 rejections never invoke them; above GraphQL and the
+///     header transforms so session-based hook decisions run before any
+///     payload work and hook short-circuits stay untransformed like every
+///     other gateway rejection.
+/// 14. [`GraphQlLayer`] — GraphQL protections, playground, and persisted
 ///     queries (absent when unconfigured). Below auth/rate-limit so the
 ///     per-key grants are resolved, the playground stays credentialed, and
 ///     rejected requests buy no parse work; above the header transforms so
 ///     GraphQL rejections stay untransformed and the persisted-query
 ///     rewrite happens before request transforms see the upstream-bound
 ///     request.
-/// 13. [`HeaderTransformLayer`] — per-API header add/remove on requests and
+/// 15. [`HeaderTransformLayer`] — per-API header add/remove on requests and
 ///     responses (absent when unconfigured). Below auth/rate-limit so
 ///     gateway rejections are not transformed; above [`ApiIdHeaderLayer`] so
 ///     a transform can never spoof the anti-spoof api-id header.
-/// 14. [`MockResponseLayer`] — gateway-answered mock responses (absent when
+/// 16. [`MockResponseLayer`] — gateway-answered mock responses (absent when
 ///     unconfigured). Below auth/rate-limit (mocks on a protected API stay
 ///     protected) and below the header transforms, so mock responses get
 ///     the API's response transforms like any upstream response.
-/// 15. [`CacheLayer`] — shared response caching for safe requests (absent
+/// 17. [`CacheLayer`] — shared response caching for safe requests (absent
 ///     when unconfigured). Below auth/rate-limit so cache hits still
 ///     require credentials and consume rate, below the header transforms so
 ///     the stored copy is the raw upstream response (transforms re-apply
 ///     live on every hit), and below mocks so mock responses — already
 ///     gateway-local — are never cached.
-/// 16. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound request.
+/// 18. [`ApiIdHeaderLayer`] — sets `x-g2-api-id` on the upstream-bound
+///     request. Innermost, so neither transforms nor plugins can spoof it.
 ///
 /// [`Self::build`] composes the full stack for an unversioned API. A
 /// versioned API splits the stack around its version dispatcher instead:
 /// [`Self::build_outer`] composes the shared, version-independent layers
 /// (items 1–7) around the dispatcher, and [`Self::build_inner`] composes
-/// the per-version layers (items 8–16) around each version's forwarder.
+/// the per-version layers (items 8–18) around each version's forwarder.
 /// The three methods must keep the ordering above consistent.
 #[derive(Debug, Clone)]
 pub struct ChainBuilder {
@@ -99,6 +112,8 @@ pub struct ChainBuilder {
     cors: Option<CorsLayer>,
     path_policy: Option<PathPolicyLayer>,
     size_limit: Option<RequestSizeLimitLayer>,
+    plugins_pre: Option<PluginLayer>,
+    plugins_post: Option<PluginLayer>,
     graphql: Option<GraphQlLayer>,
     transform_headers: Option<HeaderTransformLayer>,
     mock: Option<MockResponseLayer>,
@@ -121,6 +136,8 @@ impl ChainBuilder {
             cors: None,
             path_policy: None,
             size_limit: None,
+            plugins_pre: None,
+            plugins_post: None,
             graphql: None,
             transform_headers: None,
             mock: None,
@@ -199,6 +216,21 @@ impl ChainBuilder {
         self
     }
 
+    /// Adds WASM pre hooks, run directly above auth (`None` is a no-op).
+    #[must_use]
+    pub fn plugins_pre(mut self, plugins_pre: Option<PluginLayer>) -> Self {
+        self.plugins_pre = plugins_pre;
+        self
+    }
+
+    /// Adds WASM post hooks, run directly below rate limiting (`None` is a
+    /// no-op).
+    #[must_use]
+    pub fn plugins_post(mut self, plugins_post: Option<PluginLayer>) -> Self {
+        self.plugins_post = plugins_post;
+        self
+    }
+
     /// Adds GraphQL protections, playground, and persisted queries (`None`
     /// is a no-op).
     #[must_use]
@@ -250,8 +282,10 @@ impl ChainBuilder {
             .option_layer(self.cors)
             .option_layer(self.path_policy)
             .option_layer(self.size_limit)
+            .option_layer(self.plugins_pre)
             .option_layer(self.auth)
             .option_layer(self.rate_limit)
+            .option_layer(self.plugins_post)
             .option_layer(self.graphql)
             .option_layer(self.transform_headers)
             .option_layer(self.mock)
@@ -304,8 +338,10 @@ impl ChainBuilder {
         let svc = ServiceBuilder::new()
             .option_layer(self.path_policy)
             .option_layer(self.size_limit)
+            .option_layer(self.plugins_pre)
             .option_layer(self.auth)
             .option_layer(self.rate_limit)
+            .option_layer(self.plugins_post)
             .option_layer(self.graphql)
             .option_layer(self.transform_headers)
             .option_layer(self.mock)
@@ -481,6 +517,107 @@ mod tests {
         // Everything else still requires credentials.
         let resp = call("/other").await.expect("infallible");
         assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn pre_plugins_run_before_auth_and_post_plugins_after() {
+        use std::sync::Arc;
+
+        use g2_core::AuthConfig;
+        use g2_storage::SharedStorage;
+
+        use crate::plugin::{HookKind, HookOutcome, PluginExec, PluginLayer};
+
+        /// Answers every request with 418.
+        struct Teapot;
+        impl PluginExec for Teapot {
+            fn name(&self) -> &str {
+                "teapot"
+            }
+            fn run(
+                &self,
+                _call: &crate::plugin::HookInvocation<'_>,
+            ) -> Result<HookOutcome, String> {
+                let mut resp = http::Response::new(Bytes::new());
+                *resp.status_mut() = http::StatusCode::IM_A_TEAPOT;
+                Ok(HookOutcome::Respond(resp))
+            }
+        }
+
+        // Token auth with an empty store: every authenticated request 401s,
+        // so what the client sees reveals which side of auth the plugin ran.
+        let auth = || {
+            let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+            AuthLayer::from_config(&AuthConfig::default(), storage, "users-api", "acme", None)
+                .expect("valid")
+                .expect("token mode")
+        };
+        let plugin = |kind| PluginLayer::from_execs(kind, vec![Arc::new(Teapot)]);
+
+        // Pre slot: the plugin answers before auth can reject.
+        let chain = ChainBuilder::new(RequestContext::new("users-api", "acme"))
+            .auth(Some(auth()))
+            .plugins_pre(Some(plugin(HookKind::Pre)))
+            .build(tower::service_fn(echo_forward));
+        let resp = chain
+            .oneshot(Request::new(body("")))
+            .await
+            .expect("infallible");
+        assert_eq!(resp.status(), http::StatusCode::IM_A_TEAPOT);
+
+        // Post slot: auth rejects first, the plugin never runs.
+        let chain = ChainBuilder::new(RequestContext::new("users-api", "acme"))
+            .auth(Some(auth()))
+            .plugins_post(Some(plugin(HookKind::Post)))
+            .build(tower::service_fn(echo_forward));
+        let resp = chain
+            .oneshot(Request::new(body("")))
+            .await
+            .expect("infallible");
+        assert_eq!(resp.status(), http::StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn plugins_cannot_spoof_the_api_id_header() {
+        use std::sync::Arc;
+
+        use crate::plugin::{HookKind, HookOutcome, PluginExec, PluginLayer};
+
+        /// Sets the anti-spoof header on the request.
+        struct Spoofer;
+        impl PluginExec for Spoofer {
+            fn name(&self) -> &str {
+                "spoofer"
+            }
+            fn run(
+                &self,
+                _call: &crate::plugin::HookInvocation<'_>,
+            ) -> Result<HookOutcome, String> {
+                Ok(HookOutcome::Continue {
+                    set_headers: vec![(API_ID_HEADER, HeaderValue::from_static("spoofed"))],
+                    remove_headers: vec![],
+                })
+            }
+        }
+
+        let chain = ChainBuilder::new(RequestContext::new("users-api", "acme"))
+            .plugins_post(Some(PluginLayer::from_execs(
+                HookKind::Post,
+                vec![Arc::new(Spoofer)],
+            )))
+            .build(tower::service_fn(echo_forward));
+        let resp = chain
+            .oneshot(Request::new(body("")))
+            .await
+            .expect("infallible");
+        // The anti-spoof stamp is innermost and wins.
+        assert_eq!(
+            resp.headers()
+                .get("x-echo-api-id")
+                .expect("api id")
+                .as_bytes(),
+            b"users-api"
+        );
     }
 
     #[tokio::test]
