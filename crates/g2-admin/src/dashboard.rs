@@ -99,6 +99,15 @@ pub(crate) async fn node(State(state): State<AdminState>) -> Response {
                         "last_error": s.last_error,
                     })
                 }),
+                // Last GraphQL schema-sync success/error; null when sync is
+                // off or the API is versioned (each version syncs its own
+                // schema, not surfaced here).
+                "graphql_schema_sync": route.graphql_sync_status().map(|s| {
+                    serde_json::json!({
+                        "last_success_unix_secs": s.last_success_unix_secs,
+                        "last_error": s.last_error,
+                    })
+                }),
                 // Circuit state ("closed"/"open"/"half_open"); null when
                 // breaking is off or the API is versioned (each version
                 // keeps its own circuit, not surfaced here).

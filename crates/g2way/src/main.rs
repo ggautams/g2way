@@ -290,6 +290,23 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             });
         }
 
+        // GraphQL schema sync: `POST /g2/graphql/sync` broadcasts a nudge;
+        // this task triggers an immediate re-introspection on every synced
+        // API of the current route table.
+        {
+            let gateway = Arc::clone(&gateway);
+            let storage = Arc::clone(&storage);
+            tokio::spawn(async move {
+                let org_id = g2_core::DEFAULT_ORG_ID.to_owned();
+                if let Err(e) = reload::listen_graphql_sync(storage, org_id, gateway).await {
+                    tracing::error!(
+                        error = %e,
+                        "graphql schema-sync subscription failed; admin-triggered sync disabled"
+                    );
+                }
+            });
+        }
+
         let listener = tokio::net::TcpListener::bind(config.listen_addr).await?;
         if let (Some(_), Some(tls)) = (&tls_acceptor, &config.tls) {
             tracing::info!(

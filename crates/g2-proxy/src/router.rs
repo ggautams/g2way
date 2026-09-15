@@ -8,10 +8,10 @@ use g2_core::{ApiDefinition, Error};
 use g2_middleware::SharedJwksFetch;
 use g2_middleware::{
     AnalyticsHandle, AnalyticsLayer, AuthLayer, BodyTransformLayer, CacheLayer, ChainBuilder,
-    ChainService, CorsLayer, EndpointLimits, GraphQlLayer, HeaderTransformLayer, HookKind,
-    HttpMetrics, IpFilterLayer, MetricsLayer, MockResponseLayer, PathPolicyLayer, PluginLayer,
-    RateLimitLayer, RequestContext, RequestSizeLimitLayer, SharedPluginLoader, SpikeGuard,
-    StatsLayer, StatsRegistry, TraceLayer, VersionDispatch,
+    ChainService, CorsLayer, EndpointLimits, GraphQlLayer, GraphQlSyncHandle, HeaderTransformLayer,
+    HookKind, HttpMetrics, IpFilterLayer, MetricsLayer, MockResponseLayer, PathPolicyLayer,
+    PluginLayer, RateLimitLayer, RequestContext, RequestSizeLimitLayer, SchemaSyncSnapshot,
+    SharedPluginLoader, SpikeGuard, StatsLayer, StatsRegistry, TraceLayer, VersionDispatch,
 };
 use g2_storage::SharedStorage;
 
@@ -63,6 +63,9 @@ impl<'a> RouteResources<'a> {
 /// Sets the per-version (inner) layers on `builder` from `def` — the one
 /// place the inner half of a chain is configured, shared by the unversioned
 /// [`ChainBuilder::build`] path and each version of a versioned API.
+/// Alongside the builder it returns the GraphQL schema-sync handle, when
+/// the version configures one — the caller spawns the refresher, which
+/// needs the upstream target this function never sees.
 ///
 /// `scope` namespaces the response cache and the endpoint rate-limit
 /// counters: the API id for an unversioned API, `{api_id}:{version}` per
@@ -74,7 +77,7 @@ fn inner_layers(
     res: &RouteResources<'_>,
     jwks_fetch: &SharedJwksFetch,
     scope: &str,
-) -> Result<ChainBuilder, Error> {
+) -> Result<(ChainBuilder, Option<GraphQlSyncHandle>), Error> {
     let storage = res.storage;
     let auth = AuthLayer::from_config(
         &def.auth,
@@ -123,6 +126,7 @@ fn inner_layers(
         .map(|g| GraphQlLayer::from_config(g, def))
         .transpose()?
         .flatten();
+    let graphql_sync = graphql.as_ref().and_then(GraphQlLayer::sync_handle);
     let cache = def
         .cache
         .as_ref()
@@ -139,18 +143,21 @@ fn inner_layers(
         ),
         None => (None, None),
     };
-    Ok(builder
-        .path_policy(path_policy)
-        .size_limit(size_limit)
-        .plugins_pre(plugins_pre)
-        .auth(auth)
-        .rate_limit(rate_limit)
-        .plugins_post(plugins_post)
-        .graphql(graphql)
-        .transform_headers(transform_headers)
-        .transform_body(transform_body)
-        .mock(mock)
-        .cache(cache))
+    Ok((
+        builder
+            .path_policy(path_policy)
+            .size_limit(size_limit)
+            .plugins_pre(plugins_pre)
+            .auth(auth)
+            .rate_limit(rate_limit)
+            .plugins_post(plugins_post)
+            .graphql(graphql)
+            .transform_headers(transform_headers)
+            .transform_body(transform_body)
+            .mock(mock)
+            .cache(cache),
+        graphql_sync,
+    ))
 }
 
 /// One routable API: a validated [`ApiDefinition`] plus everything
@@ -168,6 +175,30 @@ pub struct Route {
     /// The API's middleware chain, ending in the upstream forwarder. Cloned
     /// per request by the gateway.
     pub(crate) chain: ChainService,
+    /// GraphQL schema-sync handles — one per version configuring
+    /// `graphql.schema_sync` (at most one for an unversioned API). The
+    /// admin nudge listener triggers immediate re-fetches through these.
+    graphql_sync: Vec<GraphQlSyncHandle>,
+}
+
+impl Route {
+    /// The route's GraphQL schema-sync handles (every synced version), for
+    /// the admin-triggered sync broadcast.
+    #[must_use]
+    pub fn graphql_sync_handles(&self) -> &[GraphQlSyncHandle] {
+        &self.graphql_sync
+    }
+
+    /// The schema-sync status of an **unversioned** API with sync
+    /// configured; `None` otherwise (versioned APIs sync per version and
+    /// report no aggregate, like [`UpstreamTarget::discovery_status`]).
+    #[must_use]
+    pub fn graphql_sync_status(&self) -> Option<SchemaSyncSnapshot> {
+        if self.def.versioning.is_some() {
+            return None;
+        }
+        self.graphql_sync.first().map(GraphQlSyncHandle::status)
+    }
 }
 
 impl std::fmt::Debug for Route {
@@ -214,6 +245,7 @@ impl Route {
             )
             .ip_filter(ip_filter)
             .cors(cors);
+        let mut graphql_sync = Vec::new();
         let chain = match &def.versioning {
             None => {
                 if let Some(health) = &def.health_check {
@@ -222,8 +254,12 @@ impl Route {
                 if let Some(sd) = &def.service_discovery {
                     crate::discovery::spawn_refresher(forwarder, &target, sd);
                 }
-                inner_layers(outer, &def, res, &jwks_fetch, &def.api_id)?
-                    .build(Forward::new(forwarder, Arc::clone(&target)))
+                let (builder, sync) = inner_layers(outer, &def, res, &jwks_fetch, &def.api_id)?;
+                if let Some(sync) = sync {
+                    crate::graphql_sync::spawn_refresher(forwarder, &target, &sync);
+                    graphql_sync.push(sync);
+                }
+                builder.build(Forward::new(forwarder, Arc::clone(&target)))
             }
             // A versioned API gets one inner chain per version — each built
             // from the version's effective definition, with its own upstream
@@ -242,14 +278,18 @@ impl Route {
                         crate::discovery::spawn_refresher(forwarder, &vtarget, sd);
                     }
                     let scope = format!("{}:{name}", vdef.api_id);
-                    let inner = inner_layers(
+                    let (builder, sync) = inner_layers(
                         ChainBuilder::new(ctx.clone()),
                         &vdef,
                         res,
                         &jwks_fetch,
                         &scope,
-                    )?
-                    .build_inner(Forward::new(forwarder, vtarget));
+                    )?;
+                    if let Some(sync) = sync {
+                        crate::graphql_sync::spawn_refresher(forwarder, &vtarget, &sync);
+                        graphql_sync.push(sync);
+                    }
+                    let inner = builder.build_inner(Forward::new(forwarder, vtarget));
                     chains.insert(name.clone(), inner);
                 }
                 outer.build_outer(VersionDispatch::from_config(
@@ -264,6 +304,7 @@ impl Route {
             def,
             target,
             chain,
+            graphql_sync,
         })
     }
 
@@ -353,6 +394,31 @@ mod tests {
     fn table(defs: Vec<ApiDefinition>) -> Result<RouteTable, Error> {
         let storage: SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
         RouteTable::build(defs, &RouteResources::new(&Forwarder::new(), &storage))
+    }
+
+    #[test]
+    fn graphql_sync_handles_and_status_ride_the_route() {
+        let mut synced = def("gql", "/gql/", "http://gql.internal/graphql");
+        synced.graphql = Some(
+            serde_json::from_value(serde_json::json!({
+                "schema": "type Query { hello: String }",
+                "schema_sync": {}
+            }))
+            .expect("graphql config"),
+        );
+        // Built synchronously (no runtime): the refresher spawn is skipped
+        // with a warning, but the handles and status must still be wired.
+        let table =
+            table(vec![synced, def("plain", "/plain/", "http://p.internal")]).expect("build");
+        let gql = table.match_path("/gql/x").expect("routed");
+        assert_eq!(gql.graphql_sync_handles().len(), 1);
+        let status = gql.graphql_sync_status().expect("sync configured");
+        assert_eq!(status.last_success_unix_secs, None);
+        assert_eq!(status.last_error, None);
+
+        let plain = table.match_path("/plain/x").expect("routed");
+        assert!(plain.graphql_sync_handles().is_empty());
+        assert!(plain.graphql_sync_status().is_none());
     }
 
     #[tokio::test]

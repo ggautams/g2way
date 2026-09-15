@@ -25,6 +25,16 @@ pub fn reload_channel(org_id: &str) -> String {
     format!("g2:{org_id}:channel:reload")
 }
 
+/// Pub/sub channel a GraphQL schema-sync nudge for `org_id` is broadcast
+/// on: `g2:{org_id}:channel:graphql-sync`.
+///
+/// The message payload carries no data — receivers re-fetch every synced
+/// API's schema from its upstream via introspection (see ADR-0008).
+#[must_use]
+pub fn graphql_sync_channel(org_id: &str) -> String {
+    format!("g2:{org_id}:channel:graphql-sync")
+}
+
 /// Settings for the pod-local token-bucket spike guard placed in front of
 /// the distributed (Redis) rate limiter.
 ///

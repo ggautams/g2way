@@ -44,7 +44,9 @@ pub use body_transform::{BodyTransformRule, BodyTransforms};
 pub use config::{AnalyticsSinkKind, ClientCertMode, GatewayConfig, SpikeGuardConfig, TlsConfig};
 pub use endpoints::{EndpointRateLimit, MockResponse, PathRule};
 pub use error::Error;
-pub use graphql::{GraphQlConfig, GraphQlExecutionMode, PersistedQuery, PlaygroundConfig};
+pub use graphql::{
+    GraphQlConfig, GraphQlExecutionMode, PersistedQuery, PlaygroundConfig, SchemaSyncConfig,
+};
 pub use plugins::{PluginRef, PluginsConfig};
 pub use policy::Policy;
 pub use security::CorsConfig;

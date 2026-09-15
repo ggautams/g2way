@@ -95,19 +95,38 @@ const PLAYGROUND_HTML: &str = r#"<!DOCTYPE html>
 "#;
 
 /// Everything one API's GraphQL handling needs, precomputed at route-build
-/// time.
-struct GraphQlShared {
-    api_id: String,
-    schema: Valid<Schema>,
+/// time. `pub(crate)` so [`graphql_sync`](crate::graphql_sync) can drive
+/// the schema swap.
+pub(crate) struct GraphQlShared {
+    pub(crate) api_id: String,
+    /// The schema-dependent state — the second designated swappable leaf
+    /// after ADR-0006's `TargetSet` (ADR-0008): schema sync replaces it
+    /// wholesale; everything else here is schema-independent and fixed
+    /// until a reload.
+    pub(crate) state: arc_swap::ArcSwap<GraphQlSchemaState>,
+    /// Sync status/trigger state; `None` when `schema_sync` is not
+    /// configured (the state is then never swapped).
+    pub(crate) sync: Option<crate::graphql_sync::SchemaSync>,
     introspection_enabled: bool,
     max_query_depth: Option<u32>,
     playground: Option<PlaygroundPage>,
-    persisted: Vec<CompiledPersisted>,
+    pub(crate) persisted: Vec<CompiledPersisted>,
     /// Origin-form URI persisted requests are rewritten to (the API's
     /// listen root, i.e. the GraphQL endpoint itself).
     graphql_uri: Uri,
     /// Bound on buffered request bodies, in bytes.
     max_body_bytes: usize,
+}
+
+/// The schema-dependent half of [`GraphQlShared`], swapped wholesale by a
+/// successful schema sync (seeded from `graphql.schema` at route build).
+pub(crate) struct GraphQlSchemaState {
+    /// The SDL this state was compiled from, for change detection.
+    pub(crate) sdl: String,
+    pub(crate) schema: Valid<Schema>,
+    /// Each persisted operation validated against [`schema`](Self::schema),
+    /// index-parallel to [`GraphQlShared::persisted`].
+    pub(crate) persisted_docs: Vec<Valid<ExecutableDocument>>,
 }
 
 impl std::fmt::Debug for GraphQlShared {
@@ -128,18 +147,18 @@ struct PlaygroundPage {
     html: Bytes,
 }
 
-/// One persisted GraphQL-as-REST endpoint, compiled for matching and
-/// pre-parsed for enforcement.
-struct CompiledPersisted {
+/// One persisted GraphQL-as-REST endpoint, compiled for matching. The
+/// schema-independent half: the pre-parsed operation lives in
+/// [`GraphQlSchemaState::persisted_docs`] (same index) because it must be
+/// re-validated when a schema sync swaps the schema.
+pub(crate) struct CompiledPersisted {
     method: Method,
     /// Anchored regex over the absolute request path, with one named
     /// capture per `{name}` template parameter.
     regex: Regex,
-    /// The raw operation text, forwarded to the upstream verbatim.
-    query: String,
-    /// The parsed operation — protections run on this without any
-    /// per-request parsing.
-    doc: Valid<ExecutableDocument>,
+    /// The raw operation text, forwarded to the upstream verbatim (and
+    /// re-validated against a synced schema).
+    pub(crate) query: String,
     operation_name: Option<String>,
     variables: Option<serde_json::Value>,
 }
@@ -153,7 +172,9 @@ pub struct GraphQlLayer {
 /// Folds an apollo-compiler diagnostic list into per-diagnostic one-line
 /// messages (the CLI-report `Display` form spans many lines of source
 /// snippets — wrong for JSON error bodies).
-fn diagnostic_messages(errors: &apollo_compiler::validation::DiagnosticList) -> Vec<String> {
+pub(crate) fn diagnostic_messages(
+    errors: &apollo_compiler::validation::DiagnosticList,
+) -> Vec<String> {
     errors.iter().map(|d| d.error.to_string()).collect()
 }
 
@@ -203,6 +224,7 @@ impl GraphQlLayer {
         });
 
         let mut persisted = Vec::with_capacity(config.persisted_queries.len());
+        let mut persisted_docs = Vec::with_capacity(config.persisted_queries.len());
         for (index, pq) in config.persisted_queries.iter().enumerate() {
             let method = pq
                 .method
@@ -244,16 +266,24 @@ impl GraphQlLayer {
                 method,
                 regex,
                 query: pq.operation.clone(),
-                doc,
                 operation_name: pq.operation_name.clone(),
                 variables: pq.variables.clone(),
             });
+            persisted_docs.push(doc);
         }
 
         Ok(Some(Self {
             shared: Arc::new(GraphQlShared {
                 api_id: def.api_id.clone(),
-                schema,
+                state: arc_swap::ArcSwap::from_pointee(GraphQlSchemaState {
+                    sdl: config.schema.clone(),
+                    schema,
+                    persisted_docs,
+                }),
+                sync: config
+                    .schema_sync
+                    .as_ref()
+                    .map(|c| crate::graphql_sync::SchemaSync::new(c.clone())),
                 introspection_enabled: config.introspection_enabled,
                 max_query_depth: config.max_query_depth,
                 playground,
@@ -265,6 +295,17 @@ impl GraphQlLayer {
                 .unwrap_or(usize::MAX),
             }),
         }))
+    }
+
+    /// A handle for driving this API's schema sync (`Some` iff
+    /// `graphql.schema_sync` is configured) — the refresher task and the
+    /// admin nudge listener act through it.
+    #[must_use]
+    pub fn sync_handle(&self) -> Option<crate::graphql_sync::GraphQlSyncHandle> {
+        self.shared.sync.as_ref()?;
+        Some(crate::graphql_sync::GraphQlSyncHandle {
+            shared: Arc::clone(&self.shared),
+        })
     }
 }
 
@@ -308,6 +349,10 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
         Box::pin(async move {
+            // One load per request; the full `Arc` (not a guard) because it
+            // is held across `.await`s (ADR-0006's swappable-leaf rule).
+            let state = shared.state.load_full();
+
             // 1. The playground page (already behind auth, which runs above).
             if let Some(pg) = &shared.playground {
                 if req.method() == Method::GET && req.uri().path() == pg.path {
@@ -324,15 +369,18 @@ where
                 .and_then(|s| s.session().access.get(shared.api_id.as_str()).cloned());
 
             // 2. Persisted GraphQL-as-REST endpoints (first match wins).
-            for p in &shared.persisted {
+            for (index, p) in shared.persisted.iter().enumerate() {
                 if p.method != *req.method() {
                     continue;
                 }
                 let Some(caps) = p.regex.captures(req.uri().path()) else {
                     continue;
                 };
-                // The persisted operation is policed like a client query.
-                if let Some(resp) = enforce(&shared, grants.as_ref(), &p.doc) {
+                // The persisted operation is policed like a client query;
+                // its doc rides the schema state (same index) because it is
+                // re-validated whenever a schema sync swaps the schema.
+                if let Some(resp) = enforce(&shared, grants.as_ref(), &state.persisted_docs[index])
+                {
                     return Ok(resp);
                 }
                 let variables = p
@@ -351,7 +399,7 @@ where
                 Err(resp) => return Ok(resp),
             };
             let doc = match ExecutableDocument::parse_and_validate(
-                &shared.schema,
+                &state.schema,
                 query,
                 "request.graphql",
             ) {

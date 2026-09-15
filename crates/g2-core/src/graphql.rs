@@ -12,17 +12,34 @@
 //! a broken schema fails loudly at `POST /g2/apis` (or file load), never at
 //! request time.
 
+use std::collections::BTreeMap;
+
+use http::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
-use crate::transform::TRANSFORM_METHODS;
+use crate::transform::{HOP_BY_HOP, TRANSFORM_METHODS};
 use crate::Error;
 
 /// Playground path used when a [`PlaygroundConfig`] does not name one,
 /// relative to the API's listen path.
 pub const DEFAULT_PLAYGROUND_PATH: &str = "/playground";
 
+/// Default [`SchemaSyncConfig::interval_ms`]: ten minutes.
+pub const DEFAULT_SCHEMA_SYNC_INTERVAL_MS: u64 = 600_000;
+
+/// Default [`SchemaSyncConfig::timeout_ms`]: ten seconds.
+pub const DEFAULT_SCHEMA_SYNC_TIMEOUT_MS: u64 = 10_000;
+
 fn default_playground_path() -> String {
     DEFAULT_PLAYGROUND_PATH.to_owned()
+}
+
+fn default_sync_interval_ms() -> u64 {
+    DEFAULT_SCHEMA_SYNC_INTERVAL_MS
+}
+
+fn default_sync_timeout_ms() -> u64 {
+    DEFAULT_SCHEMA_SYNC_TIMEOUT_MS
 }
 
 fn default_true() -> bool {
@@ -108,6 +125,100 @@ pub struct GraphQlConfig {
     /// order; the first match wins.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub persisted_queries: Vec<PersistedQuery>,
+
+    /// Periodic schema sync from upstream introspection. When set, each
+    /// gateway pod polls the upstream's introspection endpoint and swaps
+    /// the schema it validates against in memory (stale-on-error;
+    /// [`schema`](Self::schema) stays required as the seed). Unset = the
+    /// schema is static (ADR-0008).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema_sync: Option<SchemaSyncConfig>,
+}
+
+/// Schema-sync settings: how a pod fetches the upstream's schema via
+/// GraphQL introspection (see [`GraphQlConfig::schema_sync`]).
+///
+/// The introspection `POST` goes to the API's own upstream (respecting
+/// load balancing, service discovery, and health eviction) unless
+/// [`url`](Self::url) points elsewhere. Every failure — transport, non-2xx,
+/// invalid introspection JSON, a converted schema that does not compile, or
+/// a persisted query invalid against the new schema — keeps the previous
+/// schema serving and is surfaced on `GET /g2/node`.
+///
+/// # Example (JSON)
+///
+/// ```json
+/// {
+///   "interval_ms": 300000,
+///   "headers": { "authorization": "Bearer token" }
+/// }
+/// ```
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchemaSyncConfig {
+    /// Milliseconds between introspection fetches (must be > 0). Defaults
+    /// to [`DEFAULT_SCHEMA_SYNC_INTERVAL_MS`]. An admin-triggered sync
+    /// (`POST /g2/graphql/sync`) fetches immediately regardless.
+    #[serde(default = "default_sync_interval_ms")]
+    pub interval_ms: u64,
+
+    /// Per-fetch timeout in milliseconds (must be > 0). Defaults to
+    /// [`DEFAULT_SCHEMA_SYNC_TIMEOUT_MS`].
+    #[serde(default = "default_sync_timeout_ms")]
+    pub timeout_ms: u64,
+
+    /// Absolute `http(s)` URL to introspect instead of the API's upstream —
+    /// for when introspection is served elsewhere (e.g. an internal
+    /// endpoint while the public one has introspection disabled).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+
+    /// Extra headers on the introspection request (upstream auth): name →
+    /// literal value. Hop-by-hop headers are rejected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl SchemaSyncConfig {
+    fn validate(&self, fail: &impl Fn(String) -> Error) -> Result<(), Error> {
+        if self.interval_ms == 0 {
+            return Err(fail(
+                "`graphql.schema_sync.interval_ms` must be greater than zero".into(),
+            ));
+        }
+        if self.timeout_ms == 0 {
+            return Err(fail(
+                "`graphql.schema_sync.timeout_ms` must be greater than zero".into(),
+            ));
+        }
+        if let Some(url) = &self.url {
+            let valid = (url.starts_with("http://") || url.starts_with("https://"))
+                && url.parse::<http::Uri>().is_ok();
+            if !valid {
+                return Err(fail(format!(
+                    "`graphql.schema_sync.url` must be an absolute http(s) URL, got `{url}`"
+                )));
+            }
+        }
+        for (name, value) in &self.headers {
+            if HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(fail(format!(
+                    "`graphql.schema_sync.headers` name is not a valid header name: `{name}`"
+                )));
+            }
+            if HOP_BY_HOP.iter().any(|h| h.eq_ignore_ascii_case(name)) {
+                return Err(fail(format!(
+                    "`graphql.schema_sync.headers` must not set hop-by-hop header `{name}`"
+                )));
+            }
+            if HeaderValue::from_str(value).is_err() {
+                return Err(fail(format!(
+                    "`graphql.schema_sync.headers` value for `{name}` is not a valid header value"
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Settings for the gateway-served GraphQL playground.
@@ -217,9 +328,10 @@ impl GraphQlConfig {
     ///
     /// Returns [`Error::InvalidApiDefinition`] when the schema is empty or
     /// not a valid GraphQL schema, `max_query_depth` is zero, a playground
-    /// or persisted path breaks the path rules, or a persisted query has an
+    /// or persisted path breaks the path rules, a persisted query has an
     /// invalid method, path template, operation, operation name, or
-    /// variables template.
+    /// variables template, or a schema-sync setting is invalid (zero
+    /// interval/timeout, non-http(s) URL, bad or hop-by-hop header).
     pub fn validate(&self, api: &str) -> Result<(), Error> {
         let fail = |reason: String| Error::InvalidApiDefinition {
             api: api.to_owned(),
@@ -246,6 +358,10 @@ impl GraphQlConfig {
 
         if let Some(playground) = &self.playground {
             validate_relative_path(&playground.path, "graphql.playground.path", &fail)?;
+        }
+
+        if let Some(sync) = &self.schema_sync {
+            sync.validate(&fail)?;
         }
 
         for (index, pq) in self.persisted_queries.iter().enumerate() {
@@ -641,6 +757,75 @@ mod tests {
             vec!["id", "post_id"]
         );
         assert!(path_template_params("/plain/path").is_empty());
+    }
+
+    #[test]
+    fn schema_sync_defaults_and_round_trip() {
+        let cfg = parse(
+            &serde_json::json!({
+                "schema": SCHEMA,
+                "schema_sync": {}
+            })
+            .to_string(),
+        );
+        cfg.validate("api").expect("valid");
+        let sync = cfg.schema_sync.as_ref().expect("set");
+        assert_eq!(sync.interval_ms, DEFAULT_SCHEMA_SYNC_INTERVAL_MS);
+        assert_eq!(sync.timeout_ms, DEFAULT_SCHEMA_SYNC_TIMEOUT_MS);
+        assert!(sync.url.is_none());
+        assert!(sync.headers.is_empty());
+
+        let full = parse(
+            &serde_json::json!({
+                "schema": SCHEMA,
+                "schema_sync": {
+                    "interval_ms": 5000,
+                    "timeout_ms": 2000,
+                    "url": "https://internal.example/graphql",
+                    "headers": { "authorization": "Bearer t" }
+                }
+            })
+            .to_string(),
+        );
+        full.validate("api").expect("valid");
+        let json = serde_json::to_string(&full).expect("serializes");
+        assert_eq!(parse(&json), full);
+
+        // Unset stays off the wire.
+        let bare = serde_json::to_string(&minimal()).expect("serializes");
+        assert!(!bare.contains("schema_sync"));
+    }
+
+    #[test]
+    fn schema_sync_rules_are_enforced() {
+        let cases = [
+            ("interval_ms", serde_json::json!({ "interval_ms": 0 })),
+            ("timeout_ms", serde_json::json!({ "timeout_ms": 0 })),
+            ("url", serde_json::json!({ "url": "ftp://x/graphql" })),
+            ("url", serde_json::json!({ "url": "/relative" })),
+            ("url", serde_json::json!({ "url": "http://bad host/" })),
+            (
+                "header name",
+                serde_json::json!({ "headers": { "bad name": "v" } }),
+            ),
+            (
+                "hop-by-hop",
+                serde_json::json!({ "headers": { "Connection": "close" } }),
+            ),
+            (
+                "header value",
+                serde_json::json!({ "headers": { "x-ok": "bad\nvalue" } }),
+            ),
+        ];
+        for (label, sync) in cases {
+            let cfg =
+                parse(&serde_json::json!({ "schema": SCHEMA, "schema_sync": sync }).to_string());
+            let err = cfg.validate("api").unwrap_err().to_string();
+            assert!(
+                err.contains("schema_sync"),
+                "{label}: err should name schema_sync, got {err}"
+            );
+        }
     }
 
     #[test]

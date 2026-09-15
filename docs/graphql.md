@@ -39,6 +39,7 @@ Add a `graphql` block to the API definition:
 | `max_query_depth` | unlimited | Nested selection-set levels (`{ a { b } }` = 2); deeper queries get `403`. |
 | `playground` | off | Serve a GraphiQL page (see below). |
 | `persisted_queries` | `[]` | GraphQL-as-REST endpoints (see below). |
+| `schema_sync` | off | Keep the schema in sync with the upstream via introspection (see below). |
 
 The whole listen path becomes the GraphQL endpoint: clients `POST` a JSON
 `{"query": …, "variables": …}` envelope to the listen root (or `GET` with
@@ -121,6 +122,49 @@ through verbatim. `operation_name` selects one operation when the
 document defines several. Persisted operations are validated against the
 schema at write/load time and policed per key like any client query.
 
+## Schema sync
+
+`schema_sync` keeps the compiled schema in step with the upstream via
+GraphQL introspection (ADR-0008) — periodically, plus immediately on
+`POST /g2/graphql/sync` (admin API, broadcast to every pod):
+
+```json
+"schema_sync": {
+  "interval_ms": 600000,
+  "timeout_ms": 10000,
+  "url": "http://gql-internal:4000/graphql",
+  "headers": { "authorization": "Bearer …" }
+}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `interval_ms` | `600000` | Milliseconds between introspection fetches. |
+| `timeout_ms` | `10000` | Per-fetch timeout. |
+| `url` | the API's upstream | Absolute `http(s)` URL to introspect instead. |
+| `headers` | `{}` | Extra headers on the introspection request (upstream auth). |
+
+Each pod POSTs the standard introspection query to the API's upstream
+(following load balancing, service discovery, and health eviction; with
+`url` set, that pinned endpoint instead), converts the answer to SDL,
+compiles it, re-validates every persisted query against it, and swaps the
+schema **in memory** — no reload, no storage write. `schema` stays
+required: it seeds the state and keeps serving until the first successful
+sync (and is what `GET /g2/apis` shows — the synced schema is pod-local).
+
+Failure semantics are stale-on-error: any failure — transport, non-2xx,
+an upstream refusing introspection, a schema that does not compile, or a
+persisted query invalid against the new schema — keeps the previous
+schema serving and surfaces on `GET /g2/node` as a per-API
+`graphql_schema_sync` block (`last_success_unix_secs`, `last_error`;
+`null` for versioned APIs, which sync per version).
+
+Two things worth knowing: the API's own `introspection_enabled: false`
+polices *clients*, not the sync — the fetch goes straight to the
+upstream. And an upstream that never answers introspection (the usual
+reason for disabling it publicly) leaves the seed schema serving forever
+with a permanent `last_error`; that is what the `url` override is for.
+
 ## Interactions and limits
 
 - **Body buffering**: GraphQL POSTs are buffered to be parsed, capped at
@@ -134,6 +178,6 @@ schema at write/load time and policed per key like any client query.
   tooling sends deep introspection documents.
 - **Methods**: a GraphQL API answers `GET` and `POST`; other methods get
   `405` (CORS preflights are handled by the CORS layer above).
-- **Not yet**: subscriptions (needs WebSocket passthrough), schema sync
-  from upstream introspection, UDG/federation, APQ, request batching —
-  all tracked as M9 roadmap boxes.
+- **Not yet**: subscriptions (WebSocket passthrough is in — the GraphQL
+  wiring is a later box), UDG/federation, APQ, request batching — all
+  tracked as M9 roadmap boxes.

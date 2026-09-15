@@ -106,6 +106,7 @@ pub fn router(
     let authed = Router::new()
         .route("/g2/version", get(version))
         .route("/g2/reload", post(reload))
+        .route("/g2/graphql/sync", post(graphql_sync))
         .route("/g2/node", get(dashboard::node))
         .route("/g2/stats", get(dashboard::stats))
         .route("/g2/keys", get(keys::list_keys).post(keys::create_key))
@@ -256,6 +257,36 @@ async fn reload(State(state): State<AdminState>) -> Response {
     }
 }
 
+/// `POST /g2/graphql/sync` — broadcast a GraphQL schema-sync nudge to
+/// every gateway pod (this one included) via storage pub/sub.
+///
+/// Returns as soon as the nudge is published: each pod immediately
+/// re-fetches the schema of every API configuring `graphql.schema_sync`
+/// from its upstream via introspection, swapping the compiled schema on
+/// change and keeping the previous one on any failure (surfaced on
+/// `GET /g2/node`). APIs without `schema_sync` are unaffected.
+#[utoipa::path(post, path = "/g2/graphql/sync", tag = "system",
+    security(("admin_secret" = [])),
+    responses(
+        (status = 200, description = "Nudge broadcast; pods re-introspect asynchronously"),
+        (status = 403, description = "Admin secret missing or wrong"),
+        (status = 503, description = "Storage backend unavailable"),
+    ))]
+async fn graphql_sync(State(state): State<AdminState>) -> Response {
+    let channel = g2_core::config::graphql_sync_channel(g2_core::DEFAULT_ORG_ID);
+    match state.storage.publish(&channel, "sync").await {
+        Ok(()) => {
+            tracing::info!("graphql schema-sync nudge broadcast");
+            Json(serde_json::json!({ "status": "ok", "message": "graphql schema sync broadcast" }))
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "graphql schema-sync broadcast failed");
+            error_response(StatusCode::SERVICE_UNAVAILABLE, "storage unavailable")
+        }
+    }
+}
+
 /// Authenticated fallback for unmatched admin paths.
 async fn not_found() -> Response {
     error_response(StatusCode::NOT_FOUND, "no such admin endpoint")
@@ -311,6 +342,44 @@ mod tests {
 
     async fn call(path: &str, secret: Option<&str>) -> (StatusCode, String) {
         send(test_router(MemoryStorage::new()), request(path, secret)).await
+    }
+
+    #[tokio::test]
+    async fn graphql_sync_publishes_the_nudge_and_needs_the_secret() {
+        let storage: SharedStorage = Arc::new(MemoryStorage::new());
+        let mut nudges = storage
+            .subscribe(&g2_core::config::graphql_sync_channel(
+                g2_core::DEFAULT_ORG_ID,
+            ))
+            .await
+            .expect("subscribe");
+        let router = crate::router(SECRET, Arc::clone(&storage), None, None).expect("router");
+
+        let no_secret = Request::builder()
+            .method("POST")
+            .uri("/g2/graphql/sync")
+            .body(Body::empty())
+            .expect("request");
+        let (status, _) = send(router.clone(), no_secret).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        let authed = Request::builder()
+            .method("POST")
+            .uri("/g2/graphql/sync")
+            .header(ADMIN_AUTH_HEADER, SECRET)
+            .body(Body::empty())
+            .expect("request");
+        let (status, body) = send(router, authed).await;
+        assert_eq!(status, StatusCode::OK, "body: {body}");
+        assert!(
+            body.contains("graphql schema sync broadcast"),
+            "body: {body}"
+        );
+        let nudge = tokio::time::timeout(std::time::Duration::from_secs(2), nudges.recv())
+            .await
+            .expect("nudge arrives")
+            .expect("channel open");
+        assert_eq!(nudge, "sync");
     }
 
     #[test]

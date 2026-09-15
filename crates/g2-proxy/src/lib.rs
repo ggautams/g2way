@@ -32,6 +32,7 @@ mod breaker;
 mod discovery;
 pub mod forward;
 pub mod gateway;
+mod graphql_sync;
 mod health;
 mod response;
 mod rewrite;
