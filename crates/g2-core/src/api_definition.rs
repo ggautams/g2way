@@ -1484,6 +1484,14 @@ impl ApiDefinition {
                     .into(),
             ));
         }
+        if self.upstream_http2 && self.graphql_subscriptions_enabled() {
+            return Err(fail(
+                "`upstream_http2` cannot be combined with `graphql.subscriptions`: the \
+                 subscription WebSocket upgrade cannot cross an HTTP/2-only upstream \
+                 connection"
+                    .into(),
+            ));
+        }
         if let Some(cache) = &self.cache {
             cache.validate(&self.api_id)?;
         }
@@ -1499,6 +1507,19 @@ impl ApiDefinition {
             versioning.validate(self)?;
         }
         Ok(())
+    }
+
+    /// Whether GraphQL subscriptions over WebSocket are enabled for this
+    /// API: a [`graphql`](Self::graphql) block that is enabled and carries
+    /// an enabled `subscriptions` block. Implies upgrade capability on the
+    /// forwarding path even when [`enable_upgrades`](Self::enable_upgrades)
+    /// is off — the GraphQL layer polices or rejects every WebSocket
+    /// handshake on such an API, so no opaque tunnel can result (ADR-0009).
+    #[must_use]
+    pub fn graphql_subscriptions_enabled(&self) -> bool {
+        self.graphql
+            .as_ref()
+            .is_some_and(|g| g.enabled && g.subscriptions.as_ref().is_some_and(|s| s.enabled))
     }
 
     /// The parsed [`Uri`] form of [`Self::target_url`].
@@ -2747,6 +2768,58 @@ mod tests {
         let err = def.validate().unwrap_err().to_string();
         assert!(err.contains("upstream_http2"), "got: {err}");
         assert!(err.contains("enable_upgrades"), "got: {err}");
+    }
+
+    /// A definition with a subscriptions-enabled GraphQL block.
+    fn subscriptions_def() -> ApiDefinition {
+        let mut def = parse(minimal_json());
+        def.graphql = Some(
+            serde_json::from_value(serde_json::json!({
+                "schema": "type Query { hello: String } type Subscription { ticks: Int }",
+                "subscriptions": {}
+            }))
+            .expect("parses"),
+        );
+        def
+    }
+
+    #[test]
+    fn graphql_subscriptions_enabled_truth_table() {
+        assert!(!parse(minimal_json()).graphql_subscriptions_enabled());
+
+        let def = subscriptions_def();
+        def.validate().expect("valid");
+        assert!(def.graphql_subscriptions_enabled());
+
+        // The graphql-level kill switch turns subscriptions off with it.
+        let mut def = subscriptions_def();
+        def.graphql.as_mut().expect("set").enabled = false;
+        assert!(!def.graphql_subscriptions_enabled());
+
+        // So does the subscriptions-level one.
+        let mut def = subscriptions_def();
+        def.graphql
+            .as_mut()
+            .expect("set")
+            .subscriptions
+            .as_mut()
+            .expect("set")
+            .enabled = false;
+        assert!(!def.graphql_subscriptions_enabled());
+
+        // A graphql block without a subscriptions block: off.
+        let mut def = subscriptions_def();
+        def.graphql.as_mut().expect("set").subscriptions = None;
+        assert!(!def.graphql_subscriptions_enabled());
+    }
+
+    #[test]
+    fn upstream_http2_rejects_graphql_subscriptions() {
+        let mut def = subscriptions_def();
+        def.upstream_http2 = true;
+        let err = def.validate().unwrap_err().to_string();
+        assert!(err.contains("upstream_http2"), "got: {err}");
+        assert!(err.contains("graphql.subscriptions"), "got: {err}");
     }
 
     #[test]

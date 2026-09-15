@@ -42,6 +42,12 @@ axum = "0.8"
 # GraphQL (schema/query parsing and spec validation — ADR-0004)
 apollo-compiler = "1"
 
+# WebSocket frame codec for GraphQL subscriptions (ADR-0009). Codec only:
+# both upgrade handshakes stay on hyper's passthrough (no TLS, no sha1
+# here), and the established streams are wrapped with `from_raw_socket`.
+# The `handshake` feature is dev-only (test clients/fake upstreams).
+tokio-tungstenite = { version = "0.30", default-features = false }
+
 # WASM plugin runtime (ADR-0005). Pinned to major 33: 34+ raises wasmtime's
 # MSRV past our `rust-version = 1.85`. Trimmed features only — none of these
 # need cmake (the rust:1-slim Docker build stage has gcc but no cmake).

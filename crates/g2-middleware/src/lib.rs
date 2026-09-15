@@ -27,6 +27,7 @@ pub mod context;
 pub mod cors;
 pub mod graphql;
 pub mod graphql_sync;
+pub mod graphql_ws;
 pub(crate) mod hmac;
 pub mod ip_filter;
 pub mod jwks;
@@ -60,6 +61,7 @@ pub use graphql_sync::{
     introspection_to_sdl, GraphQlSyncHandle, SchemaSyncSnapshot, SyncNudge, WeakGraphQlSync,
     INTROSPECTION_QUERY,
 };
+pub use graphql_ws::GraphQlWsTunnel;
 pub use ip_filter::{IpFilter, IpFilterLayer};
 pub use jwks::{JwksFetch, JwksFetchFuture, SharedJwksFetch};
 pub use metrics::{HttpMetrics, MetricsLayer};

@@ -112,8 +112,8 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
       substitution from headers and path params)
 - [x] Schema sync from upstream introspection (admin-triggered + periodic;
       ADR-0008, `docs/graphql.md` §Schema sync)
-- [ ] GraphQL subscriptions over WebSocket (unblocked 2026-09-01 by the M8+
-      WebSocket passthrough)
+- [x] GraphQL subscriptions over WebSocket (terminate-and-police relay,
+      both subprotocols — ADR-0009, `docs/graphql.md` §Subscriptions)
 - [ ] Universal Data Graph: gateway-executed stitching of REST/GraphQL upstreams
       (needs an execution-engine ADR)
 - [ ] Federation: supergraph/subgraph support
@@ -1113,3 +1113,47 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   live**: real binary, admin trigger flipped `{extra}` 400→200 with the
   full log chain. Next M9 box: GraphQL subscriptions over WebSocket
   (still unblocked) or UDG (needs an execution-engine ADR first).
+- **2026-09-02 (2)** — M9 GraphQL subscriptions over WebSocket landed
+  (ADR-0009, `docs/graphql.md` §Subscriptions), user-confirmed shape:
+  **terminate & police** (not opaque passthrough), both subprotocols
+  (`graphql-transport-ws` + legacy `graphql-ws`), tokio-tungstenite 0.30
+  (`default-features=false`, MSRV 1.85 = ours; frame codec only — both
+  HTTP handshakes stay on hyper's passthrough, so Key/Accept cross end to
+  end and the gateway needs no sha1; streams wrapped via
+  `from_raw_socket`). Config: `graphql.subscriptions {enabled,
+  max_message_bytes?}` (presence-enables like playground; cap defaults to
+  `max_request_body_bytes` else 1 MiB; validation requires a Subscription
+  root and rejects `upstream_http2`); **implies** forwarder upgrade
+  capability without `enable_upgrades` (every WS handshake on a GraphQL
+  API is policed or rejected — no opaque bypass possible). Seam:
+  `GraphQlWsTunnel` request extension (g2-middleware, no trait inversion
+  — g2-proxy already deps g2-middleware) stamped by the GraphQL layer's
+  new WS-handshake branch (before the persisted loop; 400 when disabled /
+  no known subprotocol offered), removed at the forwarder's upgrade gate,
+  run in `upgrade_response`'s detached task instead of
+  `copy_bidirectional`; the upstream's 101 subprotocol is authoritative
+  (unknown pick → 502 fail-closed; none echoed → **union** policing,
+  error shape per the message's own protocol). `enforce` refactored into
+  shared `check_document` → `Violation` (HTTP mapper + WS error mapper).
+  Policing: subscribe/start payloads (any operation type) parsed against
+  the ArcSwap schema state per message (sync applies to live tunnels);
+  violations → per-protocol `error` with the id, connection stays open;
+  invalid JSON/unknown type/binary → close 4400 (legacy:
+  connection_error + 1002); WS pings leg-local (auto-pong + flush);
+  upstream→client verbatim, zero parsing. **Flagged behavior change**:
+  subscription operations over plain HTTP now 400 (resolved via
+  `operationName`; multi-op docs selecting a query still pass).
+  `futures-util` moved dev→real dep in g2-middleware (`std`+`sink`).
+  Tests: 4 g2-core config + truth table, 17 graphql_ws units (policer
+  table + duplex relay sessions incl. denied-never-crosses), 5 graphql.rs
+  handshake/HTTP-hardening units, 2 forward.rs units, 6-case
+  `graphql_subscriptions_e2e.rs` (real tungstenite client/upstream:
+  stream-end-to-end incl. Accept passthrough, authed grants deny,
+  depth, legacy session + wrong-vocab close, no-subscriptions 400,
+  unpoliceable-upstream 502; upstream message log proves denials never
+  cross). **Gotcha:** `cargo test -p g2-middleware` alone fails on
+  tokio `test-util` feature unification (comes via g2-storage's
+  dev-deps) — test with `-p g2-middleware -p g2-storage` or the whole
+  workspace. Not done (deliberate, ADR-0009 consequences): per-message
+  analytics/metrics, mid-tunnel grant re-checks, RFC 8441. Next M9 box:
+  UDG (needs an execution-engine ADR first) or federation.

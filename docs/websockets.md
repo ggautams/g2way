@@ -41,6 +41,9 @@ per-version overridable (`versions.<name>.enable_upgrades`).
   bytes without interpreting them: no per-message metrics, no response
   transforms, no size limits inside the tunnel. Each tunnel occupies one
   gateway↔client and one gateway↔upstream connection for its lifetime.
+  **Exception:** GraphQL subscription tunnels (`graphql.subscriptions`,
+  ADR-0009) are terminated and policed message by message — see
+  `docs/graphql.md` §Subscriptions.
 - **Timeouts.** `upstream_timeout_ms` bounds the upgrade handshake (request
   out → `101` back). The tunnel itself has no idle or lifetime cap — the
   endpoints own keep-alive (WebSocket ping/pong).

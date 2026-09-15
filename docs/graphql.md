@@ -40,6 +40,7 @@ Add a `graphql` block to the API definition:
 | `playground` | off | Serve a GraphiQL page (see below). |
 | `persisted_queries` | `[]` | GraphQL-as-REST endpoints (see below). |
 | `schema_sync` | off | Keep the schema in sync with the upstream via introspection (see below). |
+| `subscriptions` | off | GraphQL subscriptions over WebSocket, policed message by message (see below). |
 
 The whole listen path becomes the GraphQL endpoint: clients `POST` a JSON
 `{"query": …, "variables": …}` envelope to the listen root (or `GET` with
@@ -165,6 +166,59 @@ upstream. And an upstream that never answers introspection (the usual
 reason for disabling it publicly) leaves the seed schema serving forever
 with a permanent `last_error`; that is what the `url` override is for.
 
+## Subscriptions over WebSocket
+
+With `"subscriptions": {}` the listen path also accepts GraphQL WebSocket
+handshakes (ADR-0009). The gateway **terminates and polices** the
+subprotocol rather than tunneling blindly: every `subscribe`
+(graphql-transport-ws) / `start` (legacy graphql-ws) payload is validated
+against the schema and run through the same protections as an HTTP query —
+depth limits, introspection control, and the key's field permissions.
+Violations get a protocol `error` message with the operation's `id` and
+never reach the upstream; everything the upstream sends is relayed
+verbatim.
+
+```json
+"graphql": {
+  "schema": "type Query { hello: String } type Subscription { ticks: Int }",
+  "subscriptions": { "max_message_bytes": 262144 }
+}
+```
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | Kill switch inside the block (presence enables, like `playground`). |
+| `max_message_bytes` | request-body cap | Cap on one client→gateway WebSocket message; unset inherits the API's `max_request_body_bytes` (1 MiB when that is unset too). |
+
+Worth knowing:
+
+- **Both subprotocols are supported** — `graphql-transport-ws` (the
+  `graphql-ws` npm library) and the legacy `graphql-ws`
+  (subscriptions-transport-ws). The upstream's `101` picks; an upstream
+  that echoes no subprotocol is policed under the union of both. A client
+  offering neither is refused at the handshake (`400`), and an upstream
+  negotiating anything else gets `502` — the gateway never opens a tunnel
+  it cannot police.
+- **`enable_upgrades` is not required**: the subscriptions block implies
+  upgrade capability for this API. `upstream_http2` cannot be combined
+  with it (an HTTP/1.1 upgrade cannot cross an h2-only upstream), and the
+  schema must define a `Subscription` root type.
+- **The handshake runs the full middleware chain** (it is a `GET`) — auth,
+  rate limits, IP filters, analytics. Per-key GraphQL grants are read at
+  handshake time and enforced on every operation in the socket.
+- **Fail closed**: invalid JSON, unknown message types, binary frames, and
+  over-cap messages end the connection (`4400` on graphql-transport-ws; a
+  `connection_error` message then `1002` on legacy).
+- **A subscription operation over plain HTTP is rejected** with `400`
+  (`GraphQL subscriptions require a WebSocket connection`) instead of
+  being blind-forwarded — the executed operation is resolved via
+  `operationName`, so multi-operation documents selecting a query still
+  pass. This applies to every GraphQL API, subscriptions enabled or not.
+- Schema sync applies to open tunnels: each operation is validated against
+  the schema state current at that moment. Tunnels are not part of the
+  graceful drain (expect reconnects on deploys), and there are no
+  per-message analytics — the handshake is counted like any request.
+
 ## Interactions and limits
 
 - **Body buffering**: GraphQL POSTs are buffered to be parsed, capped at
@@ -178,6 +232,5 @@ with a permanent `last_error`; that is what the `url` override is for.
   tooling sends deep introspection documents.
 - **Methods**: a GraphQL API answers `GET` and `POST`; other methods get
   `405` (CORS preflights are handled by the CORS layer above).
-- **Not yet**: subscriptions (WebSocket passthrough is in — the GraphQL
-  wiring is a later box), UDG/federation, APQ, request batching — all
-  tracked as M9 roadmap boxes.
+- **Not yet**: UDG/federation, APQ, request batching — all tracked as M9
+  roadmap boxes.

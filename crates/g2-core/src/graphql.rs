@@ -133,6 +133,53 @@ pub struct GraphQlConfig {
     /// schema is static (ADR-0008).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema_sync: Option<SchemaSyncConfig>,
+
+    /// GraphQL subscriptions over WebSocket. When set (and enabled), the
+    /// gateway accepts `graphql-transport-ws` / `graphql-ws` WebSocket
+    /// handshakes on the listen path and polices every subscribe operation
+    /// like an HTTP query (ADR-0009). Unset = WebSocket handshakes on the
+    /// GraphQL endpoint are rejected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscriptions: Option<SubscriptionsConfig>,
+}
+
+/// GraphQL-subscriptions-over-WebSocket settings (see
+/// [`GraphQlConfig::subscriptions`]).
+///
+/// The gateway terminates the WebSocket subprotocol on both legs: client
+/// `subscribe`/`start` payloads are validated against the schema and the
+/// per-key grants before being forwarded; violations are answered with
+/// protocol-level `error` messages and never reach the upstream. Upstream
+/// frames are relayed verbatim. Requires the schema to define a
+/// `Subscription` root type.
+///
+/// # Example (JSON)
+///
+/// ```json
+/// { "max_message_bytes": 262144 }
+/// ```
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubscriptionsConfig {
+    /// Kill switch inside the block; defaults to `true` (presence of the
+    /// block enables subscriptions, like [`GraphQlConfig::playground`]).
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Cap on a single client→gateway WebSocket message (must be > 0).
+    /// Unset = the API's `max_request_body_bytes`, else 1 MiB — the same
+    /// bound the HTTP-side body buffering uses.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_message_bytes: Option<u64>,
+}
+
+impl Default for SubscriptionsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_message_bytes: None,
+        }
+    }
 }
 
 /// Schema-sync settings: how a pod fetches the upstream's schema via
@@ -330,8 +377,10 @@ impl GraphQlConfig {
     /// not a valid GraphQL schema, `max_query_depth` is zero, a playground
     /// or persisted path breaks the path rules, a persisted query has an
     /// invalid method, path template, operation, operation name, or
-    /// variables template, or a schema-sync setting is invalid (zero
-    /// interval/timeout, non-http(s) URL, bad or hop-by-hop header).
+    /// variables template, a schema-sync setting is invalid (zero
+    /// interval/timeout, non-http(s) URL, bad or hop-by-hop header), a
+    /// subscriptions message cap is zero, or subscriptions are enabled on a
+    /// schema without a `Subscription` root type.
     pub fn validate(&self, api: &str) -> Result<(), Error> {
         let fail = |reason: String| Error::InvalidApiDefinition {
             api: api.to_owned(),
@@ -362,6 +411,23 @@ impl GraphQlConfig {
 
         if let Some(sync) = &self.schema_sync {
             sync.validate(&fail)?;
+        }
+
+        if let Some(subs) = &self.subscriptions {
+            if subs.max_message_bytes == Some(0) {
+                return Err(fail(
+                    "`graphql.subscriptions.max_message_bytes` must be greater than zero \
+                     (omit it to inherit the API's request-body cap)"
+                        .into(),
+                ));
+            }
+            if subs.enabled && schema.schema_definition.subscription.is_none() {
+                return Err(fail(
+                    "`graphql.subscriptions` is enabled but `graphql.schema` defines no \
+                     `Subscription` root type"
+                        .into(),
+                ));
+            }
         }
 
         for (index, pq) in self.persisted_queries.iter().enumerate() {
@@ -826,6 +892,77 @@ mod tests {
                 "{label}: err should name schema_sync, got {err}"
             );
         }
+    }
+
+    const SUB_SCHEMA: &str = "type Query { hello: String } \
+                              type Subscription { ticks: Int }";
+
+    #[test]
+    fn subscriptions_defaults_and_round_trip() {
+        let cfg = parse(
+            &serde_json::json!({
+                "schema": SUB_SCHEMA,
+                "subscriptions": {}
+            })
+            .to_string(),
+        );
+        cfg.validate("api").expect("valid");
+        let subs = cfg.subscriptions.as_ref().expect("set");
+        assert!(subs.enabled);
+        assert!(subs.max_message_bytes.is_none());
+        assert_eq!(*subs, SubscriptionsConfig::default());
+
+        let full = parse(
+            &serde_json::json!({
+                "schema": SUB_SCHEMA,
+                "subscriptions": { "enabled": true, "max_message_bytes": 4096 }
+            })
+            .to_string(),
+        );
+        full.validate("api").expect("valid");
+        let json = serde_json::to_string(&full).expect("serializes");
+        assert_eq!(parse(&json), full);
+
+        // Unset stays off the wire.
+        let bare = serde_json::to_string(&minimal()).expect("serializes");
+        assert!(!bare.contains("subscriptions"));
+    }
+
+    #[test]
+    fn subscriptions_zero_message_cap_is_rejected() {
+        let cfg = parse(
+            &serde_json::json!({
+                "schema": SUB_SCHEMA,
+                "subscriptions": { "max_message_bytes": 0 }
+            })
+            .to_string(),
+        );
+        let err = cfg.validate("api").unwrap_err().to_string();
+        assert!(err.contains("max_message_bytes"), "got: {err}");
+    }
+
+    #[test]
+    fn subscriptions_require_a_subscription_root() {
+        let cfg = parse(
+            &serde_json::json!({
+                "schema": SCHEMA,
+                "subscriptions": {}
+            })
+            .to_string(),
+        );
+        let err = cfg.validate("api").unwrap_err().to_string();
+        assert!(err.contains("Subscription"), "got: {err}");
+
+        // A disabled block on a subscription-less schema is fine (the kill
+        // switch parks the config without forcing a schema change).
+        let off = parse(
+            &serde_json::json!({
+                "schema": SCHEMA,
+                "subscriptions": { "enabled": false }
+            })
+            .to_string(),
+        );
+        off.validate("api").expect("valid when disabled");
     }
 
     #[test]

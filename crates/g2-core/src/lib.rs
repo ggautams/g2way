@@ -46,6 +46,7 @@ pub use endpoints::{EndpointRateLimit, MockResponse, PathRule};
 pub use error::Error;
 pub use graphql::{
     GraphQlConfig, GraphQlExecutionMode, PersistedQuery, PlaygroundConfig, SchemaSyncConfig,
+    SubscriptionsConfig,
 };
 pub use plugins::{PluginRef, PluginsConfig};
 pub use policy::Policy;

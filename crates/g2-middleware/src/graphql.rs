@@ -11,15 +11,21 @@
 //! Per request the layer:
 //!
 //! 1. Serves the GraphiQL playground page on its configured path (`GET`).
-//! 2. Answers persisted GraphQL-as-REST endpoints: a matching REST-shaped
+//! 2. Recognizes subscription WebSocket handshakes (when
+//!    `graphql.subscriptions` is enabled) and stamps the policed-tunnel
+//!    extension the forwarder's upgrade path hands the connection to
+//!    (see [`graphql_ws`](crate::graphql_ws), ADR-0009).
+//! 3. Answers persisted GraphQL-as-REST endpoints: a matching REST-shaped
 //!    request is rewritten into a `POST` of the pre-parsed operation to the
 //!    API's GraphQL endpoint, with variables filled from path parameters
 //!    and headers.
-//! 3. Otherwise treats the request as a GraphQL request: the query (from a
+//! 4. Otherwise treats the request as a GraphQL request: the query (from a
 //!    `GET` `?query=` parameter or a buffered JSON `POST` body) is parsed
 //!    and validated against the API's schema, then policed — introspection
 //!    control, depth limits, per-key field permissions — before the
-//!    original bytes are forwarded upstream unchanged.
+//!    original bytes are forwarded upstream unchanged. A subscription
+//!    operation over plain HTTP is rejected (`400`) — it can only execute
+//!    over a WebSocket.
 //!
 //! Like [`transform_body`](crate::transform_body), this layer buffers a
 //! request body. The buffering is bounded (the API's
@@ -116,6 +122,10 @@ pub(crate) struct GraphQlShared {
     graphql_uri: Uri,
     /// Bound on buffered request bodies, in bytes.
     max_body_bytes: usize,
+    /// Whether subscriptions over WebSocket are enabled (ADR-0009).
+    subscriptions_enabled: bool,
+    /// Cap on one client→gateway WebSocket message, in bytes.
+    pub(crate) ws_max_message_bytes: usize,
 }
 
 /// The schema-dependent half of [`GraphQlShared`], swapped wholesale by a
@@ -166,7 +176,7 @@ pub(crate) struct CompiledPersisted {
 /// Tower layer enforcing one API's GraphQL configuration.
 #[derive(Debug, Clone)]
 pub struct GraphQlLayer {
-    shared: Arc<GraphQlShared>,
+    pub(crate) shared: Arc<GraphQlShared>,
 }
 
 /// Folds an apollo-compiler diagnostic list into per-diagnostic one-line
@@ -293,6 +303,16 @@ impl GraphQlLayer {
                     def.max_request_body_bytes.unwrap_or(DEFAULT_MAX_BODY_BYTES),
                 )
                 .unwrap_or(usize::MAX),
+                subscriptions_enabled: config.subscriptions.as_ref().is_some_and(|s| s.enabled),
+                ws_max_message_bytes: usize::try_from(
+                    config
+                        .subscriptions
+                        .as_ref()
+                        .and_then(|s| s.max_message_bytes)
+                        .or(def.max_request_body_bytes)
+                        .unwrap_or(DEFAULT_MAX_BODY_BYTES),
+                )
+                .unwrap_or(usize::MAX),
             }),
         }))
     }
@@ -368,7 +388,37 @@ where
                 .get::<SessionContext>()
                 .and_then(|s| s.session().access.get(shared.api_id.as_str()).cloned());
 
-            // 2. Persisted GraphQL-as-REST endpoints (first match wins).
+            // 2. A subscription WebSocket handshake (ADR-0009): stamp the
+            // policed-tunnel extension and let the forwarder complete the
+            // upgrade. Checked before the persisted loop so a persisted
+            // `GET` route can never swallow a handshake.
+            if crate::graphql_ws::is_websocket_handshake(&req) {
+                if !shared.subscriptions_enabled {
+                    return Ok(json_error(
+                        StatusCode::BAD_REQUEST,
+                        "GraphQL subscriptions are not enabled for this API",
+                    ));
+                }
+                // Policing is the point: a socket speaking a subprotocol
+                // the gateway does not understand would bypass every
+                // GraphQL protection, so it is refused up front.
+                if !crate::graphql_ws::offers_known_protocol(req.headers()) {
+                    return Ok(json_error(
+                        StatusCode::BAD_REQUEST,
+                        "GraphQL subscriptions require the graphql-transport-ws or \
+                         graphql-ws WebSocket subprotocol",
+                    ));
+                }
+                let mut req = req;
+                req.extensions_mut()
+                    .insert(crate::graphql_ws::GraphQlWsTunnel::new(
+                        Arc::clone(&shared),
+                        grants,
+                    ));
+                return inner.call(req).await;
+            }
+
+            // 3. Persisted GraphQL-as-REST endpoints (first match wins).
             for (index, p) in shared.persisted.iter().enumerate() {
                 if p.method != *req.method() {
                     continue;
@@ -392,9 +442,9 @@ where
                     .await;
             }
 
-            // 3. A plain GraphQL request: extract the query, validate,
+            // 4. A plain GraphQL request: extract the query, validate,
             // police, forward the original bytes.
-            let (query, req) = match extract_query(req, &shared).await {
+            let (query, operation_name, req) = match extract_query(req, &shared).await {
                 Ok(ok) => ok,
                 Err(resp) => return Ok(resp),
             };
@@ -411,6 +461,21 @@ where
                     ));
                 }
             };
+            // A subscription cannot execute over plain HTTP (ADR-0009);
+            // rejected only when the *executed* operation resolves to one —
+            // a multi-operation document whose selected operation is a
+            // query still passes (ambiguous selection stays the upstream's
+            // problem, as before).
+            if doc
+                .operations
+                .get(operation_name.as_deref())
+                .is_ok_and(|op| op.is_subscription())
+            {
+                return Ok(graphql_errors(
+                    StatusCode::BAD_REQUEST,
+                    ["GraphQL subscriptions require a WebSocket connection"],
+                ));
+            }
             if let Some(resp) = enforce(&shared, grants.as_ref(), &doc) {
                 return Ok(resp);
             }
@@ -449,23 +514,37 @@ where
     resp
 }
 
-/// Pulls the GraphQL query out of a request, returning it together with the
-/// request to forward: untouched for `GET`, rebuilt around the buffered
-/// body bytes for `POST` (so the upstream sees the exact original payload).
+/// Pulls the GraphQL query (and the selected `operationName`, if any) out
+/// of a request, returning them together with the request to forward:
+/// untouched for `GET`, rebuilt around the buffered body bytes for `POST`
+/// (so the upstream sees the exact original payload).
 async fn extract_query(
     req: Request<ProxyBody>,
     shared: &GraphQlShared,
-) -> Result<(String, Request<ProxyBody>), Response<ProxyBody>> {
+) -> Result<(String, Option<String>, Request<ProxyBody>), Response<ProxyBody>> {
     match *req.method() {
         // GraphQL over GET: the query rides the `query` parameter
         // (URL-encoded), the body stays untouched.
-        Method::GET => match req.uri().query().and_then(query_parameter) {
-            Some(query) if !query.trim().is_empty() => Ok((query, req)),
-            _ => Err(graphql_errors(
-                StatusCode::BAD_REQUEST,
-                ["the request is missing a GraphQL query"],
-            )),
-        },
+        Method::GET => {
+            let query = req
+                .uri()
+                .query()
+                .and_then(|raw| query_parameter(raw, "query"));
+            match query {
+                Some(query) if !query.trim().is_empty() => {
+                    let operation_name = req
+                        .uri()
+                        .query()
+                        .and_then(|raw| query_parameter(raw, "operationName"))
+                        .filter(|n| !n.is_empty());
+                    Ok((query, operation_name, req))
+                }
+                _ => Err(graphql_errors(
+                    StatusCode::BAD_REQUEST,
+                    ["the request is missing a GraphQL query"],
+                )),
+            }
+        }
         Method::POST => {
             let (parts, body) = req.into_parts();
             let bytes = match Limited::new(body, shared.max_body_bytes).collect().await {
@@ -475,6 +554,8 @@ async fn extract_query(
             #[derive(serde::Deserialize)]
             struct Envelope {
                 query: Option<String>,
+                #[serde(rename = "operationName")]
+                operation_name: Option<String>,
             }
             let envelope: Envelope = match serde_json::from_slice(&bytes) {
                 Ok(envelope) => envelope,
@@ -490,6 +571,7 @@ async fn extract_query(
             match envelope.query.filter(|q| !q.trim().is_empty()) {
                 Some(query) => Ok((
                     query,
+                    envelope.operation_name.filter(|n| !n.is_empty()),
                     Request::from_parts(parts, ProxyBody::new(Full::new(bytes))),
                 )),
                 None => Err(graphql_errors(
@@ -519,11 +601,11 @@ fn body_read_error(err: &(dyn std::error::Error + 'static)) -> Response<ProxyBod
     }
 }
 
-/// The percent-decoded `query` parameter of a raw query string, if present.
-fn query_parameter(raw_query: &str) -> Option<String> {
+/// The percent-decoded `name` parameter of a raw query string, if present.
+fn query_parameter(raw_query: &str, name: &str) -> Option<String> {
     raw_query.split('&').find_map(|pair| {
         let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-        (key == "query").then(|| percent_decode(value, true))
+        (key == name).then(|| percent_decode(value, true))
     })
 }
 
@@ -562,43 +644,92 @@ fn percent_decode(s: &str, plus_as_space: bool) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A protection-pipeline rejection: which check a document failed. Shared
+/// by the HTTP path (mapped to a response by [`enforce`]) and the
+/// subscription WebSocket relay (mapped to a protocol `error` message).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Violation {
+    /// The document introspects while introspection is disabled.
+    Introspection,
+    /// The document is deeper than the effective depth limit.
+    DepthLimit,
+    /// The key's grants forbid selecting `field` on `ty`.
+    ForbiddenField {
+        /// The parent type of the forbidden selection.
+        ty: String,
+        /// The forbidden field name.
+        field: String,
+    },
+}
+
+impl Violation {
+    /// The client-facing message for this violation.
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Introspection => "introspection is disabled".into(),
+            Self::DepthLimit => "depth limit exceeded".into(),
+            Self::ForbiddenField { ty, field } => {
+                format!("field: {field} is restricted on type: {ty}")
+            }
+        }
+    }
+}
+
 /// Runs the protection pipeline — introspection control, depth limit,
-/// field permissions — over a validated document. `Some` carries the
-/// rejection response; `None` means the document passed.
-fn enforce(
+/// field permissions — over a validated document.
+///
+/// # Errors
+///
+/// Returns the first [`Violation`] the document commits.
+pub(crate) fn check_document(
     shared: &GraphQlShared,
     grants: Option<&ApiAccess>,
     doc: &Valid<ExecutableDocument>,
-) -> Option<Response<ProxyBody>> {
+) -> Result<(), Violation> {
     let introspection_allowed =
         shared.introspection_enabled && !grants.is_some_and(|g| g.disable_introspection);
     if !introspection_allowed && selects_introspection(doc) {
-        return Some(json_error(
-            StatusCode::FORBIDDEN,
-            "introspection is disabled",
-        ));
+        return Err(Violation::Introspection);
     }
     // A pure introspection document (every root field is a `__` meta field)
     // bypasses depth and field checks when introspection is allowed:
     // tooling sends deep introspection queries, and the schema is exactly
     // what introspection reveals — there is nothing left to hide.
     if is_pure_introspection(doc) {
-        return None;
+        return Ok(());
     }
     if let Some(limit) = effective_depth_limit(shared, grants) {
         if document_depth(doc) > limit {
-            return Some(json_error(StatusCode::FORBIDDEN, "depth limit exceeded"));
+            return Err(Violation::DepthLimit);
         }
     }
     if let Some(grants) = grants {
         if let Some((ty, field)) = first_forbidden_field(doc, grants) {
-            return Some(graphql_errors(
-                StatusCode::BAD_REQUEST,
-                [format!("field: {field} is restricted on type: {ty}")],
-            ));
+            return Err(Violation::ForbiddenField { ty, field });
         }
     }
-    None
+    Ok(())
+}
+
+/// [`check_document`] mapped to HTTP: depth/introspection violations answer
+/// `403` with the plain error shape, field violations `400` with the
+/// GraphQL error shape (ADR-0004). `None` means the document
+/// passed.
+fn enforce(
+    shared: &GraphQlShared,
+    grants: Option<&ApiAccess>,
+    doc: &Valid<ExecutableDocument>,
+) -> Option<Response<ProxyBody>> {
+    match check_document(shared, grants, doc) {
+        Ok(()) => None,
+        Err(violation @ (Violation::Introspection | Violation::DepthLimit)) => {
+            Some(json_error(StatusCode::FORBIDDEN, &violation.message()))
+        }
+        Err(violation @ Violation::ForbiddenField { .. }) => Some(graphql_errors(
+            StatusCode::BAD_REQUEST,
+            [violation.message()],
+        )),
+    }
 }
 
 /// The depth limit in force: a positive per-key override replaces the API
@@ -1336,6 +1467,112 @@ mod tests {
                 .expect("compiles")
                 .is_none()
         );
+    }
+
+    const SUB_SCHEMA: &str = "type Query { hello: String } \
+                              type Subscription { ticks: Int }";
+
+    fn subscriptions_config() -> serde_json::Value {
+        serde_json::json!({ "schema": SUB_SCHEMA, "subscriptions": {} })
+    }
+
+    fn ws_handshake(protocols: Option<&str>) -> Request<ProxyBody> {
+        let mut builder = Request::builder()
+            .method(Method::GET)
+            .uri("/gql")
+            .header(header::CONNECTION, "Upgrade")
+            .header(header::UPGRADE, "websocket");
+        if let Some(protocols) = protocols {
+            builder = builder.header(header::SEC_WEBSOCKET_PROTOCOL, protocols);
+        }
+        builder.body(ProxyBody::empty()).expect("request")
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_without_subscriptions_is_rejected() {
+        let layer = layer(base_config());
+        let resp = send(&layer, ws_handshake(Some("graphql-transport-ws"))).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_text(resp).await.contains("not enabled"),
+            "names the missing opt-in"
+        );
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_requires_a_known_subprotocol() {
+        let layer = layer(subscriptions_config());
+        for offer in [None, Some("soap-over-ws")] {
+            let resp = send(&layer, ws_handshake(offer)).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "offer {offer:?}");
+            assert!(
+                body_text(resp).await.contains("graphql-transport-ws"),
+                "error names the supported subprotocols"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_stamps_the_tunnel_extension_and_passes_through() {
+        let layer = layer(subscriptions_config());
+        let inner = tower::service_fn(|req: Request<ProxyBody>| async move {
+            assert!(
+                req.extensions()
+                    .get::<crate::graphql_ws::GraphQlWsTunnel>()
+                    .is_some(),
+                "the tunnel extension must ride the forwarded handshake"
+            );
+            Ok::<_, Infallible>(Response::new(ProxyBody::empty()))
+        });
+        let resp = layer
+            .clone()
+            .layer(inner)
+            .oneshot(ws_handshake(Some("graphql-ws, graphql-transport-ws")))
+            .await
+            .expect("infallible");
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_over_plain_http_are_rejected() {
+        let layer = layer(subscriptions_config());
+        let resp = send(&layer, post("subscription { ticks }")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        assert!(
+            body_text(resp).await.contains("WebSocket"),
+            "points the client at WebSocket"
+        );
+    }
+
+    #[tokio::test]
+    async fn operation_name_selects_what_is_executed_over_http() {
+        let layer = layer(subscriptions_config());
+        let doc = "query Q { hello } subscription S { ticks }";
+
+        // The selected operation is a query: passes.
+        let body = serde_json::json!({ "query": doc, "operationName": "Q" }).to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/gql")
+            .body(ProxyBody::new(Full::new(Bytes::from(body))))
+            .expect("request");
+        assert_eq!(send(&layer, req).await.status(), StatusCode::OK);
+
+        // The selected operation is the subscription: rejected.
+        let body = serde_json::json!({ "query": doc, "operationName": "S" }).to_string();
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/gql")
+            .body(ProxyBody::new(Full::new(Bytes::from(body))))
+            .expect("request");
+        assert_eq!(send(&layer, req).await.status(), StatusCode::BAD_REQUEST);
+
+        // Same selection over GET's operationName parameter.
+        let req = Request::builder()
+            .uri("/gql?query=query+Q+%7B+hello+%7D+subscription+S+%7B+ticks+%7D&operationName=S")
+            .body(ProxyBody::empty())
+            .expect("request");
+        assert_eq!(send(&layer, req).await.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

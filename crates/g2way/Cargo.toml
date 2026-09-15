@@ -37,6 +37,9 @@ bytes.workspace = true
 futures-util.workspace = true
 http-body-util.workspace = true
 serde_json.workspace = true
+# `handshake` gives tests `client_async`/`accept_*` for driving real
+# WebSocket sessions through the gateway (the shipped codec needs neither).
+tokio-tungstenite = { workspace = true, features = ["handshake"] }
 wat.workspace = true
 
 [lints]

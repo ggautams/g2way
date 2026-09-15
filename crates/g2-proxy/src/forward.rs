@@ -17,7 +17,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{ClientAddr, ConnectionInfo, ProxyBody};
-use http::header::{HeaderValue, CONNECTION, TE, UPGRADE};
+use http::header::{HeaderValue, CONNECTION, SEC_WEBSOCKET_PROTOCOL, TE, UPGRADE};
 use http::uri::{Authority, Scheme, Uri};
 use http::{Method, Request, Response, StatusCode, Version};
 use http_body::Body as _;
@@ -257,7 +257,11 @@ impl UpstreamTarget {
             breaker,
             discovery,
             retries: def.upstream_retries,
-            upgrades_enabled: def.enable_upgrades,
+            // GraphQL subscriptions imply upgrade capability: their
+            // WebSocket handshakes are policed or rejected by the GraphQL
+            // layer before they reach the forwarder, so the implied opt-in
+            // can never open an unpoliced tunnel (ADR-0009).
+            upgrades_enabled: def.enable_upgrades || def.graphql_subscriptions_enabled(),
             http2: def.upstream_http2,
         })
     }
@@ -644,13 +648,17 @@ async fn forward(
     // client asked (an `Upgrade` header), and the client connection can
     // actually switch protocols (hyper stamped an `OnUpgrade` extension —
     // absent on HTTP/2 requests, whose streams cannot carry an HTTP/1.1
-    // upgrade). Everything else proxies as plain HTTP.
+    // upgrade). Everything else proxies as plain HTTP. A policed GraphQL
+    // subscription tunnel (ADR-0009) rides along as a request extension
+    // stamped by the GraphQL layer; it is removed here so it can never
+    // outlive its handshake.
     let upgrade = if target.upgrades_enabled {
+        let tunnel = parts.extensions.remove::<g2_middleware::GraphQlWsTunnel>();
         parts.headers.get(UPGRADE).cloned().and_then(|protocol| {
             parts
                 .extensions
                 .remove::<hyper::upgrade::OnUpgrade>()
-                .map(|client| (protocol, client))
+                .map(|client| (protocol, client, tunnel))
         })
     } else {
         None
@@ -682,7 +690,7 @@ async fn forward(
             .headers
             .insert(TE, HeaderValue::from_static("trailers"));
     }
-    if let Some((protocol, _)) = &upgrade {
+    if let Some((protocol, _, _)) = &upgrade {
         // Hop-by-hop stripping just removed the upgrade headers; a request
         // asking the upstream to switch protocols must carry them.
         parts
@@ -729,7 +737,7 @@ async fn forward(
             }
             if resp.status() == StatusCode::SWITCHING_PROTOCOLS {
                 match upgrade {
-                    Some((_, client)) => upgrade_response(api_id, client, resp),
+                    Some((_, client, tunnel)) => upgrade_response(api_id, client, resp, tunnel),
                     // The upstream switched protocols unasked (the forwarded
                     // request carried no upgrade headers): there is no client
                     // side to splice it to, so the exchange is unusable.
@@ -789,12 +797,33 @@ async fn forward(
 /// the process exits — tunnels are not part of the graceful drain), and the
 /// bytes inside it are opaque to the gateway. The per-API upstream timeout
 /// only ever covered the upgrade handshake, which has completed here.
+///
+/// With a [`GraphQlWsTunnel`](g2_middleware::GraphQlWsTunnel) present the
+/// spliced task runs the policed graphql-ws relay instead of the opaque
+/// byte copy (ADR-0009) — unless the upstream negotiated a subprotocol the
+/// gateway cannot police, which fails the whole exchange closed as `502`
+/// (both pending protocol switches are dropped, so neither side tunnels).
 fn upgrade_response(
     api_id: &str,
     client: hyper::upgrade::OnUpgrade,
     mut resp: Response<hyper::body::Incoming>,
+    tunnel: Option<g2_middleware::GraphQlWsTunnel>,
 ) -> Response<ProxyBody> {
     let protocol = resp.headers().get(UPGRADE).cloned();
+    let negotiated = resp.headers().get(SEC_WEBSOCKET_PROTOCOL).cloned();
+    if let Some(tunnel) = &tunnel {
+        if !tunnel.accepts(negotiated.as_ref()) {
+            tracing::warn!(
+                %api_id,
+                subprotocol = negotiated.as_ref().and_then(|v| v.to_str().ok()),
+                "upstream negotiated a WebSocket subprotocol the gateway cannot police"
+            );
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "upstream negotiated an unsupported WebSocket subprotocol",
+            );
+        }
+    }
     let upstream = hyper::upgrade::on(&mut resp);
     let api_id = api_id.to_owned();
     tokio::spawn(async move {
@@ -808,6 +837,11 @@ fn upgrade_response(
             }
         };
         let (mut client_io, mut upstream_io) = (TokioIo::new(client_io), TokioIo::new(upstream_io));
+        if let Some(tunnel) = tunnel {
+            // The relay logs its own close summary.
+            tunnel.run(client_io, upstream_io, negotiated).await;
+            return;
+        }
         match tokio::io::copy_bidirectional(&mut client_io, &mut upstream_io).await {
             Ok((sent, received)) => {
                 tracing::debug!(%api_id, sent, received, "upgrade tunnel closed");
@@ -1561,6 +1595,44 @@ mod tests {
         let def: ApiDefinition = serde_json::from_str(
             r#"{"api_id":"u","name":"u","listen_path":"/u/","target_url":"http://u.internal"}"#,
         )
+        .expect("def");
+        assert!(
+            !UpstreamTarget::build(&def)
+                .expect("target")
+                .upgrades_enabled
+        );
+    }
+
+    #[test]
+    fn graphql_subscriptions_imply_upgrade_capability() {
+        // No `enable_upgrades`, but an enabled `graphql.subscriptions`
+        // block: the forwarder must still attempt the WebSocket upgrade
+        // (the GraphQL layer polices every such handshake — ADR-0009).
+        let def: ApiDefinition = serde_json::from_value(serde_json::json!({
+            "api_id": "u", "name": "u", "listen_path": "/u/",
+            "target_url": "http://u.internal",
+            "graphql": {
+                "schema": "type Query { hello: String } type Subscription { ticks: Int }",
+                "subscriptions": {},
+            },
+        }))
+        .expect("def");
+        def.validate().expect("valid");
+        assert!(
+            UpstreamTarget::build(&def)
+                .expect("target")
+                .upgrades_enabled
+        );
+
+        // A disabled subscriptions block implies nothing.
+        let def: ApiDefinition = serde_json::from_value(serde_json::json!({
+            "api_id": "u", "name": "u", "listen_path": "/u/",
+            "target_url": "http://u.internal",
+            "graphql": {
+                "schema": "type Query { hello: String }",
+                "subscriptions": { "enabled": false },
+            },
+        }))
         .expect("def");
         assert!(
             !UpstreamTarget::build(&def)
