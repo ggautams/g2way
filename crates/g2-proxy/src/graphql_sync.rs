@@ -341,7 +341,7 @@ mod tests {
         .expect("def");
         def.validate().expect("valid def");
         let target = Arc::new(UpstreamTarget::build(&def).expect("target"));
-        let layer = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
+        let layer = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None, None)
             .expect("compiles")
             .expect("enabled");
         let handle = layer.sync_handle().expect("sync configured");

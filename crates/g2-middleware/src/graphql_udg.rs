@@ -1136,7 +1136,7 @@ mod tests {
         )
         .expect("valid definition");
         def.validate().expect("valid definition");
-        GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, Some(fetch))
+        GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, Some(fetch), None)
             .expect("compiles")
             .expect("enabled")
     }
@@ -1178,6 +1178,67 @@ mod tests {
         let resp = send(layer, req).await;
         assert_eq!(resp.status(), StatusCode::OK);
         body_json(resp).await
+    }
+
+    #[tokio::test]
+    async fn cached_queries_skip_the_fetch_phase() {
+        let fetch = FakeFetch::with(&[("http://up/hello", 200, "\"hi\"")]);
+        let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let mut graphql = udg_config(&[]);
+        graphql["cache"] = serde_json::json!({});
+        let def: ApiDefinition = serde_json::from_str(
+            &serde_json::json!({
+                "api_id": "udg",
+                "name": "udg",
+                "listen_path": "/gql/",
+                "target_url": "http://unused.internal/",
+                "auth": { "mode": "keyless" },
+                "graphql": graphql
+            })
+            .to_string(),
+        )
+        .expect("valid definition");
+        def.validate().expect("valid definition");
+        let layer = GraphQlLayer::from_config(
+            def.graphql.as_ref().expect("set"),
+            &def,
+            Some(Arc::clone(&fetch) as crate::SharedUdgFetch),
+            Some(crate::GraphQlCacheWiring {
+                storage: Arc::clone(&storage),
+                scope: "udg".to_owned(),
+            }),
+        )
+        .expect("compiles")
+        .expect("enabled");
+
+        let body = ok_json(&layer, post("{ hello }")).await;
+        assert_eq!(body, serde_json::json!({ "data": { "hello": "hi" } }));
+        // Bounded wait for the background cache write.
+        for _ in 0..100 {
+            if !storage
+                .scan_prefix("g2:default:cache:udg:graphql:")
+                .await
+                .expect("scan")
+                .is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let resp = send(&layer, post("{ hello }")).await;
+        assert_eq!(fetch.calls().len(), 1, "second query never fetches");
+        assert_eq!(
+            resp.headers()
+                .get(crate::CACHE_STATUS_HEADER)
+                .expect("hit marker")
+                .as_bytes(),
+            b"hit"
+        );
+        assert_eq!(
+            body_json(resp).await,
+            serde_json::json!({ "data": { "hello": "hi" } })
+        );
     }
 
     #[tokio::test]

@@ -204,6 +204,7 @@ fn record_if_cacheable(
             .iter()
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect(),
+        policy: WritePolicy::Any,
     };
     let recording = RecordingBody {
         inner: body,
@@ -215,7 +216,9 @@ fn record_if_cacheable(
 }
 
 /// One cached response on the wire: JSON in storage. Header and body bytes
-/// are base64 (header values and bodies need not be UTF-8).
+/// are base64 (header values and bodies need not be UTF-8). Shared with the
+/// GraphQL-aware cache ([`crate::graphql_cache`]), which stores the same
+/// shape under its own key scope.
 #[derive(Serialize, Deserialize)]
 struct CachedEntry {
     status: u16,
@@ -227,7 +230,11 @@ struct CachedEntry {
 const B64: base64::engine::GeneralPurpose = base64::engine::general_purpose::STANDARD;
 
 /// Serializes a completed response for storage.
-fn encode_entry(status: StatusCode, headers: &[(HeaderName, HeaderValue)], body: &[u8]) -> String {
+pub(crate) fn encode_entry(
+    status: StatusCode,
+    headers: &[(HeaderName, HeaderValue)],
+    body: &[u8],
+) -> String {
     let entry = CachedEntry {
         status: status.as_u16(),
         headers: headers
@@ -241,7 +248,7 @@ fn encode_entry(status: StatusCode, headers: &[(HeaderName, HeaderValue)], body:
 
 /// Rebuilds the response from a stored entry, marked as a hit. `None` when
 /// the record does not decode (treated as a miss by the caller).
-fn decode_entry(stored: &str) -> Option<Response<ProxyBody>> {
+pub(crate) fn decode_entry(stored: &str) -> Option<Response<ProxyBody>> {
     let entry: CachedEntry = serde_json::from_str(stored).ok()?;
     let mut resp = Response::new(ProxyBody::new(Full::new(Bytes::from(
         B64.decode(&entry.body_b64).ok()?,
@@ -258,26 +265,64 @@ fn decode_entry(stored: &str) -> Option<Response<ProxyBody>> {
     Some(resp)
 }
 
+/// Gate deciding, from the completed body, whether an entry is written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WritePolicy {
+    /// Every completed body is stored (the HTTP cache's behavior — the
+    /// status/`Set-Cookie` gates already ran before the tee was attached).
+    Any,
+    /// Only a JSON object with no (or a `null`/empty) top-level `errors`
+    /// member is stored: a GraphQL response carrying errors — often a
+    /// transient upstream failure inside a `200` — must not be replayed for
+    /// the whole TTL (ADR-0012).
+    GraphQlSuccess,
+}
+
+impl WritePolicy {
+    /// Whether `body` may be cached under this policy.
+    fn allows(self, body: &[u8]) -> bool {
+        match self {
+            Self::Any => true,
+            Self::GraphQlSuccess => match serde_json::from_slice::<serde_json::Value>(body) {
+                Ok(serde_json::Value::Object(map)) => match map.get("errors") {
+                    None | Some(serde_json::Value::Null) => true,
+                    Some(serde_json::Value::Array(errors)) => errors.is_empty(),
+                    Some(_) => false,
+                },
+                // Non-JSON (or non-object) bodies are conservatively left
+                // uncached — a GraphQL response is always a JSON object.
+                _ => false,
+            },
+        }
+    }
+}
+
 /// Everything needed to write one entry once its body has fully streamed.
-struct CacheWrite {
-    storage: g2_storage::SharedStorage,
-    key: String,
-    ttl: Duration,
-    status: StatusCode,
-    headers: Vec<(HeaderName, HeaderValue)>,
+pub(crate) struct CacheWrite {
+    pub(crate) storage: g2_storage::SharedStorage,
+    pub(crate) key: String,
+    pub(crate) ttl: Duration,
+    pub(crate) status: StatusCode,
+    pub(crate) headers: Vec<(HeaderName, HeaderValue)>,
+    pub(crate) policy: WritePolicy,
 }
 
 impl CacheWrite {
-    /// Spawns the storage write in the background; the client's response is
-    /// already complete and must not wait on Redis.
+    /// Spawns the policy check, encoding, and storage write in the
+    /// background; the client's response is already complete and must not
+    /// wait on JSON parsing or Redis.
     fn spawn(self, body: &[u8]) {
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             // Bodies are only ever driven inside the server runtime; this
             // guard just keeps exotic sync callers panic-free.
             return;
         };
-        let value = encode_entry(self.status, &self.headers, body);
+        let body = Bytes::copy_from_slice(body);
         handle.spawn(async move {
+            if !self.policy.allows(&body) {
+                return;
+            }
+            let value = encode_entry(self.status, &self.headers, &body);
             if let Err(e) = self.storage.set(&self.key, &value, Some(self.ttl)).await {
                 tracing::error!(key = %self.key, error = %e, "cache write failed");
             }
@@ -289,13 +334,13 @@ impl CacheWrite {
 /// while being copied into a bounded buffer. A clean end-of-stream within
 /// the cap triggers the background cache write; overflow, a stream error,
 /// or an abandoned body (client gone) drops the write instead.
-struct RecordingBody {
-    inner: ProxyBody,
-    buf: BytesMut,
-    max: usize,
+pub(crate) struct RecordingBody {
+    pub(crate) inner: ProxyBody,
+    pub(crate) buf: BytesMut,
+    pub(crate) max: usize,
     /// Present while the body is still worth caching; taken on completion,
     /// dropped on overflow/error.
-    write: Option<CacheWrite>,
+    pub(crate) write: Option<CacheWrite>,
 }
 
 impl Body for RecordingBody {
@@ -759,5 +804,18 @@ mod tests {
 
         assert!(decode_entry("not json").is_none());
         assert!(decode_entry(r#"{"status":9,"headers":[],"body_b64":""}"#).is_none());
+    }
+
+    #[test]
+    fn graphql_write_policy_gates_on_errors() {
+        let policy = WritePolicy::GraphQlSuccess;
+        assert!(policy.allows(br#"{"data":{"hello":"hi"}}"#));
+        assert!(policy.allows(br#"{"data":null,"errors":[]}"#));
+        assert!(policy.allows(br#"{"data":1,"errors":null}"#));
+        assert!(!policy.allows(br#"{"errors":[{"message":"boom"}]}"#));
+        assert!(!policy.allows(br#"{"data":{},"errors":[{"message":"partial"}]}"#));
+        assert!(!policy.allows(b"not json"));
+        assert!(!policy.allows(br#"[1,2]"#));
+        assert!(WritePolicy::Any.allows(b"anything at all"));
     }
 }

@@ -7,10 +7,11 @@ use std::sync::Arc;
 use g2_core::{ApiDefinition, Error};
 use g2_middleware::{
     AnalyticsHandle, AnalyticsLayer, AuthLayer, BodyTransformLayer, CacheLayer, ChainBuilder,
-    ChainService, CorsLayer, EndpointLimits, GraphQlLayer, GraphQlSyncHandle, HeaderTransformLayer,
-    HookKind, HttpMetrics, IpFilterLayer, MetricsLayer, MockResponseLayer, PathPolicyLayer,
-    PluginLayer, RateLimitLayer, RequestContext, RequestSizeLimitLayer, SchemaSyncSnapshot,
-    SharedPluginLoader, SpikeGuard, StatsLayer, StatsRegistry, TraceLayer, VersionDispatch,
+    ChainService, CorsLayer, EndpointLimits, GraphQlCacheWiring, GraphQlLayer, GraphQlSyncHandle,
+    HeaderTransformLayer, HookKind, HttpMetrics, IpFilterLayer, MetricsLayer, MockResponseLayer,
+    PathPolicyLayer, PluginLayer, RateLimitLayer, RequestContext, RequestSizeLimitLayer,
+    SchemaSyncSnapshot, SharedPluginLoader, SpikeGuard, StatsLayer, StatsRegistry, TraceLayer,
+    VersionDispatch,
 };
 use g2_middleware::{SharedJwksFetch, SharedUdgFetch};
 use g2_storage::SharedStorage;
@@ -124,7 +125,17 @@ fn inner_layers(
     let graphql = def
         .graphql
         .as_ref()
-        .map(|g| GraphQlLayer::from_config(g, def, Some(Arc::clone(udg_fetch))))
+        .map(|g| {
+            GraphQlLayer::from_config(
+                g,
+                def,
+                Some(Arc::clone(udg_fetch)),
+                Some(GraphQlCacheWiring {
+                    storage: Arc::clone(storage),
+                    scope: scope.to_owned(),
+                }),
+            )
+        })
         .transpose()?
         .flatten();
     let graphql_sync = graphql.as_ref().and_then(GraphQlLayer::sync_handle);

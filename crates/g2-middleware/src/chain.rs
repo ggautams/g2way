@@ -77,7 +77,10 @@ use crate::{ChainService, ProxyBody};
 ///     GraphQL rejections stay untransformed and the persisted-query
 ///     rewrite happens before request transforms see the upstream-bound
 ///     request. In `udg` execution mode this layer answers every GraphQL
-///     request itself (ADR-0010) — the slots below it never run.
+///     request itself (ADR-0010) — the slots below it never run. With
+///     `graphql.cache` configured it also runs the GraphQL-aware response
+///     cache (ADR-0012), so a proxy-mode hit stores/replays the
+///     *post-transform* response — the opposite of slot 18.
 /// 15. [`HeaderTransformLayer`] — per-API header add/remove on requests and
 ///     responses (absent when unconfigured). Below auth/rate-limit so
 ///     gateway rejections are not transformed; above [`ApiIdHeaderLayer`] so
@@ -894,9 +897,10 @@ mod tests {
             }"#,
         )
         .expect("valid definition");
-        let graphql = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
-            .expect("compiles")
-            .expect("enabled");
+        let graphql =
+            GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None, None)
+                .expect("compiles")
+                .expect("enabled");
 
         let chain = ChainBuilder::new(RequestContext::new("users-api", "acme"))
             .auth(Some(auth))

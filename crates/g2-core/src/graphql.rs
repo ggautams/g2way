@@ -182,6 +182,19 @@ pub struct GraphQlConfig {
     /// [`Supergraph`](GraphQlExecutionMode::Supergraph) (ADR-0011).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supergraph: Option<SupergraphConfig>,
+
+    /// GraphQL-aware response caching (ADR-0012). When set, responses to
+    /// **query** operations are cached — keyed on the active schema, the
+    /// operation name, the query text, and the variables — and repeat
+    /// queries are answered without contacting the upstream (or re-running
+    /// gateway-side execution), marked `x-g2-cache: hit`. Mutations and
+    /// subscriptions always bypass, and a response carrying GraphQL
+    /// `errors` is never stored. The cache is shared across clients like
+    /// [`ApiDefinition::cache`](crate::ApiDefinition::cache); per-key
+    /// grants are re-checked on every request before the cache is read.
+    /// Unset = GraphQL responses are not cached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<crate::CacheConfig>,
 }
 
 /// Federation supergraph settings (see [`GraphQlConfig::supergraph`]).
@@ -724,11 +737,12 @@ impl GraphQlConfig {
     /// variables template, a schema-sync setting is invalid (zero
     /// interval/timeout, non-http(s) URL, bad or hop-by-hop header), a
     /// subscriptions message cap is zero, subscriptions are enabled on a
-    /// schema without a `Subscription` root type, `data_sources` or
-    /// `supergraph` is set outside its execution mode, a `udg`-mode rule
-    /// fails (schema sync or enabled subscriptions present, a data source
-    /// missing, unknown, or invalid, or a persisted query selecting a
-    /// subscription), a `subgraph`-mode schema fails federation
+    /// schema without a `Subscription` root type, a `cache` setting is
+    /// zero, `data_sources` or `supergraph` is set outside its execution
+    /// mode, a `udg`-mode rule fails (schema sync or enabled subscriptions
+    /// present, a data source missing, unknown, or invalid, `cache`
+    /// combined with a data-source template reading `_g2`, or a persisted
+    /// query selecting a subscription), a `subgraph`-mode schema fails federation
     /// augmentation, or a `supergraph`-mode rule fails (non-empty schema,
     /// missing or invalid `supergraph` block, composition error, schema
     /// sync or enabled subscriptions present).
@@ -747,6 +761,10 @@ impl GraphQlConfig {
                 "`graphql.max_query_depth` must be greater than zero (omit it for unlimited)"
                     .into(),
             ));
+        }
+
+        if let Some(cache) = &self.cache {
+            cache.validate(api, "graphql.cache")?;
         }
 
         if self.supergraph.is_some() && self.execution_mode != GraphQlExecutionMode::Supergraph {
@@ -778,6 +796,9 @@ impl GraphQlConfig {
                     ));
                 }
                 self.validate_data_sources(&schema, &fail)?;
+                if self.cache.is_some() {
+                    self.reject_cached_per_request_templates(&fail)?;
+                }
             }
             GraphQlExecutionMode::Supergraph => {
                 if self.schema_sync.is_some() {
@@ -962,6 +983,51 @@ impl GraphQlConfig {
                     return Err(fail(format!(
                         "`graphql.data_sources` must map every root field in `udg` \
                          execution mode; missing `{key}`"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Rejects `graphql.cache` on a udg API whose data-source templates
+    /// read the per-request `_g2` context (headers, session alias): such a
+    /// source produces per-client responses, and the cache is shared across
+    /// clients, so replaying them would leak one caller's data to another
+    /// (ADR-0012). Templates reading only `args` are fine — the arguments
+    /// are part of the cache key.
+    fn reject_cached_per_request_templates(
+        &self,
+        fail: &impl Fn(String) -> Error,
+    ) -> Result<(), Error> {
+        for (key, source) in &self.data_sources {
+            let field = |name: String| format!("graphql.data_sources[\"{key}\"].{name}");
+            let mut templates: Vec<(String, &str)> = Vec::new();
+            let headers = match source {
+                UdgDataSource::Rest(rest) => {
+                    templates.push((field("url".into()), &rest.url));
+                    if let Some(body) = &rest.body {
+                        templates.push((field("body".into()), body));
+                    }
+                    &rest.headers
+                }
+                UdgDataSource::Graphql(gql) => &gql.headers,
+            };
+            for (name, value) in headers {
+                templates.push((field(format!("headers.{name}")), value));
+            }
+            for (name, template) in templates {
+                // Sources are template-validated before this runs; a parse
+                // failure here would already have failed validation.
+                let env = minijinja::Environment::new();
+                let reads_g2 = env
+                    .template_from_str(template)
+                    .is_ok_and(|t| t.undeclared_variables(false).contains("_g2"));
+                if reads_g2 {
+                    return Err(fail(format!(
+                        "`graphql.cache` cannot be combined with `{name}`, whose template \
+                         reads the per-request `_g2` context — the cache is shared across \
+                         clients, so per-client responses must never be stored (ADR-0012)"
                     )));
                 }
             }
@@ -1607,6 +1673,77 @@ mod tests {
             json["subscriptions"] = serde_json::json!({ "enabled": false });
         });
         off.validate("api").expect("valid when disabled");
+    }
+
+    #[test]
+    fn cache_block_parses_defaults_and_validates() {
+        let cfg = parse(
+            &serde_json::json!({
+                "schema": format!("{SCHEMA} type Subscription {{ ticks: Int }}"),
+                "subscriptions": {},
+                "cache": {}
+            })
+            .to_string(),
+        );
+        cfg.validate("api").expect("valid");
+        let cache = cfg.cache.as_ref().expect("set");
+        assert_eq!(cache.ttl_secs, 60);
+        assert_eq!(cache.max_body_bytes, 1_048_576);
+
+        // Unset stays off the wire.
+        let bare = serde_json::to_string(&minimal()).expect("serializes");
+        assert!(!bare.contains("cache"));
+    }
+
+    #[test]
+    fn graphql_cache_zero_values_are_rejected() {
+        for (json, field) in [
+            (r#"{"ttl_secs": 0}"#, "graphql.cache.ttl_secs"),
+            (r#"{"max_body_bytes": 0}"#, "graphql.cache.max_body_bytes"),
+        ] {
+            let mut cfg = minimal();
+            cfg.cache = Some(serde_json::from_str(json).expect("parses"));
+            let err = cfg.validate("api").unwrap_err().to_string();
+            assert!(err.contains(field), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn udg_cache_rejects_per_request_templates() {
+        // The shared `udg_sources` fixture reads `_g2.session.alias` in a
+        // header template — caching that source would leak across clients.
+        let leaky = udg(|json| {
+            json["cache"] = serde_json::json!({});
+        });
+        let err = leaky.validate("api").unwrap_err().to_string();
+        assert!(
+            err.contains("_g2") && err.contains("Query.user"),
+            "got: {err}"
+        );
+
+        // Args-only templates are fine: arguments are part of the cache key.
+        let clean = udg(|json| {
+            json["cache"] = serde_json::json!({});
+            json["data_sources"]["Query.user"] = serde_json::json!({
+                "kind": "rest",
+                "url": "http://up.internal/users/{{ args.id }}"
+            });
+        });
+        clean.validate("api").expect("valid");
+    }
+
+    #[test]
+    fn cache_is_accepted_in_subgraph_mode() {
+        let cfg = parse(
+            &serde_json::json!({
+                "schema": "type Query { user(id: ID!): User } \
+                           type User @key(fields: \"id\") { id: ID! name: String }",
+                "execution_mode": "subgraph",
+                "cache": {}
+            })
+            .to_string(),
+        );
+        cfg.validate("api").expect("valid");
     }
 
     #[test]

@@ -120,7 +120,9 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 - [x] Federation: supergraph/subgraph support (`subgraph` + `supergraph`
       execution modes: gateway-side composition and `_entities` execution —
       ADR-0011, `docs/graphql.md` §Federation)
-- [ ] GraphQL-aware response caching
+- [x] GraphQL-aware response caching (`graphql.cache` — operation-keyed,
+      query-only, error-excluding; ADR-0012, `docs/graphql.md` §Response
+      caching)
 - [ ] Stretch: query complexity/cost limits; automatic persisted
       queries (APQ)
 
@@ -1226,3 +1228,35 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   dead-subgraph partial data, subgraph-mode reserved-query passthrough).
   Next M9 box: GraphQL-aware response caching, or the stretch items
   (complexity limits, APQ).
+- **2026-09-02 (5)** — M9 GraphQL-aware response caching landed (ADR-0012,
+  `docs/graphql.md` §Response caching), user-confirmed shape: **shared
+  across clients** (the M7 cache precedent; enforce-before-lookup is the policing
+  guarantee) and **query-only, error-excluding** (mutations/subscriptions
+  bypass, never invalidate — TTL is the whole contract; a 2xx whose JSON
+  carries non-empty `errors` is dropped at background-write time via the
+  new `cache::WritePolicy::GraphQlSuccess`). Config: `GraphQlConfig.cache:
+  Option<CacheConfig>` (reused M7 struct — `CacheConfig::validate` grew a
+  field-prefix param; zero OpenAPI changes); per-version rides the
+  wholesale `VersionOverrides.graphql`. Lives **inside the GraphQL layer**
+  (slot 14 — only it has the parsed operation, and udg/supergraph never
+  reach slot 18): new `g2-middleware::graphql_cache::GraphQlCache` reusing
+  cache.rs's entry codec + `RecordingBody` tee (made pub(crate)); key =
+  `g2:{org}:cache:{scope}:graphql:` + digest of
+  `sdl_hash\nopname\nquery\nvariables` — `sdl_hash` precomputed on
+  `GraphQlSchemaState` (new `::new()`, both construction sites), so schema
+  sync/reload starts a fresh keyspace; variables canonicalize through
+  serde_json's BTreeMap ordering (absent/null/`{}` ≡ ""). Persisted
+  endpoints cache too, substituted variables in the key. **New leak guard
+  found while planning**: udg data-source templates reading `_g2`
+  (headers/session) produce per-client responses → validation rejects
+  them combined with `graphql.cache`. `GraphQlLayer::from_config` grew a
+  4th param `Option<GraphQlCacheWiring{storage, scope}>` (9 call sites);
+  router passes real wiring. Documented consequence: proxy-mode entries
+  store the **post-transform** response (slot 14 > 15/16), opposite of
+  slot 18. Tests: 4 core config + 8 graphql-cache/policy units + 7 layer
+  tests + udg fetch-skip test + 4-case `graphql_cache_e2e.rs` (counting
+  upstream: hit-never-forwards, mutation/variable misses, errors-never-
+  cached, persisted per-path-param). **Gotcha:** layer tests must drive
+  the response body (`body_text`) or the tee never records. Next M9 box
+  (last): stretch — query complexity/cost limits or APQ; also still open
+  from M7: cache-flush admin endpoint (prefix scan is ready for it).

@@ -1087,7 +1087,7 @@ mod tests {
         )
         .expect("valid definition");
         def.validate().expect("valid definition");
-        GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, Some(fetch))
+        GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, Some(fetch), None)
             .expect("compiles")
             .expect("enabled")
     }

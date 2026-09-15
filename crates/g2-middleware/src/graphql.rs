@@ -32,6 +32,15 @@
 //! the API's data sources (the `graphql_udg` module, ADR-0010) and
 //! `inner` is never called.
 //!
+//! With `graphql.cache` configured, steps 3 and 4 additionally consult the
+//! GraphQL-aware response cache (the `graphql_cache` module,
+//! ADR-0012) — strictly **after** every policing gate, and only for query
+//! operations. Note the placement consequence: this layer sits above the
+//! header/body transforms, so in proxy mode the cached copy is the
+//! **post-transform** response (a hit replays it without re-running them) —
+//! the opposite of the slot-18 HTTP cache, which stores the raw upstream
+//! response below the transforms.
+//!
 //! Like [`transform_body`](crate::transform_body), this layer buffers a
 //! request body. The buffering is bounded (the API's
 //! `max_request_body_bytes`, else 1 MiB) and the exact bytes are
@@ -58,7 +67,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use apollo_compiler::executable::{ExecutableDocument, Selection, SelectionSet};
+use apollo_compiler::executable::{ExecutableDocument, OperationType, Selection, SelectionSet};
 use apollo_compiler::response::{JsonMap, JsonValue};
 use apollo_compiler::validation::Valid;
 use apollo_compiler::{Name, Schema};
@@ -141,6 +150,9 @@ pub(crate) struct GraphQlShared {
     /// `execution_mode: "supergraph"` (ADR-0011). Schema-independent like
     /// [`udg`](Self::udg) and for the same reason.
     supergraph: Option<Arc<crate::graphql_federation::SupergraphEngine>>,
+    /// GraphQL-aware response cache; `Some` iff `graphql.cache` is
+    /// configured and the route build supplied storage wiring (ADR-0012).
+    cache: Option<crate::graphql_cache::GraphQlCache>,
 }
 
 /// The schema-dependent half of [`GraphQlShared`], swapped wholesale by a
@@ -148,10 +160,32 @@ pub(crate) struct GraphQlShared {
 pub(crate) struct GraphQlSchemaState {
     /// The SDL this state was compiled from, for change detection.
     pub(crate) sdl: String,
+    /// Digest of [`sdl`](Self::sdl), leading every GraphQL cache key so a
+    /// schema swap starts a fresh keyspace (ADR-0012); superseded entries
+    /// age out via their TTL.
+    pub(crate) sdl_hash: String,
     pub(crate) schema: Valid<Schema>,
     /// Each persisted operation validated against [`schema`](Self::schema),
     /// index-parallel to [`GraphQlShared::persisted`].
     pub(crate) persisted_docs: Vec<Valid<ExecutableDocument>>,
+}
+
+impl GraphQlSchemaState {
+    /// Builds the state, deriving [`sdl_hash`](Self::sdl_hash) — the one
+    /// construction path, so the hash can never drift from the SDL.
+    pub(crate) fn new(
+        sdl: String,
+        schema: Valid<Schema>,
+        persisted_docs: Vec<Valid<ExecutableDocument>>,
+    ) -> Self {
+        let sdl_hash = g2_core::session::hash_key(&sdl);
+        Self {
+            sdl,
+            sdl_hash,
+            schema,
+            persisted_docs,
+        }
+    }
 }
 
 impl std::fmt::Debug for GraphQlShared {
@@ -194,6 +228,19 @@ pub struct GraphQlLayer {
     pub(crate) shared: Arc<GraphQlShared>,
 }
 
+/// Storage wiring for the GraphQL-aware response cache, supplied by the
+/// route build (the `udg_fetch` pattern: the proxy crate owns the storage
+/// handle). Required by [`GraphQlLayer::from_config`] only when the config
+/// sets `graphql.cache` (ADR-0012).
+#[derive(Clone)]
+pub struct GraphQlCacheWiring {
+    /// The shared storage cache entries live in.
+    pub storage: g2_storage::SharedStorage,
+    /// The cache scope: the API id, or `{api_id}:{version}` for one version
+    /// of a versioned API (`:graphql` is appended internally).
+    pub scope: String,
+}
+
 /// Folds an apollo-compiler diagnostic list into per-diagnostic one-line
 /// messages (the CLI-report `Display` form spans many lines of source
 /// snippets — wrong for JSON error bodies).
@@ -211,6 +258,8 @@ impl GraphQlLayer {
     ///
     /// `udg_fetch` is the data-source HTTP seam (supplied by the proxy
     /// crate); it is required only when `execution_mode` is `udg`.
+    /// `cache_wiring` supplies the storage and cache scope; it is required
+    /// only when `graphql.cache` is configured (ADR-0012).
     ///
     /// # Errors
     ///
@@ -218,11 +267,13 @@ impl GraphQlLayer {
     /// operation, or a UDG data source does not compile — normally
     /// impossible after [`GraphQlConfig::validate`], but route building
     /// must not panic on a definition that skipped validation — or when
-    /// `udg` mode is configured without a fetcher.
+    /// `udg` mode is configured without a fetcher, or `graphql.cache`
+    /// without cache wiring.
     pub fn from_config(
         config: &GraphQlConfig,
         def: &ApiDefinition,
         udg_fetch: Option<crate::SharedUdgFetch>,
+        cache_wiring: Option<GraphQlCacheWiring>,
     ) -> Result<Option<Self>, Error> {
         if !config.enabled {
             return Ok(None);
@@ -348,14 +399,29 @@ impl GraphQlLayer {
             persisted_docs.push(doc);
         }
 
+        let cache = match (&config.cache, cache_wiring) {
+            (Some(cache_config), Some(wiring)) => Some(crate::graphql_cache::GraphQlCache::new(
+                cache_config,
+                &wiring.scope,
+                &def.org_id,
+                wiring.storage,
+            )),
+            (Some(_), None) => {
+                return Err(fail(
+                    "`graphql.cache` requires cache storage (not wired in this build path)".into(),
+                ));
+            }
+            (None, _) => None,
+        };
+
         Ok(Some(Self {
             shared: Arc::new(GraphQlShared {
                 api_id: def.api_id.clone(),
-                state: arc_swap::ArcSwap::from_pointee(GraphQlSchemaState {
+                state: arc_swap::ArcSwap::from_pointee(GraphQlSchemaState::new(
                     sdl,
                     schema,
                     persisted_docs,
-                }),
+                )),
                 sync: config
                     .schema_sync
                     .as_ref()
@@ -381,6 +447,7 @@ impl GraphQlLayer {
                 .unwrap_or(usize::MAX),
                 udg,
                 supergraph,
+                cache,
             }),
         }))
     }
@@ -505,6 +572,31 @@ where
                     .variables
                     .as_ref()
                     .map(|t| substitute_variables(t, &caps, req.headers()));
+                // Persisted queries are cached like plain ones (ADR-0012);
+                // the substituted variables — which may carry per-client
+                // header and path values — are part of the key, so a
+                // per-client response can never be replayed to someone
+                // else.
+                let cache_key = shared.cache.as_ref().and_then(|cache| {
+                    state.persisted_docs[index]
+                        .operations
+                        .get(p.operation_name.as_deref())
+                        .ok()
+                        .filter(|op| op.operation_type == OperationType::Query)
+                        .map(|_| {
+                            cache.key(
+                                &state.sdl_hash,
+                                p.operation_name.as_deref(),
+                                &p.query,
+                                &crate::graphql_cache::canonical_json_variables(variables.as_ref()),
+                            )
+                        })
+                });
+                if let (Some(cache), Some(key)) = (&shared.cache, &cache_key) {
+                    if let Some(hit) = cache.lookup(key).await {
+                        return Ok(hit);
+                    }
+                }
                 // In udg/supergraph mode the gateway executes the persisted
                 // operation itself (ADR-0010/-0011); otherwise it is
                 // forwarded upstream.
@@ -514,31 +606,34 @@ where
                         // Validation guarantees an object template.
                         _ => JsonMap::new(),
                     };
-                    if let Some(sg) = &shared.supergraph {
-                        return Ok(crate::graphql_federation::execute(
+                    let resp = if let Some(sg) = &shared.supergraph {
+                        crate::graphql_federation::execute(
                             sg,
                             &state,
                             &state.persisted_docs[index],
                             p.operation_name.as_deref(),
                             vars,
                         )
-                        .await);
-                    }
-                    let udg = shared.udg.as_ref().expect("checked above");
-                    let meta = crate::graphql_udg::RequestMeta::capture(&req);
-                    return Ok(crate::graphql_udg::execute(
-                        udg,
-                        &state,
-                        &state.persisted_docs[index],
-                        p.operation_name.as_deref(),
-                        vars,
-                        meta,
-                    )
-                    .await);
+                        .await
+                    } else {
+                        let udg = shared.udg.as_ref().expect("checked above");
+                        let meta = crate::graphql_udg::RequestMeta::capture(&req);
+                        crate::graphql_udg::execute(
+                            udg,
+                            &state,
+                            &state.persisted_docs[index],
+                            p.operation_name.as_deref(),
+                            vars,
+                            meta,
+                        )
+                        .await
+                    };
+                    return Ok(with_cache(&shared, cache_key, resp));
                 }
-                return inner
+                let resp = inner
                     .call(rewrite_persisted(req, &shared, p, variables))
-                    .await;
+                    .await?;
+                return Ok(with_cache(&shared, cache_key, resp));
             }
 
             // 4. A plain GraphQL request: extract the query, validate,
@@ -553,6 +648,10 @@ where
                 Ok(ok) => ok,
                 Err(resp) => return Ok(resp),
             };
+            // The query text is consumed by `parse_and_validate` below;
+            // keep a copy for the cache key only when the cache could
+            // apply (ADR-0012).
+            let cache_query = shared.cache.as_ref().map(|_| query.clone());
             let doc = match ExecutableDocument::parse_and_validate(
                 &state.schema,
                 query,
@@ -584,35 +683,76 @@ where
             if let Some(resp) = enforce(&shared, grants.as_ref(), &doc) {
                 return Ok(resp);
             }
+            // Only after every policing gate has passed may the shared
+            // cache answer — and only for query operations; mutations and
+            // subscriptions bypass, and an ambiguous selection stays
+            // uncached like it stays the upstream's problem (ADR-0012).
+            let cache_key = match (&shared.cache, cache_query) {
+                (Some(cache), Some(cache_query)) => doc
+                    .operations
+                    .get(operation_name.as_deref())
+                    .ok()
+                    .filter(|op| op.operation_type == OperationType::Query)
+                    .map(|_| {
+                        cache.key(
+                            &state.sdl_hash,
+                            operation_name.as_deref(),
+                            &cache_query,
+                            &crate::graphql_cache::canonical_variables(variables.as_ref()),
+                        )
+                    }),
+                _ => None,
+            };
+            if let (Some(cache), Some(key)) = (&shared.cache, &cache_key) {
+                if let Some(hit) = cache.lookup(key).await {
+                    return Ok(hit);
+                }
+            }
             if shared.udg.is_some() || shared.supergraph.is_some() {
                 let vars = match parse_raw_variables(variables) {
                     Ok(vars) => vars,
                     Err(resp) => return Ok(*resp),
                 };
-                if let Some(sg) = &shared.supergraph {
-                    return Ok(crate::graphql_federation::execute(
+                let resp = if let Some(sg) = &shared.supergraph {
+                    crate::graphql_federation::execute(
                         sg,
                         &state,
                         &doc,
                         operation_name.as_deref(),
                         vars,
                     )
-                    .await);
-                }
-                let udg = shared.udg.as_ref().expect("checked above");
-                let meta = crate::graphql_udg::RequestMeta::capture(&req);
-                return Ok(crate::graphql_udg::execute(
-                    udg,
-                    &state,
-                    &doc,
-                    operation_name.as_deref(),
-                    vars,
-                    meta,
-                )
-                .await);
+                    .await
+                } else {
+                    let udg = shared.udg.as_ref().expect("checked above");
+                    let meta = crate::graphql_udg::RequestMeta::capture(&req);
+                    crate::graphql_udg::execute(
+                        udg,
+                        &state,
+                        &doc,
+                        operation_name.as_deref(),
+                        vars,
+                        meta,
+                    )
+                    .await
+                };
+                return Ok(with_cache(&shared, cache_key, resp));
             }
-            inner.call(req).await
+            let resp = inner.call(req).await?;
+            Ok(with_cache(&shared, cache_key, resp))
         })
+    }
+}
+
+/// Attaches the cache's recording tee when the request produced a cache key
+/// (query operation, cache configured — ADR-0012); pass-through otherwise.
+fn with_cache(
+    shared: &GraphQlShared,
+    key: Option<String>,
+    resp: Response<ProxyBody>,
+) -> Response<ProxyBody> {
+    match (&shared.cache, key) {
+        (Some(cache), Some(key)) => cache.record(resp, key),
+        _ => resp,
     }
 }
 
@@ -660,8 +800,9 @@ struct ExtractedQuery {
 }
 
 /// Raw request variables: pre-parsed JSON when they rode a `POST` envelope,
-/// URL-decoded text from a `GET` `?variables=` parameter.
-enum RawVariables {
+/// URL-decoded text from a `GET` `?variables=` parameter. `pub(crate)` so
+/// [`crate::graphql_cache`] can canonicalize them into a cache key.
+pub(crate) enum RawVariables {
     Parsed(JsonValue),
     Text(String),
 }
@@ -1196,7 +1337,7 @@ mod tests {
     fn layer(graphql: serde_json::Value) -> GraphQlLayer {
         let def = definition(graphql);
         def.validate().expect("valid definition");
-        GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
+        GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None, None)
             .expect("compiles")
             .expect("enabled")
     }
@@ -1517,7 +1658,7 @@ mod tests {
         // The layer's own cap (from max_request_body_bytes).
         let mut def = definition(base_config());
         def.max_request_body_bytes = Some(24);
-        let layer = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
+        let layer = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None, None)
             .expect("compiles")
             .expect("enabled");
         let resp = send(&layer, post("{ user(id: \"1\") { name } }")).await;
@@ -1654,7 +1795,7 @@ mod tests {
         let mut def = definition(base_config());
         def.graphql.as_mut().expect("set").enabled = false;
         assert!(
-            GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
+            GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None, None)
                 .expect("compiles")
                 .is_none()
         );
@@ -1814,5 +1955,296 @@ mod tests {
             "%zz",
             "invalid escape passes through"
         );
+    }
+
+    // ---- GraphQL-aware response caching (ADR-0012) ----
+
+    /// The layer with the response cache wired to `storage` (scope `gql`,
+    /// default org → prefix `g2:default:cache:gql:graphql:`).
+    fn cached_layer(
+        mut graphql: serde_json::Value,
+        storage: &g2_storage::SharedStorage,
+    ) -> GraphQlLayer {
+        graphql["cache"] = serde_json::json!({});
+        let def = definition(graphql);
+        def.validate().expect("valid definition");
+        GraphQlLayer::from_config(
+            def.graphql.as_ref().expect("set"),
+            &def,
+            None,
+            Some(GraphQlCacheWiring {
+                storage: Arc::clone(storage),
+                scope: "gql".to_owned(),
+            }),
+        )
+        .expect("compiles")
+        .expect("enabled")
+    }
+
+    /// Inner service counting calls and answering a fixed JSON body.
+    fn counting_inner(
+        counter: Arc<std::sync::atomic::AtomicUsize>,
+        body: &'static str,
+    ) -> crate::ChainService {
+        crate::ChainService::new(tower::service_fn(move |_req: Request<ProxyBody>| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                Ok::<_, Infallible>(Response::new(ProxyBody::new(Full::new(
+                    Bytes::from_static(body.as_bytes()),
+                ))))
+            }
+        }))
+    }
+
+    async fn send_counted(
+        layer: &GraphQlLayer,
+        inner: &crate::ChainService,
+        req: Request<ProxyBody>,
+    ) -> Response<ProxyBody> {
+        layer
+            .clone()
+            .layer(inner.clone())
+            .oneshot(req)
+            .await
+            .expect("infallible")
+    }
+
+    /// Waits for the background cache write under `prefix` (bounded).
+    async fn await_cache_entry(storage: &g2_storage::SharedStorage, prefix: &str) {
+        for _ in 0..100 {
+            let keys = storage.scan_prefix(prefix).await.expect("scan");
+            if !keys.is_empty() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        panic!("cache entry never written under {prefix}");
+    }
+
+    fn post_envelope(envelope: serde_json::Value) -> Request<ProxyBody> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/gql")
+            .body(ProxyBody::new(Full::new(Bytes::from(envelope.to_string()))))
+            .expect("request")
+    }
+
+    #[tokio::test]
+    async fn identical_queries_are_served_from_the_cache() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let layer = cached_layer(base_config(), &storage);
+        let count = Arc::new(AtomicUsize::new(0));
+        let inner = counting_inner(Arc::clone(&count), r#"{"data":{"hello":"hi"}}"#);
+
+        let resp = send_counted(&layer, &inner, post("{ hello }")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            !resp.headers().contains_key(crate::CACHE_STATUS_HEADER),
+            "first request is a miss"
+        );
+        assert_eq!(body_text(resp).await, r#"{"data":{"hello":"hi"}}"#);
+        await_cache_entry(&storage, "g2:default:cache:gql:graphql:").await;
+
+        let resp = send_counted(&layer, &inner, post("{ hello }")).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "upstream reached once");
+        assert_eq!(
+            resp.headers()
+                .get(crate::CACHE_STATUS_HEADER)
+                .expect("hit marker")
+                .as_bytes(),
+            b"hit"
+        );
+        assert_eq!(body_text(resp).await, r#"{"data":{"hello":"hi"}}"#);
+    }
+
+    #[tokio::test]
+    async fn variables_vary_the_key_and_canonicalize_by_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let layer = cached_layer(base_config(), &storage);
+        let count = Arc::new(AtomicUsize::new(0));
+        let inner = counting_inner(Arc::clone(&count), r#"{"data":{"user":null}}"#);
+        let query = "query U($id: ID!) { user(id: $id) { name } }";
+
+        let resp = send_counted(
+            &layer,
+            &inner,
+            post_envelope(serde_json::json!({ "query": query, "variables": {"id": "1"} })),
+        )
+        .await;
+        body_text(resp).await; // drive the body: the tee records on completion
+        await_cache_entry(&storage, "g2:default:cache:gql:graphql:").await;
+
+        // Different variables: a distinct entry, so the upstream is hit.
+        let _ = send_counted(
+            &layer,
+            &inner,
+            post_envelope(serde_json::json!({ "query": query, "variables": {"id": "2"} })),
+        )
+        .await;
+        assert_eq!(count.load(Ordering::SeqCst), 2, "distinct variables miss");
+
+        // Key order does not matter: {"id":"1"} re-serializes canonically.
+        let raw = format!(
+            r#"{{"variables":{{"id":"1"}},"query":{}}}"#,
+            serde_json::json!(query)
+        );
+        let resp = send_counted(
+            &layer,
+            &inner,
+            Request::builder()
+                .method(Method::POST)
+                .uri("/gql")
+                .body(ProxyBody::new(Full::new(Bytes::from(raw))))
+                .expect("request"),
+        )
+        .await;
+        assert_eq!(count.load(Ordering::SeqCst), 2, "canonical variables hit");
+        assert!(resp.headers().contains_key(crate::CACHE_STATUS_HEADER));
+    }
+
+    #[tokio::test]
+    async fn mutations_bypass_the_cache_entirely() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let layer = cached_layer(
+            serde_json::json!({
+                "schema": format!("{SCHEMA} type Mutation {{ rename(id: ID!): User }}")
+            }),
+            &storage,
+        );
+        let count = Arc::new(AtomicUsize::new(0));
+        let inner = counting_inner(Arc::clone(&count), r#"{"data":{"rename":null}}"#);
+
+        for _ in 0..2 {
+            let resp = send_counted(
+                &layer,
+                &inner,
+                post("mutation { rename(id: \"1\") { id } }"),
+            )
+            .await;
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(!resp.headers().contains_key(crate::CACHE_STATUS_HEADER));
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2, "every mutation forwards");
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let keys = storage
+            .scan_prefix("g2:default:cache:")
+            .await
+            .expect("scan");
+        assert!(keys.is_empty(), "mutations never stored, got {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn error_responses_are_not_cached() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let layer = cached_layer(base_config(), &storage);
+        let count = Arc::new(AtomicUsize::new(0));
+        let inner = counting_inner(
+            Arc::clone(&count),
+            r#"{"data":null,"errors":[{"message":"boom"}]}"#,
+        );
+
+        for _ in 0..2 {
+            let resp = send_counted(&layer, &inner, post("{ hello }")).await;
+            assert!(!resp.headers().contains_key(crate::CACHE_STATUS_HEADER));
+            body_text(resp).await;
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 2, "error responses miss");
+        let keys = storage
+            .scan_prefix("g2:default:cache:")
+            .await
+            .expect("scan");
+        assert!(keys.is_empty(), "errors never stored, got {keys:?}");
+    }
+
+    #[tokio::test]
+    async fn get_queries_are_cached_too() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let layer = cached_layer(base_config(), &storage);
+        let count = Arc::new(AtomicUsize::new(0));
+        let inner = counting_inner(Arc::clone(&count), r#"{"data":{"hello":"hi"}}"#);
+        let get = || {
+            Request::builder()
+                .method(Method::GET)
+                .uri("/gql?query=%7B%20hello%20%7D")
+                .body(ProxyBody::empty())
+                .expect("request")
+        };
+
+        body_text(send_counted(&layer, &inner, get()).await).await;
+        await_cache_entry(&storage, "g2:default:cache:gql:graphql:").await;
+        let resp = send_counted(&layer, &inner, get()).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert!(resp.headers().contains_key(crate::CACHE_STATUS_HEADER));
+
+        // GET and POST of the same query share one entry: the key is the
+        // operation, not the transport.
+        let resp = send_counted(&layer, &inner, post("{ hello }")).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "POST hits the GET entry");
+        assert!(resp.headers().contains_key(crate::CACHE_STATUS_HEADER));
+    }
+
+    #[tokio::test]
+    async fn persisted_endpoints_cache_per_substituted_variables() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let layer = cached_layer(
+            serde_json::json!({
+                "schema": SCHEMA,
+                "persisted_queries": [{
+                    "method": "GET",
+                    "path": "/users/{id}",
+                    "operation": "query User($id: ID!) { user(id: $id) { name } }",
+                    "variables": { "id": "$path.id" }
+                }]
+            }),
+            &storage,
+        );
+        let count = Arc::new(AtomicUsize::new(0));
+        let inner = counting_inner(Arc::clone(&count), r#"{"data":{"user":null}}"#);
+        let get = |path: &str| {
+            Request::builder()
+                .method(Method::GET)
+                .uri(path)
+                .body(ProxyBody::empty())
+                .expect("request")
+        };
+
+        body_text(send_counted(&layer, &inner, get("/gql/users/1")).await).await;
+        await_cache_entry(&storage, "g2:default:cache:gql:graphql:").await;
+        let resp = send_counted(&layer, &inner, get("/gql/users/1")).await;
+        assert_eq!(count.load(Ordering::SeqCst), 1, "same user hits");
+        assert!(resp.headers().contains_key(crate::CACHE_STATUS_HEADER));
+
+        let resp = send_counted(&layer, &inner, get("/gql/users/2")).await;
+        assert_eq!(count.load(Ordering::SeqCst), 2, "other user misses");
+        assert!(!resp.headers().contains_key(crate::CACHE_STATUS_HEADER));
+    }
+
+    #[tokio::test]
+    async fn a_schema_swap_starts_a_fresh_keyspace() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let storage: g2_storage::SharedStorage = Arc::new(g2_storage::MemoryStorage::new());
+        let count = Arc::new(AtomicUsize::new(0));
+        let inner = counting_inner(Arc::clone(&count), r#"{"data":{"hello":"hi"}}"#);
+
+        let layer = cached_layer(base_config(), &storage);
+        body_text(send_counted(&layer, &inner, post("{ hello }")).await).await;
+        await_cache_entry(&storage, "g2:default:cache:gql:graphql:").await;
+
+        // The same query against a different SDL over the same storage
+        // (what a schema sync swap produces) must not read the old entry.
+        let swapped = cached_layer(
+            serde_json::json!({ "schema": format!("{SCHEMA} type Extra {{ x: Int }}") }),
+            &storage,
+        );
+        let resp = send_counted(&swapped, &inner, post("{ hello }")).await;
+        assert_eq!(count.load(Ordering::SeqCst), 2, "new schema, new keyspace");
+        assert!(!resp.headers().contains_key(crate::CACHE_STATUS_HEADER));
     }
 }

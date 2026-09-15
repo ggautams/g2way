@@ -26,6 +26,7 @@ pub mod chain;
 pub mod context;
 pub mod cors;
 pub mod graphql;
+pub(crate) mod graphql_cache;
 pub(crate) mod graphql_federation;
 pub mod graphql_sync;
 pub(crate) mod graphql_udg;
@@ -59,7 +60,7 @@ pub use context::{
     AuthBypass, ClientAddr, ConnectionInfo, RequestContext, SessionContext, UpstreamLatency,
 };
 pub use cors::{Cors, CorsLayer};
-pub use graphql::{GraphQl, GraphQlLayer};
+pub use graphql::{GraphQl, GraphQlCacheWiring, GraphQlLayer};
 pub use graphql_sync::{
     introspection_to_sdl, GraphQlSyncHandle, SchemaSyncSnapshot, SyncNudge, WeakGraphQlSync,
     INTROSPECTION_QUERY,

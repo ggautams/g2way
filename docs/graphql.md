@@ -45,6 +45,7 @@ Add a `graphql` block to the API definition:
 | `schema_sync` | off | Keep the schema in sync with the upstream via introspection (see below). |
 | `subscriptions` | off | GraphQL subscriptions over WebSocket, policed message by message (see below). |
 | `data_sources` | `{}` | UDG root-field → data-source map; required in (and exclusive to) `udg` mode (see below). |
+| `cache` | off | GraphQL-aware response caching, keyed on the operation (see below). |
 
 The whole listen path becomes the GraphQL endpoint: clients `POST` a JSON
 `{"query": …, "variables": …}` envelope to the listen root (or `GET` with
@@ -393,20 +394,64 @@ Semantics and limits (all violations are loud config errors, ADR-0011):
   into subgraph queries; subgraph responses are marginally larger than an
   optimal planner would request.
 
+## Response caching
+
+`graphql.cache` enables GraphQL-aware response caching (ADR-0012) — the
+plain response cache (`cache`) never helps GraphQL, since it only stores
+safe methods and GraphQL rides `POST`:
+
+```json
+{ "graphql": { "schema": "…", "cache": { "ttl_secs": 60 } } }
+```
+
+The block reuses the `cache` shape (`ttl_secs` defaults to 60,
+`max_body_bytes` to 1 MiB) and works in every execution mode; per-version
+overrides ride `versions.<name>.graphql` wholesale, and each version
+caches under its own scope. Entries are keyed on the operation, not the
+URL: the active schema (a digest — a schema sync or reload starts a fresh
+keyspace), the operation name, the query text (not normalized; whitespace
+varies the key), and the variables (canonicalized, so JSON key order does
+not). Hits are marked `x-g2-cache: hit` and, in udg/supergraph mode, skip
+the fetch phase entirely.
+
+What is cached is deliberately conservative:
+
+- **Query operations only.** Mutations and subscriptions always bypass,
+  and a mutation does not invalidate anything — like the plain cache, the
+  TTL is the whole contract.
+- **Clean successes only**: `2xx`, no `Set-Cookie`, and never a response
+  whose JSON carries a non-empty top-level `errors` array — a transient
+  upstream failure inside a `200` is not replayed for the whole TTL.
+- **Shared across clients** (plain-cache semantics). Per-key grants,
+  depth, and introspection rules are enforced on every request *before*
+  the cache is read, so a client can never read an entry for a query it
+  is not allowed to make. But if your upstream answers the same allowed
+  query differently per caller (`{ me { … } }`), do not enable the cache.
+  In udg mode this is enforced: a data-source template reading the
+  per-request `_g2` context rejects `graphql.cache` at validation.
+- Persisted GraphQL-as-REST endpoints are cached too (queries only); the
+  substituted variables are part of the key, so `/users/1` and `/users/2`
+  never share an entry.
+
+One placement consequence: the GraphQL layer sits above the header/body
+transforms, so in proxy mode the cached copy is the **post-transform**
+response and a hit replays it without re-running response transforms (the
+plain cache stores the raw upstream response and re-applies them live).
+
 ## Interactions and limits
 
 - **Body buffering**: GraphQL POSTs are buffered to be parsed, capped at
   the API's `max_request_body_bytes` (1 MiB when unset); over the cap is
   `413`. The exact original bytes are forwarded, so the upstream sees the
   request unmodified.
-- **Caching**: the response cache only stores safe methods, so GraphQL
-  POSTs are never cached. GraphQL-aware caching is a later M9 box.
+- **Caching**: see [Response caching](#response-caching); the plain
+  response cache (`cache`) ignores GraphQL POSTs.
 - **Introspection depth**: a pure introspection query (only `__`-fields
   at the root) bypasses the depth limit when introspection is allowed —
   tooling sends deep introspection documents.
 - **Methods**: a GraphQL API answers `GET` and `POST`; other methods get
   `405` (CORS preflights are handled by the CORS layer above).
-- **Not yet**: APQ, request batching, GraphQL-aware caching, nested-field
-  (non-root) UDG data sources, interface entities / `@requires` /
-  federated subscriptions — all tracked as M9 roadmap boxes or ADR-0011
-  future work.
+- **Not yet**: APQ, request batching, query complexity/cost limits,
+  nested-field (non-root) UDG data sources, interface entities /
+  `@requires` / federated subscriptions — all tracked as M9 roadmap boxes
+  or ADR-0011 future work.

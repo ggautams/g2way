@@ -567,6 +567,9 @@ fn default_cache_max_body_bytes() -> u64 {
 /// normalization: `?a=1&b=2` and `?b=2&a=1` cache separately) and expire
 /// after `ttl_secs`. HTTP cache-control semantics (`Vary`, `no-store`,
 /// `Age`) are not interpreted — the TTL is the whole contract.
+///
+/// GraphQL traffic (`POST`) is never cached here; `graphql.cache` reuses
+/// this config shape for operation-keyed caching instead (ADR-0012).
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheConfig {
@@ -583,19 +586,22 @@ pub struct CacheConfig {
 
 impl CacheConfig {
     /// Validates the cache settings; `api` names the owning definition in
-    /// errors.
-    fn validate(&self, api: &str) -> Result<(), Error> {
+    /// errors and `field_prefix` names the config field holding this block
+    /// (`cache` or `graphql.cache`).
+    pub(crate) fn validate(&self, api: &str, field_prefix: &str) -> Result<(), Error> {
         let fail = |reason: String| Error::InvalidApiDefinition {
             api: api.to_owned(),
             reason,
         };
         if self.ttl_secs == 0 {
-            return Err(fail("`cache.ttl_secs` must be greater than zero".into()));
+            return Err(fail(format!(
+                "`{field_prefix}.ttl_secs` must be greater than zero"
+            )));
         }
         if self.max_body_bytes == 0 {
-            return Err(fail(
-                "`cache.max_body_bytes` must be greater than zero".into(),
-            ));
+            return Err(fail(format!(
+                "`{field_prefix}.max_body_bytes` must be greater than zero"
+            )));
         }
         Ok(())
     }
@@ -1352,9 +1358,12 @@ pub fn api_definition_key_prefix(org_id: &str) -> String {
 ///
 /// `scope` is the API id for an unversioned API, or `{api_id}:{version}` for
 /// one version of a versioned API — versions can differ in upstream and
-/// transforms, so they must never share entries. The full entry key is this
-/// prefix plus a digest of the request method, path, and query; scoping by
-/// prefix keeps a future flush-by-API admin operation a plain prefix scan.
+/// transforms, so they must never share entries. The GraphQL-aware cache
+/// (`graphql.cache`) uses `{scope}:graphql`, keeping its entries disjoint
+/// from the HTTP cache's. The full entry key is this prefix plus a digest of
+/// the request (method, path, and query for the HTTP cache; schema hash,
+/// operation name, query text, and variables for the GraphQL cache); scoping
+/// by prefix keeps a future flush-by-API admin operation a plain prefix scan.
 #[must_use]
 pub fn response_cache_key_prefix(org_id: &str, scope: &str) -> String {
     format!("g2:{org_id}:cache:{scope}:")
@@ -1493,7 +1502,7 @@ impl ApiDefinition {
             ));
         }
         if let Some(cache) = &self.cache {
-            cache.validate(&self.api_id)?;
+            cache.validate(&self.api_id, "cache")?;
         }
         if let Some(graphql) = &self.graphql {
             graphql.validate(&self.api_id)?;

@@ -666,11 +666,11 @@ impl GraphQlSyncHandle {
                     })?;
             persisted_docs.push(doc);
         }
-        self.shared.state.store(Arc::new(GraphQlSchemaState {
+        self.shared.state.store(Arc::new(GraphQlSchemaState::new(
             sdl,
             schema,
             persisted_docs,
-        }));
+        )));
         self.record_success();
         Ok(true)
     }
@@ -892,7 +892,7 @@ mod tests {
         )
         .expect("valid definition");
         def.validate().expect("valid definition");
-        let layer = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
+        let layer = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None, None)
             .expect("compiles")
             .expect("enabled");
         let handle = layer.sync_handle().expect("sync configured");
@@ -924,7 +924,7 @@ mod tests {
             .to_string(),
         )
         .expect("valid definition");
-        let plain = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
+        let plain = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None, None)
             .expect("compiles")
             .expect("enabled");
         assert!(plain.sync_handle().is_none());
