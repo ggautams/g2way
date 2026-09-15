@@ -137,6 +137,10 @@ pub(crate) struct GraphQlShared {
     /// udg mode rejects `schema_sync` at validation, so the schema leaf
     /// above never swaps for a UDG API.
     udg: Option<Arc<crate::graphql_udg::UdgEngine>>,
+    /// Federation supergraph execution state; `Some` iff
+    /// `execution_mode: "supergraph"` (ADR-0011). Schema-independent like
+    /// [`udg`](Self::udg) and for the same reason.
+    supergraph: Option<Arc<crate::graphql_federation::SupergraphEngine>>,
 }
 
 /// The schema-dependent half of [`GraphQlShared`], swapped wholesale by a
@@ -228,28 +232,55 @@ impl GraphQlLayer {
             reason,
         };
 
-        let udg = match config.execution_mode {
-            GraphQlExecutionMode::Proxy => None,
+        // The effective schema by mode (ADR-0011): the configured SDL
+        // as-is, federation-augmented, or composed — plus the mode's
+        // gateway-side execution engine, when it has one.
+        let mut udg = None;
+        let mut supergraph = None;
+        let require_fetch = |mode: &str| {
+            udg_fetch.clone().ok_or_else(|| {
+                fail(format!(
+                    "`{mode}` execution mode requires a data-source fetcher \
+                     (not wired in this build path)"
+                ))
+            })
+        };
+        let parse_schema = |sdl: &str| {
+            Schema::parse_and_validate(sdl, "schema.graphql").map_err(|e| {
+                fail(format!(
+                    "`graphql.schema` is not a valid GraphQL schema: {}",
+                    diagnostic_messages(&e.errors).join("; ")
+                ))
+            })
+        };
+        let (sdl, schema) = match config.execution_mode {
+            GraphQlExecutionMode::Proxy => (config.schema.clone(), parse_schema(&config.schema)?),
             GraphQlExecutionMode::Udg => {
-                let fetch = udg_fetch.ok_or_else(|| {
-                    fail(
-                        "`udg` execution mode requires a data-source fetcher \
-                          (not wired in this build path)"
-                            .into(),
-                    )
-                })?;
-                Some(Arc::new(crate::graphql_udg::UdgEngine::compile(
+                let fetch = require_fetch("udg")?;
+                udg = Some(Arc::new(crate::graphql_udg::UdgEngine::compile(
                     config, def, fetch,
-                )?))
+                )?));
+                (config.schema.clone(), parse_schema(&config.schema)?)
+            }
+            GraphQlExecutionMode::Subgraph => {
+                g2_core::federation::augment_subgraph_sdl(&config.schema)
+                    .map_err(|e| fail(format!("`graphql.schema`: {e}")))?
+            }
+            GraphQlExecutionMode::Supergraph => {
+                let fetch = require_fetch("supergraph")?;
+                let sup = config.supergraph.as_ref().ok_or_else(|| {
+                    fail("`supergraph` execution mode requires `graphql.supergraph`".into())
+                })?;
+                let composed = g2_core::federation::compose(&sup.composition_inputs())
+                    .map_err(|e| fail(format!("`graphql.supergraph`: {e}")))?;
+                supergraph = Some(Arc::new(
+                    crate::graphql_federation::SupergraphEngine::compile(
+                        sup, &composed, def, fetch,
+                    )?,
+                ));
+                (composed.sdl, composed.schema)
             }
         };
-
-        let schema = Schema::parse_and_validate(&config.schema, "schema.graphql").map_err(|e| {
-            fail(format!(
-                "`graphql.schema` is not a valid GraphQL schema: {}",
-                diagnostic_messages(&e.errors).join("; ")
-            ))
-        })?;
 
         // `/users/` and `/users` both listen on the prefix `/users`; the
         // bare prefix is the API's GraphQL endpoint (`/` for a catch-all).
@@ -321,7 +352,7 @@ impl GraphQlLayer {
             shared: Arc::new(GraphQlShared {
                 api_id: def.api_id.clone(),
                 state: arc_swap::ArcSwap::from_pointee(GraphQlSchemaState {
-                    sdl: config.schema.clone(),
+                    sdl,
                     schema,
                     persisted_docs,
                 }),
@@ -349,6 +380,7 @@ impl GraphQlLayer {
                 )
                 .unwrap_or(usize::MAX),
                 udg,
+                supergraph,
             }),
         }))
     }
@@ -473,14 +505,26 @@ where
                     .variables
                     .as_ref()
                     .map(|t| substitute_variables(t, &caps, req.headers()));
-                // In udg mode the gateway executes the persisted operation
-                // itself (ADR-0010); otherwise it is forwarded upstream.
-                if let Some(udg) = &shared.udg {
+                // In udg/supergraph mode the gateway executes the persisted
+                // operation itself (ADR-0010/-0011); otherwise it is
+                // forwarded upstream.
+                if shared.udg.is_some() || shared.supergraph.is_some() {
                     let vars = match variables.map(JsonValue::from) {
                         Some(JsonValue::Object(map)) => map,
                         // Validation guarantees an object template.
                         _ => JsonMap::new(),
                     };
+                    if let Some(sg) = &shared.supergraph {
+                        return Ok(crate::graphql_federation::execute(
+                            sg,
+                            &state,
+                            &state.persisted_docs[index],
+                            p.operation_name.as_deref(),
+                            vars,
+                        )
+                        .await);
+                    }
+                    let udg = shared.udg.as_ref().expect("checked above");
                     let meta = crate::graphql_udg::RequestMeta::capture(&req);
                     return Ok(crate::graphql_udg::execute(
                         udg,
@@ -540,11 +584,22 @@ where
             if let Some(resp) = enforce(&shared, grants.as_ref(), &doc) {
                 return Ok(resp);
             }
-            if let Some(udg) = &shared.udg {
+            if shared.udg.is_some() || shared.supergraph.is_some() {
                 let vars = match parse_raw_variables(variables) {
                     Ok(vars) => vars,
                     Err(resp) => return Ok(*resp),
                 };
+                if let Some(sg) = &shared.supergraph {
+                    return Ok(crate::graphql_federation::execute(
+                        sg,
+                        &state,
+                        &doc,
+                        operation_name.as_deref(),
+                        vars,
+                    )
+                    .await);
+                }
+                let udg = shared.udg.as_ref().expect("checked above");
                 let meta = crate::graphql_udg::RequestMeta::capture(&req);
                 return Ok(crate::graphql_udg::execute(
                     udg,
@@ -1678,6 +1733,35 @@ mod tests {
             body_text(resp).await.contains("WebSocket"),
             "points the client at WebSocket"
         );
+    }
+
+    #[tokio::test]
+    async fn subgraph_mode_admits_and_polices_federation_requests() {
+        // A federating router's reserved queries validate against the
+        // augmented schema and are forwarded like any other operation
+        // (ADR-0011 §2).
+        let layer = layer(serde_json::json!({
+            "execution_mode": "subgraph",
+            "schema": "type Query { user(id: ID!): User } \
+                       type User @key(fields: \"id\") { id: ID! name: String }"
+        }));
+        let resp = send(&layer, post("{ _service { sdl } }")).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let entities = r#"query ($r: [_Any!]!) {
+            _entities(representations: $r) { ... on User { name } }
+        }"#;
+        let resp = send(&layer, post(entities)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "forwarded to the upstream");
+
+        // Policing still applies: an unknown field is rejected, and
+        // per-key field permissions cover entity selections.
+        let resp = send(&layer, post("{ _entities { nope } }")).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let mut req = post(entities);
+        req.extensions_mut().insert(session(serde_json::json!({
+            "restricted_types": [{ "name": "User", "fields": ["name"] }]
+        })));
+        assert_eq!(send(&layer, req).await.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]

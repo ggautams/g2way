@@ -26,6 +26,7 @@ pub mod chain;
 pub mod context;
 pub mod cors;
 pub mod graphql;
+pub(crate) mod graphql_federation;
 pub mod graphql_sync;
 pub(crate) mod graphql_udg;
 pub mod graphql_ws;

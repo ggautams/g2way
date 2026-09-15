@@ -36,8 +36,8 @@ Add a `graphql` block to the API definition:
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Kill switch; `false` disables all GraphQL handling. |
-| `execution_mode` | `"proxy"` | `proxy` (forward to the upstream) or `udg` (the gateway executes; see below). Federation is later M9 work. |
-| `schema` | — (required) | The GraphQL schema, SDL. Validated at write/load time; requests are validated against it. |
+| `execution_mode` | `"proxy"` | `proxy` (forward to the upstream), `udg` (the gateway executes; see below), `subgraph` / `supergraph` (federation; see below). |
+| `schema` | — (required) | The GraphQL schema, SDL. Validated at write/load time; requests are validated against it. In `supergraph` mode it must be empty (the schema is composed). |
 | `introspection_enabled` | `true` | `false` rejects `__schema`/`__type` queries with `403`. |
 | `max_query_depth` | unlimited | Nested selection-set levels (`{ a { b } }` = 2); deeper queries get `403`. |
 | `playground` | off | Serve a GraphiQL page (see below). |
@@ -309,6 +309,90 @@ Worth knowing:
   field argument. Shape the schema to the REST response — there is
   no `data_path` remapping yet.
 
+## Federation
+
+Two execution modes cover Apollo Federation (ADR-0011).
+
+### Subgraph mode
+
+`"execution_mode": "subgraph"` fronts one federation-capable service.
+`schema` is the subgraph SDL (`@key`, `@external`, …); missing federation
+directive/type definitions are injected automatically, and the schema is
+augmented with the reserved `_service`/`_entities` root fields (plus the
+`_Entity` union over the SDL's `@key` types), so a federating router's
+requests validate and are policed — depth, introspection control, per-key
+field permissions — like any other operation before being forwarded. The
+upstream must implement the federation service spec itself (the gateway
+forwards `_service { sdl }`, it does not answer it). Schema sync and
+subscriptions work as in proxy mode.
+
+```json
+{
+  "graphql": {
+    "execution_mode": "subgraph",
+    "schema": "type Query { user(id: ID!): User } type User @key(fields: \"id\") { id: ID! name: String }"
+  }
+}
+```
+
+### Supergraph mode
+
+`"execution_mode": "supergraph"` makes the gateway the federation router:
+it composes the subgraph SDLs into one schema at write/load time and
+executes queries by fetching each root field from the subgraph that owns
+it, resolving cross-subgraph entity fields via `_entities` fetches (one
+batched call per entity boundary per level; sibling fetches run
+concurrently). `schema` must be empty — clients see the composed,
+federation-directive-free schema in introspection and the playground.
+
+```json
+{
+  "graphql": {
+    "execution_mode": "supergraph",
+    "supergraph": {
+      "subgraphs": [
+        { "name": "users", "url": "http://users.internal/graphql",
+          "sdl": "type Query { user(id: ID!): User } type User @key(fields: \"id\") { id: ID! name: String }" },
+        { "name": "reviews", "url": "http://reviews.internal/graphql",
+          "sdl": "type Query { topReviews: [Review!]! } type Review { body: String } type User @key(fields: \"id\") { id: ID! @external reviews: [Review!] }",
+          "headers": { "authorization": "Bearer token" },
+          "timeout_ms": 5000, "max_response_bytes": 1048576 }
+      ]
+    }
+  }
+}
+```
+
+Per subgraph: `name` (unique; the only thing clients ever see in errors),
+`url` (absolute `http(s)`), `sdl` (pasted, so composition is deterministic
+and validated at write time), optional `headers` (literal values, upstream
+auth), `timeout_ms` (default: the API's `upstream_timeout_ms`) and
+`max_response_bytes` (default 4 MiB) per fetch.
+
+Semantics and limits (all violations are loud config errors, ADR-0011):
+
+- **Composition v1**: root types must be named `Query`/`Mutation`; a root
+  field defined by two subgraphs is an error. An object type with `@key`
+  is an entity — fields merge across subgraphs with per-field ownership;
+  non-entity types must be structurally identical everywhere. Keys are
+  flat scalar field lists (no nested selections); the first resolvable
+  `@key` per subgraph is canonical. `@requires` and `@override` are
+  rejected; `@provides` is ignored (correct but unoptimized); interface
+  entities are not supported.
+- **Execution**: like udg mode, nothing is forwarded — `target_url` is
+  required but unused, and the proxy path's LB/discovery/health/breaker
+  do not apply to subgraph fetches. A subgraph failure degrades to
+  partial data: affected fields null per nullability with positioned
+  errors naming only the subgraph name; a subgraph's own `errors` are
+  appended message-only, prefixed with its name.
+- **`schema_sync` and enabled `subscriptions` are rejected** (composed
+  schemas have no single upstream; federated subscriptions are future
+  work). Persisted queries and the playground work against the composed
+  schema; persisted operations execute locally.
+- The gateway injects `__typename` and aliased key fields (`g2__<field>`)
+  into subgraph queries; subgraph responses are marginally larger than an
+  optimal planner would request.
+
 ## Interactions and limits
 
 - **Body buffering**: GraphQL POSTs are buffered to be parsed, capped at
@@ -322,6 +406,7 @@ Worth knowing:
   tooling sends deep introspection documents.
 - **Methods**: a GraphQL API answers `GET` and `POST`; other methods get
   `405` (CORS preflights are handled by the CORS layer above).
-- **Not yet**: federation, APQ, request batching, GraphQL-aware caching,
-  nested-field (non-root) UDG data sources — all tracked as M9 roadmap
-  boxes.
+- **Not yet**: APQ, request batching, GraphQL-aware caching, nested-field
+  (non-root) UDG data sources, interface entities / `@requires` /
+  federated subscriptions — all tracked as M9 roadmap boxes or ADR-0011
+  future work.

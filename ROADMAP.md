@@ -117,7 +117,9 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
 - [x] Universal Data Graph: gateway-executed stitching of REST/GraphQL upstreams
       (root-field data sources, minijinja templates — ADR-0010,
       `docs/graphql.md` §Universal Data Graph)
-- [ ] Federation: supergraph/subgraph support
+- [x] Federation: supergraph/subgraph support (`subgraph` + `supergraph`
+      execution modes: gateway-side composition and `_entities` execution —
+      ADR-0011, `docs/graphql.md` §Federation)
 - [ ] GraphQL-aware response caching
 - [ ] Stretch: query complexity/cost limits; automatic persisted
       queries (APQ)
@@ -1192,3 +1194,35 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   nested-field sources/batching, REST `data_path`, per-source
   LB/health/breaker, udg subscriptions. Next M9 box: federation, or
   GraphQL-aware response caching.
+- **2026-09-02 (4)** — M9 federation landed (ADR-0011, `docs/graphql.md`
+  §Federation): two new execution modes. **`subgraph`** = proxy mode with a
+  federation-aware schema: `g2_core::federation` injects missing federation
+  directive/type definitions and augments the SDL with `_service`/
+  `_entities` + the `_Entity` union (idempotent — an already-expanded SDL
+  round-trips), so a federating router's reserved queries validate and are
+  policed like any operation; schema sync/subscriptions keep working.
+  **`supergraph`** = the gateway as router: `graphql.supergraph.subgraphs
+  [{name, url, sdl, headers, timeout_ms, max_response_bytes}]`, composed at
+  write/load time (`federation::compose` — root fields single-owner, entity
+  fields merged with per-field ownership + per-subgraph canonical keys,
+  value types must be identical, fed directives stripped, composed SDL
+  re-validated as the final gate; `graphql.schema` gained
+  `#[serde(default)]` and must be **empty** here). Execution extends the
+  ADR-0010 engine: record (reused) → **plan** (new
+  `graphql_federation::Planner` splits selection trees by ownership,
+  inlines fragments, injects `__typename` + collision-proof `g2__<key>`
+  aliases) → fetch (owner per root field; per level one batched
+  `_entities` POST per (entity, target) with a collision-proof
+  `$g2_representations` var, grandchildren resolve on the owned entity
+  values pre-merge, mask-aligned merge walk) → stitch (reused,
+  ResponseKey). Failures: partial data, errors name only the subgraph.
+  Rejected loudly in v1: @requires/@override, interface entities, nested
+  keys, shared root fields, non-Query/Mutation roots, subgraph
+  Subscription roots; @provides ignored. Engine rides `UdgFetch` (static
+  headers, schema-sync precedent); no new deps anywhere. ~30 new tests
+  (8 federation-core, 12 config, 10 executor + subgraph layer test) +
+  4-case `graphql_federation_e2e.rs` (real gateway + two real subgraph
+  upstreams: stitch with upstream-body assertions, local introspection,
+  dead-subgraph partial data, subgraph-mode reserved-query passthrough).
+  Next M9 box: GraphQL-aware response caching, or the stretch items
+  (complexity limits, APQ).

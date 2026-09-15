@@ -368,7 +368,7 @@ pub(crate) async fn execute(
 }
 
 /// Serializes an [`ExecutionResponse`] as the `200 application/json` reply.
-fn execution_response(response: &ExecutionResponse) -> Response<ProxyBody> {
+pub(crate) fn execution_response(response: &ExecutionResponse) -> Response<ProxyBody> {
     match serde_json::to_vec(response) {
         Ok(body) => {
             let mut resp =
@@ -387,23 +387,23 @@ fn execution_response(response: &ExecutionResponse) -> Response<ProxyBody> {
 }
 
 /// One root field the recording pass observed.
-struct RecordedField {
+pub(crate) struct RecordedField {
     /// The alias-aware key the field answers under.
-    response_key: String,
+    pub(crate) response_key: String,
     /// The schema field name (the data-source lookup key's second half).
-    field_name: String,
+    pub(crate) field_name: String,
     /// The engine-coerced arguments (variables substituted, defaults
     /// applied) — the `args` template context.
-    args: JsonMap,
+    pub(crate) args: JsonMap,
     /// The merged field selections, cloned so the fetch phase can print a
     /// GraphQL source's sub-query.
-    selections: Vec<Field>,
+    pub(crate) selections: Vec<Field>,
 }
 
 /// Phase-1 resolver: records each collected root field and skips it.
-struct Recorder<'a> {
-    fields: RefCell<Vec<RecordedField>>,
-    root_type: &'a str,
+pub(crate) struct Recorder<'a> {
+    pub(crate) fields: RefCell<Vec<RecordedField>>,
+    pub(crate) root_type: &'a str,
 }
 
 impl ObjectValue for Recorder<'_> {
@@ -434,16 +434,16 @@ impl ObjectValue for Recorder<'_> {
 }
 
 /// One fetched root field, ready for the stitch pass.
-struct FetchOutcome {
-    response_key: String,
+pub(crate) struct FetchOutcome {
+    pub(crate) response_key: String,
     /// The JSON the source produced, or the field error to report.
-    value: Result<JsonValue, FieldError>,
+    pub(crate) value: Result<JsonValue, FieldError>,
     /// How nested selections key into the JSON (source-kind dependent).
-    key_by: KeyBy,
+    pub(crate) key_by: KeyBy,
     /// The originating source key, for nested-projection error messages.
-    source_key: String,
+    pub(crate) source_key: String,
     /// Errors a GraphQL source reported, appended to the stitched response.
-    upstream_errors: Vec<GraphQLError>,
+    pub(crate) upstream_errors: Vec<GraphQLError>,
 }
 
 /// Fetches one recorded root field from its mapped data source.
@@ -699,17 +699,17 @@ async fn fetch_graphql(
 /// by schema field name (the upstream knows nothing of aliases); a GraphQL
 /// upstream already honored aliases, so its tree keys by response key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum KeyBy {
+pub(crate) enum KeyBy {
     FieldName,
     ResponseKey,
 }
 
 /// Phase-3 root resolver: hands each root field its prefetched JSON.
-struct PrefetchedRoot<'a> {
-    root_type: &'a str,
+pub(crate) struct PrefetchedRoot<'a> {
+    pub(crate) root_type: &'a str,
     /// Response key → the fetch outcome, taken once when the engine asks
     /// (the engine resolves each collected field exactly once).
-    values: HashMap<String, RefCell<Option<FetchOutcome>>>,
+    pub(crate) values: HashMap<String, RefCell<Option<FetchOutcome>>>,
 }
 
 impl ObjectValue for PrefetchedRoot<'_> {
@@ -875,7 +875,7 @@ fn resolve_named<'a>(
     }
 }
 
-fn field_error(message: String) -> FieldError {
+pub(crate) fn field_error(message: String) -> FieldError {
     FieldError { message }
 }
 
@@ -974,7 +974,7 @@ fn collect_set(
     }
 }
 
-fn collect_directives(directives: &ast::DirectiveList, vars: &mut HashSet<Name>) {
+pub(crate) fn collect_directives(directives: &ast::DirectiveList, vars: &mut HashSet<Name>) {
     for directive in directives.iter() {
         for arg in &directive.arguments {
             collect_value(&arg.value, vars);
@@ -982,7 +982,7 @@ fn collect_directives(directives: &ast::DirectiveList, vars: &mut HashSet<Name>)
     }
 }
 
-fn collect_value(value: &ast::Value, vars: &mut HashSet<Name>) {
+pub(crate) fn collect_value(value: &ast::Value, vars: &mut HashSet<Name>) {
     match value {
         ast::Value::Variable(name) => {
             vars.insert(name.clone());

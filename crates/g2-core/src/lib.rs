@@ -26,6 +26,7 @@ pub mod body_transform;
 pub mod config;
 pub mod endpoints;
 mod error;
+pub mod federation;
 pub mod graphql;
 pub mod loader;
 pub mod plugins;
@@ -46,7 +47,8 @@ pub use endpoints::{EndpointRateLimit, MockResponse, PathRule};
 pub use error::Error;
 pub use graphql::{
     GraphQlConfig, GraphQlExecutionMode, PersistedQuery, PlaygroundConfig, SchemaSyncConfig,
-    SubscriptionsConfig, UdgDataSource, UdgGraphQlSource, UdgRestSource,
+    SubgraphConfig, SubscriptionsConfig, SupergraphConfig, UdgDataSource, UdgGraphQlSource,
+    UdgRestSource,
 };
 pub use plugins::{PluginRef, PluginsConfig};
 pub use policy::Policy;

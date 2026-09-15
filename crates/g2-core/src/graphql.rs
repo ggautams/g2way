@@ -51,9 +51,6 @@ fn default_true() -> bool {
 }
 
 /// How the gateway executes GraphQL for an API.
-///
-/// The enum is the extension point for later M9 modes (federation
-/// supergraph and subgraph).
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +67,21 @@ pub enum GraphQlExecutionMode {
     /// into one GraphQL response. Nothing is forwarded to
     /// [`target_url`](crate::ApiDefinition::target_url) (ADR-0010).
     Udg,
+
+    /// Apollo Federation subgraph: proxy-mode behavior, but
+    /// [`schema`](GraphQlConfig::schema) is federation SDL (`@key` and
+    /// friends) and is augmented with the reserved federation machinery
+    /// (`_service`, `_entities`) so a federating router's requests validate
+    /// and are policed like any others (ADR-0011). The upstream must
+    /// implement the federation service spec itself.
+    Subgraph,
+
+    /// Apollo Federation supergraph: the gateway composes the SDLs in
+    /// [`supergraph`](GraphQlConfig::supergraph) into one schema and
+    /// executes federated queries itself, resolving cross-subgraph entity
+    /// fields via `_entities` fetches. Nothing is forwarded to
+    /// [`target_url`](crate::ApiDefinition::target_url) (ADR-0011).
+    Supergraph,
 }
 
 /// GraphQL settings for one API (see [`ApiDefinition::graphql`]).
@@ -105,9 +117,13 @@ pub struct GraphQlConfig {
     #[serde(default)]
     pub execution_mode: GraphQlExecutionMode,
 
-    /// The API's GraphQL schema in SDL form. Required; validated with
-    /// apollo-compiler at write/load time. Incoming queries are validated
-    /// against it — an unknown field or type never reaches the upstream.
+    /// The API's GraphQL schema in SDL form; validated with apollo-compiler
+    /// at write/load time. Incoming queries are validated against it — an
+    /// unknown field or type never reaches the upstream. Required in every
+    /// execution mode except `supergraph`, where it must be **empty**: the
+    /// supergraph schema is composed from
+    /// [`supergraph`](Self::supergraph), never authored (ADR-0011).
+    #[serde(default)]
     pub schema: String,
 
     /// Whether introspection queries (`__schema` / `__type`) are allowed.
@@ -160,6 +176,131 @@ pub struct GraphQlConfig {
     /// mutation root types must be mapped (ADR-0010).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub data_sources: BTreeMap<String, UdgDataSource>,
+
+    /// Federation supergraph settings. Required (and only allowed) when
+    /// [`execution_mode`](Self::execution_mode) is
+    /// [`Supergraph`](GraphQlExecutionMode::Supergraph) (ADR-0011).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supergraph: Option<SupergraphConfig>,
+}
+
+/// Federation supergraph settings (see [`GraphQlConfig::supergraph`]).
+///
+/// # Example (JSON)
+///
+/// ```json
+/// {
+///   "subgraphs": [
+///     { "name": "users", "url": "http://users.internal/graphql",
+///       "sdl": "type Query { user(id: ID!): User } type User @key(fields: \"id\") { id: ID! name: String }" },
+///     { "name": "reviews", "url": "http://reviews.internal/graphql",
+///       "sdl": "type User @key(fields: \"id\") { id: ID! @external reviews: [String!] } type Query { noop: Int }" }
+///   ]
+/// }
+/// ```
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SupergraphConfig {
+    /// The subgraphs to compose, in composition order. At least one.
+    pub subgraphs: Vec<SubgraphConfig>,
+}
+
+/// One subgraph of a federation supergraph.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SubgraphConfig {
+    /// Unique name of the subgraph — used in composition errors and in the
+    /// field errors clients see when a subgraph fetch fails (upstream URLs
+    /// are never exposed).
+    pub name: String,
+
+    /// Absolute `http(s)` URL of the subgraph's GraphQL endpoint.
+    pub url: String,
+
+    /// The subgraph's federation SDL (`@key` and friends), pasted into the
+    /// definition so composition is deterministic and validated at write
+    /// time (ADR-0011).
+    pub sdl: String,
+
+    /// Extra headers on every fetch to this subgraph (upstream auth): name
+    /// → literal value. Hop-by-hop headers are rejected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+
+    /// Per-fetch timeout in milliseconds (must be > 0). Unset = the API's
+    /// `upstream_timeout_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+
+    /// Cap on a response body in bytes (must be > 0). Unset =
+    /// [`DEFAULT_UDG_MAX_RESPONSE_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<u64>,
+}
+
+impl SupergraphConfig {
+    /// Validates the per-subgraph settings (composition itself is checked
+    /// by the caller via [`crate::federation::compose`]).
+    fn validate(&self, fail: &impl Fn(String) -> Error) -> Result<(), Error> {
+        for (index, sub) in self.subgraphs.iter().enumerate() {
+            let field = |name: &str| format!("graphql.supergraph.subgraphs[{index}].{name}");
+            if sub.name.trim().is_empty() {
+                return Err(fail(format!("`{}` must not be empty", field("name"))));
+            }
+            let valid = (sub.url.starts_with("http://") || sub.url.starts_with("https://"))
+                && sub.url.parse::<http::Uri>().is_ok();
+            if !valid {
+                return Err(fail(format!(
+                    "`{}` must be an absolute http(s) URL, got `{}`",
+                    field("url"),
+                    sub.url
+                )));
+            }
+            for (name, value) in &sub.headers {
+                if HeaderName::from_bytes(name.as_bytes()).is_err() {
+                    return Err(fail(format!(
+                        "`{}` name is not a valid header name: `{name}`",
+                        field("headers")
+                    )));
+                }
+                if HOP_BY_HOP.iter().any(|h| h.eq_ignore_ascii_case(name)) {
+                    return Err(fail(format!(
+                        "`{}` must not set hop-by-hop header `{name}`",
+                        field("headers")
+                    )));
+                }
+                if HeaderValue::from_str(value).is_err() {
+                    return Err(fail(format!(
+                        "`{}` value for `{name}` is not a valid header value",
+                        field("headers")
+                    )));
+                }
+            }
+            if sub.timeout_ms == Some(0) {
+                return Err(fail(format!(
+                    "`{}` must be greater than zero (omit it to inherit the API's \
+                     `upstream_timeout_ms`)",
+                    field("timeout_ms")
+                )));
+            }
+            if sub.max_response_bytes == Some(0) {
+                return Err(fail(format!(
+                    "`{}` must be greater than zero",
+                    field("max_response_bytes")
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The `(name, sdl)` pairs [`crate::federation::compose`] takes.
+    #[must_use]
+    pub fn composition_inputs(&self) -> Vec<(String, String)> {
+        self.subgraphs
+            .iter()
+            .map(|s| (s.name.clone(), s.sdl.clone()))
+            .collect()
+    }
 }
 
 /// GraphQL-subscriptions-over-WebSocket settings (see
@@ -583,26 +724,23 @@ impl GraphQlConfig {
     /// variables template, a schema-sync setting is invalid (zero
     /// interval/timeout, non-http(s) URL, bad or hop-by-hop header), a
     /// subscriptions message cap is zero, subscriptions are enabled on a
-    /// schema without a `Subscription` root type, `data_sources` is set in
-    /// proxy mode, or a `udg`-mode rule fails (schema sync or enabled
-    /// subscriptions present, a data source missing, unknown, or invalid,
-    /// or a persisted query selecting a subscription).
+    /// schema without a `Subscription` root type, `data_sources` or
+    /// `supergraph` is set outside its execution mode, a `udg`-mode rule
+    /// fails (schema sync or enabled subscriptions present, a data source
+    /// missing, unknown, or invalid, or a persisted query selecting a
+    /// subscription), a `subgraph`-mode schema fails federation
+    /// augmentation, or a `supergraph`-mode rule fails (non-empty schema,
+    /// missing or invalid `supergraph` block, composition error, schema
+    /// sync or enabled subscriptions present).
     pub fn validate(&self, api: &str) -> Result<(), Error> {
         let fail = |reason: String| Error::InvalidApiDefinition {
             api: api.to_owned(),
             reason,
         };
 
-        if self.schema.trim().is_empty() {
-            return Err(fail("`graphql.schema` must not be empty".into()));
-        }
-        let schema = apollo_compiler::Schema::parse_and_validate(&self.schema, "schema.graphql")
-            .map_err(|e| {
-                fail(format!(
-                    "`graphql.schema` is not a valid GraphQL schema: {}",
-                    diagnostic_reasons(&e.errors)
-                ))
-            })?;
+        // The effective schema — parsed, augmented, or composed by mode —
+        // that persisted queries and subscription checks validate against.
+        let schema = self.effective_schema(&fail)?;
 
         if self.max_query_depth == Some(0) {
             return Err(fail(
@@ -611,14 +749,19 @@ impl GraphQlConfig {
             ));
         }
 
+        if self.supergraph.is_some() && self.execution_mode != GraphQlExecutionMode::Supergraph {
+            return Err(fail(
+                "`graphql.supergraph` requires `execution_mode: \"supergraph\"`".into(),
+            ));
+        }
+        if !self.data_sources.is_empty() && self.execution_mode != GraphQlExecutionMode::Udg {
+            return Err(fail(
+                "`graphql.data_sources` requires `execution_mode: \"udg\"`".into(),
+            ));
+        }
+
         match self.execution_mode {
-            GraphQlExecutionMode::Proxy => {
-                if !self.data_sources.is_empty() {
-                    return Err(fail(
-                        "`graphql.data_sources` requires `execution_mode: \"udg\"`".into(),
-                    ));
-                }
-            }
+            GraphQlExecutionMode::Proxy | GraphQlExecutionMode::Subgraph => {}
             GraphQlExecutionMode::Udg => {
                 if self.schema_sync.is_some() {
                     return Err(fail(
@@ -635,6 +778,22 @@ impl GraphQlConfig {
                     ));
                 }
                 self.validate_data_sources(&schema, &fail)?;
+            }
+            GraphQlExecutionMode::Supergraph => {
+                if self.schema_sync.is_some() {
+                    return Err(fail(
+                        "`graphql.schema_sync` is not supported in `supergraph` execution \
+                         mode — there is no single upstream to introspect (ADR-0011)"
+                            .into(),
+                    ));
+                }
+                if self.subscriptions.as_ref().is_some_and(|s| s.enabled) {
+                    return Err(fail(
+                        "`graphql.subscriptions` cannot be enabled in `supergraph` \
+                         execution mode (ADR-0011)"
+                            .into(),
+                    ));
+                }
             }
         }
 
@@ -665,7 +824,11 @@ impl GraphQlConfig {
 
         for (index, pq) in self.persisted_queries.iter().enumerate() {
             let doc = pq.validate(&schema, index, &fail)?;
-            if self.execution_mode == GraphQlExecutionMode::Udg
+            let gateway_executed = matches!(
+                self.execution_mode,
+                GraphQlExecutionMode::Udg | GraphQlExecutionMode::Supergraph
+            );
+            if gateway_executed
                 && doc
                     .operations
                     .get(pq.operation_name.as_deref())
@@ -673,7 +836,7 @@ impl GraphQlConfig {
             {
                 return Err(fail(format!(
                     "`graphql.persisted_queries[{index}]` selects a subscription \
-                     operation, which `udg` execution mode cannot execute"
+                     operation, which gateway-executed modes cannot execute"
                 )));
             }
             if let Some(playground) = &self.playground {
@@ -687,6 +850,57 @@ impl GraphQlConfig {
             }
         }
         Ok(())
+    }
+
+    /// Derives and validates the mode's effective schema: the configured
+    /// SDL as-is (proxy/udg), federation-augmented (subgraph, ADR-0011 §2),
+    /// or composed from the subgraph SDLs (supergraph, ADR-0011 §4).
+    fn effective_schema(
+        &self,
+        fail: &impl Fn(String) -> Error,
+    ) -> Result<apollo_compiler::validation::Valid<apollo_compiler::Schema>, Error> {
+        match self.execution_mode {
+            GraphQlExecutionMode::Proxy | GraphQlExecutionMode::Udg => {
+                if self.schema.trim().is_empty() {
+                    return Err(fail("`graphql.schema` must not be empty".into()));
+                }
+                apollo_compiler::Schema::parse_and_validate(&self.schema, "schema.graphql").map_err(
+                    |e| {
+                        fail(format!(
+                            "`graphql.schema` is not a valid GraphQL schema: {}",
+                            diagnostic_reasons(&e.errors)
+                        ))
+                    },
+                )
+            }
+            GraphQlExecutionMode::Subgraph => {
+                if self.schema.trim().is_empty() {
+                    return Err(fail("`graphql.schema` must not be empty".into()));
+                }
+                crate::federation::augment_subgraph_sdl(&self.schema)
+                    .map(|(_, schema)| schema)
+                    .map_err(|e| fail(format!("`graphql.schema`: {e}")))
+            }
+            GraphQlExecutionMode::Supergraph => {
+                if !self.schema.trim().is_empty() {
+                    return Err(fail(
+                        "`graphql.schema` must be empty in `supergraph` execution mode — \
+                         the schema is composed from `graphql.supergraph.subgraphs` \
+                         (ADR-0011)"
+                            .into(),
+                    ));
+                }
+                let Some(sup) = &self.supergraph else {
+                    return Err(fail(
+                        "`supergraph` execution mode requires `graphql.supergraph`".into(),
+                    ));
+                };
+                sup.validate(fail)?;
+                crate::federation::compose(&sup.composition_inputs())
+                    .map(|composed| composed.schema)
+                    .map_err(|e| fail(format!("`graphql.supergraph`: {e}")))
+            }
+        }
     }
 
     /// Validates the UDG data-source map against the schema: every key must
@@ -1507,6 +1721,168 @@ mod tests {
                 "key `{key}`: expected `{needle}` in: {err}"
             );
         }
+    }
+
+    const SUBGRAPH_SDL: &str = "type Query { user(id: ID!): User } \
+                                type User @key(fields: \"id\") { id: ID! name: String }";
+
+    const OTHER_SDL: &str = "type Query { topUserIds: [ID!]! } \
+                             type User @key(fields: \"id\") \
+                             { id: ID! @external karma: Int }";
+
+    fn supergraph(mutator: impl FnOnce(&mut serde_json::Value)) -> GraphQlConfig {
+        let mut json = serde_json::json!({
+            "execution_mode": "supergraph",
+            "supergraph": {
+                "subgraphs": [
+                    { "name": "users", "url": "http://users.internal/graphql",
+                      "sdl": SUBGRAPH_SDL },
+                    { "name": "karma", "url": "http://karma.internal/graphql",
+                      "sdl": OTHER_SDL,
+                      "headers": { "authorization": "Bearer t" },
+                      "timeout_ms": 2000, "max_response_bytes": 65536 }
+                ]
+            }
+        });
+        mutator(&mut json);
+        parse(&json.to_string())
+    }
+
+    #[test]
+    fn subgraph_mode_validates_federation_sdl() {
+        let cfg = parse(
+            &serde_json::json!({
+                "execution_mode": "subgraph",
+                "schema": SUBGRAPH_SDL
+            })
+            .to_string(),
+        );
+        cfg.validate("api").expect("valid");
+
+        // The schema stays required.
+        let mut empty = cfg.clone();
+        empty.schema = String::new();
+        let err = empty.validate("api").unwrap_err().to_string();
+        assert!(err.contains("must not be empty"), "got: {err}");
+
+        // Plain proxy mode rejects the undeclared federation directives.
+        let mut proxy = cfg.clone();
+        proxy.execution_mode = GraphQlExecutionMode::Proxy;
+        assert!(proxy.validate("api").is_err(), "proxy mode must not inject");
+    }
+
+    #[test]
+    fn supergraph_config_round_trips_and_validates() {
+        let cfg = supergraph(|_| {});
+        cfg.validate("api").expect("valid");
+        assert_eq!(cfg.execution_mode, GraphQlExecutionMode::Supergraph);
+        let json = serde_json::to_string(&cfg).expect("serializes");
+        assert_eq!(parse(&json), cfg);
+
+        // Unset stays off the wire; a missing `schema` deserializes empty.
+        let bare = serde_json::to_string(&minimal()).expect("serializes");
+        assert!(!bare.contains("supergraph"));
+        assert!(cfg.schema.is_empty());
+    }
+
+    #[test]
+    fn supergraph_mode_rules_are_enforced() {
+        // A non-empty schema is refused (the schema is composed).
+        let with_schema = supergraph(|json| {
+            json["schema"] = "type Query { x: Int }".into();
+        });
+        let err = with_schema.validate("api").unwrap_err().to_string();
+        assert!(err.contains("must be empty"), "got: {err}");
+
+        // The block is required…
+        let missing = parse(&serde_json::json!({ "execution_mode": "supergraph" }).to_string());
+        let err = missing.validate("api").unwrap_err().to_string();
+        assert!(err.contains("requires `graphql.supergraph`"), "got: {err}");
+
+        // …and only allowed in supergraph mode.
+        let misplaced = supergraph(|json| {
+            json["execution_mode"] = "proxy".into();
+            json["schema"] = SCHEMA.into();
+        });
+        let err = misplaced.validate("api").unwrap_err().to_string();
+        assert!(
+            err.contains("requires `execution_mode: \"supergraph\"`"),
+            "got: {err}"
+        );
+
+        // Composition failures surface (duplicate root field).
+        let clash = supergraph(|json| {
+            json["supergraph"]["subgraphs"][1]["sdl"] = "type Query { user(id: ID!): Int }".into();
+        });
+        let err = clash.validate("api").unwrap_err().to_string();
+        assert!(err.contains("defined by both"), "got: {err}");
+
+        // schema_sync and enabled subscriptions are rejected.
+        let sync = supergraph(|json| {
+            json["schema_sync"] = serde_json::json!({});
+        });
+        let err = sync.validate("api").unwrap_err().to_string();
+        assert!(err.contains("schema_sync"), "got: {err}");
+        let subs = supergraph(|json| {
+            json["subscriptions"] = serde_json::json!({});
+        });
+        let err = subs.validate("api").unwrap_err().to_string();
+        assert!(err.contains("subscriptions"), "got: {err}");
+
+        // Per-subgraph field rules.
+        for (needle, mutate) in [
+            (
+                "name",
+                serde_json::json!({ "name": " ", "url": "http://x/", "sdl": "type Query { a: Int }" }),
+            ),
+            (
+                "url",
+                serde_json::json!({ "name": "x", "url": "ftp://x/", "sdl": "type Query { a: Int }" }),
+            ),
+            (
+                "hop-by-hop",
+                serde_json::json!({ "name": "x", "url": "http://x/", "sdl": "type Query { a: Int }",
+                                    "headers": { "Connection": "close" } }),
+            ),
+            (
+                "timeout_ms",
+                serde_json::json!({ "name": "x", "url": "http://x/", "sdl": "type Query { a: Int }",
+                                    "timeout_ms": 0 }),
+            ),
+            (
+                "max_response_bytes",
+                serde_json::json!({ "name": "x", "url": "http://x/", "sdl": "type Query { a: Int }",
+                                    "max_response_bytes": 0 }),
+            ),
+        ] {
+            let cfg = supergraph(|json| {
+                json["supergraph"]["subgraphs"][1] = mutate.clone();
+            });
+            let err = cfg.validate("api").unwrap_err().to_string();
+            assert!(err.contains(needle), "expected `{needle}` in: {err}");
+        }
+    }
+
+    #[test]
+    fn supergraph_persisted_queries_validate_against_the_composed_schema() {
+        // `karma` comes from the second subgraph, `name` from the first —
+        // only the composed schema has both.
+        let cfg = supergraph(|json| {
+            json["persisted_queries"] = serde_json::json!([{
+                "method": "GET",
+                "path": "/u/{id}",
+                "operation": "query U($id: ID!) { user(id: $id) { name karma } }",
+                "variables": { "id": "$path.id" }
+            }]);
+        });
+        cfg.validate("api").expect("valid against composed schema");
+
+        let bad = supergraph(|json| {
+            json["persisted_queries"] = serde_json::json!([{
+                "method": "GET", "path": "/x", "operation": "{ nonexistent }"
+            }]);
+        });
+        assert!(bad.validate("api").is_err());
     }
 
     #[test]
