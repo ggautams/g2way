@@ -27,6 +27,11 @@
 //!    operation over plain HTTP is rejected (`400`) — it can only execute
 //!    over a WebSocket.
 //!
+//! In `udg` execution mode (ADR-0010) steps 3 and 4 do not forward: after
+//! the same policing, the gateway executes the operation itself against
+//! the API's data sources (the `graphql_udg` module, ADR-0010) and
+//! `inner` is never called.
+//!
 //! Like [`transform_body`](crate::transform_body), this layer buffers a
 //! request body. The buffering is bounded (the API's
 //! `max_request_body_bytes`, else 1 MiB) and the exact bytes are
@@ -54,10 +59,11 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use apollo_compiler::executable::{ExecutableDocument, Selection, SelectionSet};
+use apollo_compiler::response::{JsonMap, JsonValue};
 use apollo_compiler::validation::Valid;
 use apollo_compiler::{Name, Schema};
 use bytes::Bytes;
-use g2_core::graphql::GraphQlConfig;
+use g2_core::graphql::{GraphQlConfig, GraphQlExecutionMode};
 use g2_core::session::{ApiAccess, TypeFields};
 use g2_core::{ApiDefinition, Error};
 use http::{header, HeaderMap, HeaderValue, Method, Request, Response, StatusCode, Uri};
@@ -126,6 +132,11 @@ pub(crate) struct GraphQlShared {
     subscriptions_enabled: bool,
     /// Cap on one client→gateway WebSocket message, in bytes.
     pub(crate) ws_max_message_bytes: usize,
+    /// Universal Data Graph execution state; `Some` iff
+    /// `execution_mode: "udg"` (ADR-0010). Schema-independent on purpose:
+    /// udg mode rejects `schema_sync` at validation, so the schema leaf
+    /// above never swaps for a UDG API.
+    udg: Option<Arc<crate::graphql_udg::UdgEngine>>,
 }
 
 /// The schema-dependent half of [`GraphQlShared`], swapped wholesale by a
@@ -194,19 +205,43 @@ impl GraphQlLayer {
     /// persisted endpoint's path regex and operation. Returns `Ok(None)`
     /// when the config is disabled, leaving the API's chain unchanged.
     ///
+    /// `udg_fetch` is the data-source HTTP seam (supplied by the proxy
+    /// crate); it is required only when `execution_mode` is `udg`.
+    ///
     /// # Errors
     ///
-    /// Returns [`Error::InvalidApiDefinition`] when the schema or a
-    /// persisted operation does not compile — normally impossible after
-    /// [`GraphQlConfig::validate`], but route building must not panic on a
-    /// definition that skipped validation.
-    pub fn from_config(config: &GraphQlConfig, def: &ApiDefinition) -> Result<Option<Self>, Error> {
+    /// Returns [`Error::InvalidApiDefinition`] when the schema, a persisted
+    /// operation, or a UDG data source does not compile — normally
+    /// impossible after [`GraphQlConfig::validate`], but route building
+    /// must not panic on a definition that skipped validation — or when
+    /// `udg` mode is configured without a fetcher.
+    pub fn from_config(
+        config: &GraphQlConfig,
+        def: &ApiDefinition,
+        udg_fetch: Option<crate::SharedUdgFetch>,
+    ) -> Result<Option<Self>, Error> {
         if !config.enabled {
             return Ok(None);
         }
         let fail = |reason: String| Error::InvalidApiDefinition {
             api: def.api_id.clone(),
             reason,
+        };
+
+        let udg = match config.execution_mode {
+            GraphQlExecutionMode::Proxy => None,
+            GraphQlExecutionMode::Udg => {
+                let fetch = udg_fetch.ok_or_else(|| {
+                    fail(
+                        "`udg` execution mode requires a data-source fetcher \
+                          (not wired in this build path)"
+                            .into(),
+                    )
+                })?;
+                Some(Arc::new(crate::graphql_udg::UdgEngine::compile(
+                    config, def, fetch,
+                )?))
+            }
         };
 
         let schema = Schema::parse_and_validate(&config.schema, "schema.graphql").map_err(|e| {
@@ -313,6 +348,7 @@ impl GraphQlLayer {
                         .unwrap_or(DEFAULT_MAX_BODY_BYTES),
                 )
                 .unwrap_or(usize::MAX),
+                udg,
             }),
         }))
     }
@@ -437,14 +473,39 @@ where
                     .variables
                     .as_ref()
                     .map(|t| substitute_variables(t, &caps, req.headers()));
+                // In udg mode the gateway executes the persisted operation
+                // itself (ADR-0010); otherwise it is forwarded upstream.
+                if let Some(udg) = &shared.udg {
+                    let vars = match variables.map(JsonValue::from) {
+                        Some(JsonValue::Object(map)) => map,
+                        // Validation guarantees an object template.
+                        _ => JsonMap::new(),
+                    };
+                    let meta = crate::graphql_udg::RequestMeta::capture(&req);
+                    return Ok(crate::graphql_udg::execute(
+                        udg,
+                        &state,
+                        &state.persisted_docs[index],
+                        p.operation_name.as_deref(),
+                        vars,
+                        meta,
+                    )
+                    .await);
+                }
                 return inner
                     .call(rewrite_persisted(req, &shared, p, variables))
                     .await;
             }
 
             // 4. A plain GraphQL request: extract the query, validate,
-            // police, forward the original bytes.
-            let (query, operation_name, req) = match extract_query(req, &shared).await {
+            // police, then forward the original bytes (proxy mode) or
+            // execute against the data sources (udg mode, ADR-0010).
+            let ExtractedQuery {
+                query,
+                operation_name,
+                variables,
+                req,
+            } = match extract_query(req, &shared).await {
                 Ok(ok) => ok,
                 Err(resp) => return Ok(resp),
             };
@@ -479,6 +540,22 @@ where
             if let Some(resp) = enforce(&shared, grants.as_ref(), &doc) {
                 return Ok(resp);
             }
+            if let Some(udg) = &shared.udg {
+                let vars = match parse_raw_variables(variables) {
+                    Ok(vars) => vars,
+                    Err(resp) => return Ok(*resp),
+                };
+                let meta = crate::graphql_udg::RequestMeta::capture(&req);
+                return Ok(crate::graphql_udg::execute(
+                    udg,
+                    &state,
+                    &doc,
+                    operation_name.as_deref(),
+                    vars,
+                    meta,
+                )
+                .await);
+            }
             inner.call(req).await
         })
     }
@@ -495,7 +572,7 @@ fn playground_page(pg: &PlaygroundPage) -> Response<ProxyBody> {
 }
 
 /// Builds a GraphQL-style error response: `{"errors": [{"message": …}, …]}`.
-fn graphql_errors<I>(status: StatusCode, messages: I) -> Response<ProxyBody>
+pub(crate) fn graphql_errors<I>(status: StatusCode, messages: I) -> Response<ProxyBody>
 where
     I: IntoIterator,
     I::Item: Into<String>,
@@ -514,14 +591,60 @@ where
     resp
 }
 
-/// Pulls the GraphQL query (and the selected `operationName`, if any) out
-/// of a request, returning them together with the request to forward:
-/// untouched for `GET`, rebuilt around the buffered body bytes for `POST`
-/// (so the upstream sees the exact original payload).
+/// A GraphQL request pulled apart by [`extract_query`].
+struct ExtractedQuery {
+    query: String,
+    operation_name: Option<String>,
+    /// The request's variables, kept raw: proxy mode forwards the original
+    /// bytes untouched, so these are parsed into a map only when the
+    /// gateway itself executes (udg mode).
+    variables: Option<RawVariables>,
+    /// The request to forward: untouched for `GET`, rebuilt around the
+    /// buffered body bytes for `POST`.
+    req: Request<ProxyBody>,
+}
+
+/// Raw request variables: pre-parsed JSON when they rode a `POST` envelope,
+/// URL-decoded text from a `GET` `?variables=` parameter.
+enum RawVariables {
+    Parsed(JsonValue),
+    Text(String),
+}
+
+/// Maps raw variables to the executor's map shape: absent or JSON `null`
+/// is the empty map, anything but an object is a `400` (udg mode only —
+/// proxy mode never parses variables). The error response is boxed to keep
+/// the happy-path return slim (clippy `result_large_err`).
+fn parse_raw_variables(raw: Option<RawVariables>) -> Result<JsonMap, Box<Response<ProxyBody>>> {
+    let value = match raw {
+        None => return Ok(JsonMap::new()),
+        Some(RawVariables::Parsed(value)) => value,
+        Some(RawVariables::Text(text)) => match serde_json::from_str::<JsonValue>(&text) {
+            Ok(value) => value,
+            Err(e) => {
+                return Err(Box::new(graphql_errors(
+                    StatusCode::BAD_REQUEST,
+                    [format!("`variables` is not valid JSON: {e}")],
+                )));
+            }
+        },
+    };
+    match value {
+        JsonValue::Null => Ok(JsonMap::new()),
+        JsonValue::Object(map) => Ok(map),
+        _ => Err(Box::new(graphql_errors(
+            StatusCode::BAD_REQUEST,
+            ["`variables` must be a JSON object"],
+        ))),
+    }
+}
+
+/// Pulls the GraphQL query (with the selected `operationName` and raw
+/// variables, if any) out of a request.
 async fn extract_query(
     req: Request<ProxyBody>,
     shared: &GraphQlShared,
-) -> Result<(String, Option<String>, Request<ProxyBody>), Response<ProxyBody>> {
+) -> Result<ExtractedQuery, Response<ProxyBody>> {
     match *req.method() {
         // GraphQL over GET: the query rides the `query` parameter
         // (URL-encoded), the body stays untouched.
@@ -537,7 +660,18 @@ async fn extract_query(
                         .query()
                         .and_then(|raw| query_parameter(raw, "operationName"))
                         .filter(|n| !n.is_empty());
-                    Ok((query, operation_name, req))
+                    let variables = req
+                        .uri()
+                        .query()
+                        .and_then(|raw| query_parameter(raw, "variables"))
+                        .filter(|v| !v.trim().is_empty())
+                        .map(RawVariables::Text);
+                    Ok(ExtractedQuery {
+                        query,
+                        operation_name,
+                        variables,
+                        req,
+                    })
                 }
                 _ => Err(graphql_errors(
                     StatusCode::BAD_REQUEST,
@@ -556,6 +690,7 @@ async fn extract_query(
                 query: Option<String>,
                 #[serde(rename = "operationName")]
                 operation_name: Option<String>,
+                variables: Option<JsonValue>,
             }
             let envelope: Envelope = match serde_json::from_slice(&bytes) {
                 Ok(envelope) => envelope,
@@ -569,11 +704,12 @@ async fn extract_query(
                 }
             };
             match envelope.query.filter(|q| !q.trim().is_empty()) {
-                Some(query) => Ok((
+                Some(query) => Ok(ExtractedQuery {
                     query,
-                    envelope.operation_name.filter(|n| !n.is_empty()),
-                    Request::from_parts(parts, ProxyBody::new(Full::new(bytes))),
-                )),
+                    operation_name: envelope.operation_name.filter(|n| !n.is_empty()),
+                    variables: envelope.variables.map(RawVariables::Parsed),
+                    req: Request::from_parts(parts, ProxyBody::new(Full::new(bytes))),
+                }),
                 None => Err(graphql_errors(
                     StatusCode::BAD_REQUEST,
                     ["the request is missing a GraphQL query"],
@@ -1005,7 +1141,7 @@ mod tests {
     fn layer(graphql: serde_json::Value) -> GraphQlLayer {
         let def = definition(graphql);
         def.validate().expect("valid definition");
-        GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def)
+        GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
             .expect("compiles")
             .expect("enabled")
     }
@@ -1326,7 +1462,7 @@ mod tests {
         // The layer's own cap (from max_request_body_bytes).
         let mut def = definition(base_config());
         def.max_request_body_bytes = Some(24);
-        let layer = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def)
+        let layer = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
             .expect("compiles")
             .expect("enabled");
         let resp = send(&layer, post("{ user(id: \"1\") { name } }")).await;
@@ -1463,7 +1599,7 @@ mod tests {
         let mut def = definition(base_config());
         def.graphql.as_mut().expect("set").enabled = false;
         assert!(
-            GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def)
+            GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
                 .expect("compiles")
                 .is_none()
         );

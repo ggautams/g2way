@@ -3,12 +3,15 @@
 g2way can front a GraphQL upstream as a policing proxy (`proxy` mode):
 every request is parsed as GraphQL, validated against a schema you
 configure, and checked against depth limits, introspection rules, and
-per-key field permissions **before** it reaches the upstream. The gateway
-never executes GraphQL itself — valid, permitted requests are forwarded
-byte-for-byte.
+per-key field permissions **before** it reaches the upstream. In proxy
+mode the gateway never executes GraphQL itself — valid, permitted requests
+are forwarded byte-for-byte. In `udg` mode (Universal Data Graph, below)
+the gateway *is* the executor, stitching REST and GraphQL upstreams into
+one graph.
 
-Design decisions live in [ADR-0004](adr/0004-graphql.md). A runnable
-example definition is `examples/apis/graphql.json`.
+Design decisions live in [ADR-0004](adr/0004-graphql.md) (proxy mode and
+protections) and [ADR-0010](adr/0010-graphql-udg.md) (UDG execution). A
+runnable example definition is `examples/apis/graphql.json`.
 
 ## Enabling GraphQL on an API
 
@@ -33,7 +36,7 @@ Add a `graphql` block to the API definition:
 | Field | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Kill switch; `false` disables all GraphQL handling. |
-| `execution_mode` | `"proxy"` | Only `proxy` today (UDG/federation are later M9 work). |
+| `execution_mode` | `"proxy"` | `proxy` (forward to the upstream) or `udg` (the gateway executes; see below). Federation is later M9 work. |
 | `schema` | — (required) | The GraphQL schema, SDL. Validated at write/load time; requests are validated against it. |
 | `introspection_enabled` | `true` | `false` rejects `__schema`/`__type` queries with `403`. |
 | `max_query_depth` | unlimited | Nested selection-set levels (`{ a { b } }` = 2); deeper queries get `403`. |
@@ -41,6 +44,7 @@ Add a `graphql` block to the API definition:
 | `persisted_queries` | `[]` | GraphQL-as-REST endpoints (see below). |
 | `schema_sync` | off | Keep the schema in sync with the upstream via introspection (see below). |
 | `subscriptions` | off | GraphQL subscriptions over WebSocket, policed message by message (see below). |
+| `data_sources` | `{}` | UDG root-field → data-source map; required in (and exclusive to) `udg` mode (see below). |
 
 The whole listen path becomes the GraphQL endpoint: clients `POST` a JSON
 `{"query": …, "variables": …}` envelope to the listen root (or `GET` with
@@ -219,6 +223,92 @@ Worth knowing:
   graceful drain (expect reconnects on deploys), and there are no
   per-message analytics — the handshake is counted like any request.
 
+## Universal Data Graph
+
+With `"execution_mode": "udg"` (ADR-0010) the gateway executes queries
+itself: each requested **root field** (of `Query` or `Mutation`) is
+resolved by calling the data source mapped in `data_sources`, and the
+results are stitched into one spec-shaped GraphQL response. Nothing is
+forwarded — `target_url` stays required but is unused for traffic.
+
+```json
+"graphql": {
+  "execution_mode": "udg",
+  "schema": "type Query { user(id: ID!): User orders: [Order!] } \
+             type User { id: ID! name: String } \
+             type Order { id: ID! total: Float }",
+  "data_sources": {
+    "Query.user": {
+      "kind": "rest",
+      "url": "http://users.internal/users/{{ args.id }}",
+      "headers": { "x-caller": "{{ _g2.session.alias }}" }
+    },
+    "Query.orders": {
+      "kind": "graphql",
+      "url": "http://orders.internal/graphql",
+      "headers": { "authorization": "Bearer …" }
+    }
+  }
+}
+```
+
+Every non-meta field of the query and mutation root types must be mapped
+(`"<RootType>.<field>"` keys, using the schema's actual root type names) —
+an unmapped field is a config error, not a runtime null. Two source kinds:
+
+- **`rest`** — `method` (default `GET`), a templated `url` (the rendered
+  result must be absolute `http(s)`), templated `headers` values, and an
+  optional templated `body` (sent as `application/json` unless a
+  `content-type` header is configured). The response body is parsed as
+  JSON and becomes the field's value; nested selections are projected
+  from it by **schema field name** (aliases are applied by the gateway,
+  unselected JSON is pruned, and abstract-typed values must carry
+  `__typename`).
+- **`graphql`** — a fixed `url` plus templated `headers`. The gateway
+  `POST`s the root field's sub-selection as a standalone query — aliases,
+  arguments, referenced fragments, and the variable definitions the
+  subtree uses all round-trip — with the client's variables filtered to
+  that subset. The response's `data` is merged in; its `errors` are
+  appended to the stitched response (message-only, prefixed with the
+  source key).
+
+Templates are minijinja (the body-transform engine, ADR-0007),
+fuel-bounded and compiled at route-build time. The context is
+`{ args, _g2 }`: `args` are the field's coerced GraphQL arguments
+(variables substituted, defaults applied), `_g2` carries
+`method`/`path`/`query`/`headers` (lowercase name → first value) and
+`session.alias`.
+
+Per source, `timeout_ms` defaults to the API's `upstream_timeout_ms` and
+`max_response_bytes` to 4 MiB. A query's sources are fetched
+**concurrently**; a mutation's serially, in selection order (spec
+execution order).
+
+Worth knowing:
+
+- **Failures are per-field**: a source that cannot be reached, times out,
+  answers non-2xx, over-caps, or returns invalid JSON becomes a GraphQL
+  field error (with `path`) and a `null` — the rest of the query still
+  answers, HTTP `200`, per the spec. Error messages name only the source
+  key (`Query.user`); URLs, statuses, and bodies go to the gateway log.
+  Request-level failures (unknown `operationName`, bad `variables`,
+  variable-coercion errors) are `400`.
+- **Every protection still runs first**: auth, rate limits, depth limits,
+  introspection control, and per-key field grants reject *before* any
+  source is fetched. Introspection (`__schema`/`__type`) is answered by
+  the gateway from the compiled schema with zero upstream traffic.
+- **Persisted queries and the playground work unchanged** — persisted
+  operations execute locally through the same engine.
+- **`schema_sync` and enabled `subscriptions` are rejected** in udg mode
+  (there is no single upstream to introspect; streaming execution is a
+  later box). A `subscriptions` block with `"enabled": false` may stay.
+- Data-source fetches bypass the proxy path: load balancing, service
+  discovery, health eviction, retries, and the circuit breaker do not
+  apply to them (per-source resilience is future work).
+- Data-source templates are minijinja: `{{ args.id }}` interpolates a
+  field argument. Shape the schema to the REST response — there is
+  no `data_path` remapping yet.
+
 ## Interactions and limits
 
 - **Body buffering**: GraphQL POSTs are buffered to be parsed, capped at
@@ -232,5 +322,6 @@ Worth knowing:
   tooling sends deep introspection documents.
 - **Methods**: a GraphQL API answers `GET` and `POST`; other methods get
   `405` (CORS preflights are handled by the CORS layer above).
-- **Not yet**: UDG/federation, APQ, request batching — all tracked as M9
-  roadmap boxes.
+- **Not yet**: federation, APQ, request batching, GraphQL-aware caching,
+  nested-field (non-root) UDG data sources — all tracked as M9 roadmap
+  boxes.

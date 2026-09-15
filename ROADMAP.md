@@ -114,8 +114,9 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
       ADR-0008, `docs/graphql.md` §Schema sync)
 - [x] GraphQL subscriptions over WebSocket (terminate-and-police relay,
       both subprotocols — ADR-0009, `docs/graphql.md` §Subscriptions)
-- [ ] Universal Data Graph: gateway-executed stitching of REST/GraphQL upstreams
-      (needs an execution-engine ADR)
+- [x] Universal Data Graph: gateway-executed stitching of REST/GraphQL upstreams
+      (root-field data sources, minijinja templates — ADR-0010,
+      `docs/graphql.md` §Universal Data Graph)
 - [ ] Federation: supergraph/subgraph support
 - [ ] GraphQL-aware response caching
 - [ ] Stretch: query complexity/cost limits; automatic persisted
@@ -1157,3 +1158,37 @@ TLS connector (hyper-rustls). No WebSocket/upgrade passthrough yet (M8).
   workspace. Not done (deliberate, ADR-0009 consequences): per-message
   analytics/metrics, mid-tunnel grant re-checks, RFC 8441. Next M9 box:
   UDG (needs an execution-engine ADR first) or federation.
+- **2026-09-02 (3)** — M9 Universal Data Graph landed (ADR-0010,
+  `docs/graphql.md` §UDG), user-confirmed shape: REST + GraphQL data
+  sources on **root fields only** (nested data projected from the parent
+  JSON), minijinja templating. `execution_mode: "udg"` +
+  `data_sources {"<RootType>.<field>": {kind: rest|graphql, …}}`;
+  validation requires full root-field coverage and rejects
+  schema_sync/enabled-subscriptions in udg (so the ADR-0008 schema leaf
+  never swaps → `UdgEngine` lives schema-independent in `GraphQlShared`,
+  no third swappable leaf). **Big find:** apollo-compiler 1.32 ships a
+  public spec-compliant executor (`resolvers::Execution` — CollectFields,
+  @skip/@include, argument+result coercion, null propagation, error
+  paths, local introspection) — no hand-rolled projector, no new deps.
+  **Its async mode is unusable on our chain** (execution future holds
+  non-`Send` resolver state) → three-phase design: sync *record* pass
+  (resolver notes root fields + coerced args + merged selections, returns
+  `SkipForPartialExecution`) → `Send` *fetch* phase (join_all for
+  queries — concurrent, better than apollo's own serial engine — serial
+  for mutations) → sync *stitch* pass over the prefetched JSON
+  (`PrefetchedRoot`/`JsonNode`; REST trees key by field name, GraphQL
+  trees by response key; abstract types need upstream `__typename`).
+  GraphQL sources get the field's printed sub-selection + transitively
+  used fragments + used variable defs/values only (all-variables-used
+  validation makes over-sending an upstream error). Fetch seam =
+  `UdgFetch` trait inversion (JwksFetch pattern; `HttpUdgFetch` on the
+  h1 pool, threaded through `inner_layers`). `extract_query` now carries
+  `variables` (POST envelope + GET param; proxy mode still forwards
+  original bytes untouched). Source failures → per-field GraphQL errors
+  naming only the source key (detail logged, ADR-0005 §4). 17 udg units
+  + 9 g2-core config tests + 6-case `graphql_udg_e2e.rs`, **verified
+  live** (real binary stitched two REST fetches, variables through the
+  URL template, local introspection). Not done (deliberate, ADR-0010):
+  nested-field sources/batching, REST `data_path`, per-source
+  LB/health/breaker, udg subscriptions. Next M9 box: federation, or
+  GraphQL-aware response caching.

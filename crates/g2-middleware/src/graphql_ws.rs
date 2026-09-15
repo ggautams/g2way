@@ -481,7 +481,7 @@ mod tests {
         .expect("definition");
         def.validate().expect("valid definition");
         let config = def.graphql.clone().expect("graphql block");
-        GraphQlLayer::from_config(&config, &def)
+        GraphQlLayer::from_config(&config, &def, None)
             .expect("layer builds")
             .expect("enabled")
             .shared

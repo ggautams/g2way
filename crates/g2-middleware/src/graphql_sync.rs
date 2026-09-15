@@ -892,7 +892,7 @@ mod tests {
         )
         .expect("valid definition");
         def.validate().expect("valid definition");
-        let layer = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def)
+        let layer = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
             .expect("compiles")
             .expect("enabled");
         let handle = layer.sync_handle().expect("sync configured");
@@ -924,7 +924,7 @@ mod tests {
             .to_string(),
         )
         .expect("valid definition");
-        let plain = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def)
+        let plain = GraphQlLayer::from_config(def.graphql.as_ref().expect("set"), &def, None)
             .expect("compiles")
             .expect("enabled");
         assert!(plain.sync_handle().is_none());

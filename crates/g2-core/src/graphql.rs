@@ -30,6 +30,10 @@ pub const DEFAULT_SCHEMA_SYNC_INTERVAL_MS: u64 = 600_000;
 /// Default [`SchemaSyncConfig::timeout_ms`]: ten seconds.
 pub const DEFAULT_SCHEMA_SYNC_TIMEOUT_MS: u64 = 10_000;
 
+/// Default cap on a UDG data-source response body: 4 MiB (the schema-sync
+/// introspection cap).
+pub const DEFAULT_UDG_MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
+
 fn default_playground_path() -> String {
     DEFAULT_PLAYGROUND_PATH.to_owned()
 }
@@ -48,8 +52,7 @@ fn default_true() -> bool {
 
 /// How the gateway executes GraphQL for an API.
 ///
-/// Only [`Proxy`](Self::Proxy) exists today; the enum is the extension
-/// point for later M9 modes (UDG, federation
+/// The enum is the extension point for later M9 modes (federation
 /// supergraph and subgraph).
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,6 +63,13 @@ pub enum GraphQlExecutionMode {
     /// forwards it unchanged — it never executes GraphQL itself.
     #[default]
     Proxy,
+
+    /// Universal Data Graph: the gateway executes
+    /// queries itself, resolving each root field through the data source
+    /// mapped in [`GraphQlConfig::data_sources`] and stitching the results
+    /// into one GraphQL response. Nothing is forwarded to
+    /// [`target_url`](crate::ApiDefinition::target_url) (ADR-0010).
+    Udg,
 }
 
 /// GraphQL settings for one API (see [`ApiDefinition::graphql`]).
@@ -141,6 +151,15 @@ pub struct GraphQlConfig {
     /// GraphQL endpoint are rejected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub subscriptions: Option<SubscriptionsConfig>,
+
+    /// Universal Data Graph data sources, keyed `"<RootType>.<field>"`
+    /// (e.g. `"Query.user"` — the schema's actual root operation type
+    /// names). Required (and only allowed) when
+    /// [`execution_mode`](Self::execution_mode) is
+    /// [`Udg`](GraphQlExecutionMode::Udg); every field of the query and
+    /// mutation root types must be mapped (ADR-0010).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub data_sources: BTreeMap<String, UdgDataSource>,
 }
 
 /// GraphQL-subscriptions-over-WebSocket settings (see
@@ -180,6 +199,190 @@ impl Default for SubscriptionsConfig {
             max_message_bytes: None,
         }
     }
+}
+
+fn default_rest_method() -> String {
+    "GET".to_owned()
+}
+
+/// One Universal Data Graph data source (see
+/// [`GraphQlConfig::data_sources`]): where the gateway fetches the value of
+/// one root field in UDG mode.
+///
+/// # Example (JSON)
+///
+/// ```json
+/// { "kind": "rest", "url": "http://users.internal/users/{{ args.id }}" }
+/// ```
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UdgDataSource {
+    /// A REST/JSON endpoint: the response body is the field's JSON value.
+    Rest(UdgRestSource),
+
+    /// An upstream GraphQL service: the gateway sends the root field's
+    /// sub-selection as a standalone query and merges the response.
+    Graphql(UdgGraphQlSource),
+}
+
+/// A REST data source for one UDG root field.
+///
+/// `url`, header values, and `body` are minijinja templates (ADR-0007's
+/// engine), rendered per request against
+/// `{ args, _g2: { method, path, headers, session: { alias } } }` where
+/// `args` are the coerced GraphQL field arguments. The rendered URL must be
+/// absolute `http(s)`. The response body is parsed as JSON and becomes the
+/// field's value; nested selections are projected from it.
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdgRestSource {
+    /// HTTP method of the fetch (case-insensitive; `CONNECT` is not
+    /// allowed). Defaults to `GET`.
+    #[serde(default = "default_rest_method")]
+    pub method: String,
+
+    /// URL template. Rendered per request; the result must be an absolute
+    /// `http(s)` URL.
+    pub url: String,
+
+    /// Extra headers on the fetch: name → value template. Hop-by-hop
+    /// headers are rejected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+
+    /// Optional request-body template. Sent with
+    /// `content-type: application/json` unless [`headers`](Self::headers)
+    /// overrides it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+
+    /// Per-fetch timeout in milliseconds (must be > 0). Unset = the API's
+    /// `upstream_timeout_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+
+    /// Cap on the response body in bytes (must be > 0). Unset =
+    /// [`DEFAULT_UDG_MAX_RESPONSE_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<u64>,
+}
+
+/// A GraphQL data source for one UDG root field.
+///
+/// The gateway prints the requested field (selection set, aliases, and
+/// arguments verbatim) together with the fragment definitions and variable
+/// definitions its subtree uses, and `POST`s
+/// `{"query": …, "variables": …}` to [`url`](Self::url). The response's
+/// `data.<field>` becomes the field's value; its `errors` are appended to
+/// the stitched response (message-only).
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UdgGraphQlSource {
+    /// Absolute `http(s)` URL of the upstream GraphQL endpoint (not
+    /// templated).
+    pub url: String,
+
+    /// Extra headers on the fetch: name → value template (upstream auth).
+    /// Hop-by-hop headers are rejected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+
+    /// Per-fetch timeout in milliseconds (must be > 0). Unset = the API's
+    /// `upstream_timeout_ms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+
+    /// Cap on the response body in bytes (must be > 0). Unset =
+    /// [`DEFAULT_UDG_MAX_RESPONSE_BYTES`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_response_bytes: Option<u64>,
+}
+
+impl UdgDataSource {
+    /// Validates one data source; `key` names it in errors.
+    fn validate(&self, key: &str, fail: &impl Fn(String) -> Error) -> Result<(), Error> {
+        let field = |name: &str| format!("graphql.data_sources[\"{key}\"].{name}");
+        let (headers, timeout_ms, max_response_bytes) = match self {
+            Self::Rest(rest) => {
+                if !TRANSFORM_METHODS
+                    .iter()
+                    .any(|m| m.eq_ignore_ascii_case(&rest.method))
+                {
+                    return Err(fail(format!(
+                        "`{}` must be one of {} (got `{}`)",
+                        field("method"),
+                        TRANSFORM_METHODS.join(", "),
+                        rest.method
+                    )));
+                }
+                if rest.url.trim().is_empty() {
+                    return Err(fail(format!("`{}` must not be empty", field("url"))));
+                }
+                validate_template(&rest.url, &field("url"), fail)?;
+                if let Some(body) = &rest.body {
+                    validate_template(body, &field("body"), fail)?;
+                }
+                (&rest.headers, rest.timeout_ms, rest.max_response_bytes)
+            }
+            Self::Graphql(gql) => {
+                let valid = (gql.url.starts_with("http://") || gql.url.starts_with("https://"))
+                    && gql.url.parse::<http::Uri>().is_ok();
+                if !valid {
+                    return Err(fail(format!(
+                        "`{}` must be an absolute http(s) URL, got `{}`",
+                        field("url"),
+                        gql.url
+                    )));
+                }
+                (&gql.headers, gql.timeout_ms, gql.max_response_bytes)
+            }
+        };
+        for (name, value) in headers {
+            if HeaderName::from_bytes(name.as_bytes()).is_err() {
+                return Err(fail(format!(
+                    "`{}` name is not a valid header name: `{name}`",
+                    field("headers")
+                )));
+            }
+            if HOP_BY_HOP.iter().any(|h| h.eq_ignore_ascii_case(name)) {
+                return Err(fail(format!(
+                    "`{}` must not set hop-by-hop header `{name}`",
+                    field("headers")
+                )));
+            }
+            validate_template(value, &format!("{}.{name}", field("headers")), fail)?;
+        }
+        if timeout_ms == Some(0) {
+            return Err(fail(format!(
+                "`{}` must be greater than zero (omit it to inherit the API's \
+                 `upstream_timeout_ms`)",
+                field("timeout_ms")
+            )));
+        }
+        if max_response_bytes == Some(0) {
+            return Err(fail(format!(
+                "`{}` must be greater than zero",
+                field("max_response_bytes")
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Checks that a data-source template parses as minijinja (the
+/// body-transform precedent: syntax errors are config-time errors).
+fn validate_template(
+    template: &str,
+    field: &str,
+    fail: &impl Fn(String) -> Error,
+) -> Result<(), Error> {
+    if let Err(err) = minijinja::Environment::new().template_from_str(template) {
+        return Err(fail(format!(
+            "`{field}` is not a valid minijinja template: {err}"
+        )));
+    }
+    Ok(())
 }
 
 /// Schema-sync settings: how a pod fetches the upstream's schema via
@@ -379,8 +582,11 @@ impl GraphQlConfig {
     /// invalid method, path template, operation, operation name, or
     /// variables template, a schema-sync setting is invalid (zero
     /// interval/timeout, non-http(s) URL, bad or hop-by-hop header), a
-    /// subscriptions message cap is zero, or subscriptions are enabled on a
-    /// schema without a `Subscription` root type.
+    /// subscriptions message cap is zero, subscriptions are enabled on a
+    /// schema without a `Subscription` root type, `data_sources` is set in
+    /// proxy mode, or a `udg`-mode rule fails (schema sync or enabled
+    /// subscriptions present, a data source missing, unknown, or invalid,
+    /// or a persisted query selecting a subscription).
     pub fn validate(&self, api: &str) -> Result<(), Error> {
         let fail = |reason: String| Error::InvalidApiDefinition {
             api: api.to_owned(),
@@ -403,6 +609,33 @@ impl GraphQlConfig {
                 "`graphql.max_query_depth` must be greater than zero (omit it for unlimited)"
                     .into(),
             ));
+        }
+
+        match self.execution_mode {
+            GraphQlExecutionMode::Proxy => {
+                if !self.data_sources.is_empty() {
+                    return Err(fail(
+                        "`graphql.data_sources` requires `execution_mode: \"udg\"`".into(),
+                    ));
+                }
+            }
+            GraphQlExecutionMode::Udg => {
+                if self.schema_sync.is_some() {
+                    return Err(fail(
+                        "`graphql.schema_sync` is not supported in `udg` execution mode — \
+                         there is no single upstream to introspect (ADR-0010)"
+                            .into(),
+                    ));
+                }
+                if self.subscriptions.as_ref().is_some_and(|s| s.enabled) {
+                    return Err(fail(
+                        "`graphql.subscriptions` cannot be enabled in `udg` execution mode \
+                         (ADR-0010)"
+                            .into(),
+                    ));
+                }
+                self.validate_data_sources(&schema, &fail)?;
+            }
         }
 
         if let Some(playground) = &self.playground {
@@ -431,13 +664,90 @@ impl GraphQlConfig {
         }
 
         for (index, pq) in self.persisted_queries.iter().enumerate() {
-            pq.validate(&schema, index, &fail)?;
+            let doc = pq.validate(&schema, index, &fail)?;
+            if self.execution_mode == GraphQlExecutionMode::Udg
+                && doc
+                    .operations
+                    .get(pq.operation_name.as_deref())
+                    .is_ok_and(|op| op.is_subscription())
+            {
+                return Err(fail(format!(
+                    "`graphql.persisted_queries[{index}]` selects a subscription \
+                     operation, which `udg` execution mode cannot execute"
+                )));
+            }
             if let Some(playground) = &self.playground {
                 if pq.path == playground.path {
                     return Err(fail(format!(
                         "`graphql.persisted_queries[{index}].path` collides with the \
                          playground path `{}`",
                         playground.path
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validates the UDG data-source map against the schema: every key must
+    /// name a field of a root operation type, every root field must be
+    /// mapped, and every source must be well-formed (ADR-0010).
+    fn validate_data_sources(
+        &self,
+        schema: &apollo_compiler::validation::Valid<apollo_compiler::Schema>,
+        fail: &impl Fn(String) -> Error,
+    ) -> Result<(), Error> {
+        if self.data_sources.is_empty() {
+            return Err(fail(
+                "`udg` execution mode requires `graphql.data_sources` (one entry per \
+                 root field)"
+                    .into(),
+            ));
+        }
+        let roots: Vec<&str> = [
+            schema.schema_definition.query.as_ref(),
+            schema.schema_definition.mutation.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|component| component.name.as_str())
+        .collect();
+
+        for (key, source) in &self.data_sources {
+            let Some((ty, field_name)) = key.split_once('.') else {
+                return Err(fail(format!(
+                    "`graphql.data_sources` key `{key}` must be `<RootType>.<field>` \
+                     (e.g. `Query.user`)"
+                )));
+            };
+            if !roots.contains(&ty) {
+                return Err(fail(format!(
+                    "`graphql.data_sources` key `{key}`: `{ty}` is not the schema's \
+                     query or mutation root type"
+                )));
+            }
+            let known = schema
+                .get_object(ty)
+                .is_some_and(|object| object.fields.contains_key(field_name));
+            if !known {
+                return Err(fail(format!(
+                    "`graphql.data_sources` key `{key}`: type `{ty}` has no field \
+                     `{field_name}`"
+                )));
+            }
+            source.validate(key, fail)?;
+        }
+
+        for root in roots {
+            let Some(object) = schema.get_object(root) else {
+                continue;
+            };
+            for name in object.fields.keys() {
+                let key = format!("{root}.{name}");
+                if !self.data_sources.contains_key(&key) {
+                    return Err(fail(format!(
+                        "`graphql.data_sources` must map every root field in `udg` \
+                         execution mode; missing `{key}`"
                     )));
                 }
             }
@@ -470,12 +780,15 @@ fn validate_relative_path(
 }
 
 impl PersistedQuery {
+    /// Validates the entry, returning the parsed operation document (so
+    /// mode-specific checks need not re-parse it).
     fn validate(
         &self,
         schema: &apollo_compiler::validation::Valid<apollo_compiler::Schema>,
         index: usize,
         fail: &impl Fn(String) -> Error,
-    ) -> Result<(), Error> {
+    ) -> Result<apollo_compiler::validation::Valid<apollo_compiler::ExecutableDocument>, Error>
+    {
         let field = |name: &str| format!("graphql.persisted_queries[{index}].{name}");
 
         if !TRANSFORM_METHODS
@@ -554,7 +867,7 @@ impl PersistedQuery {
             };
             validate_variable_template(object, &seen, &field("variables"), fail)?;
         }
-        Ok(())
+        Ok(doc)
     }
 }
 
@@ -971,5 +1284,241 @@ mod tests {
             serde_json::to_string(&GraphQlExecutionMode::Proxy).expect("serializes"),
             r#""proxy""#
         );
+        assert_eq!(
+            serde_json::to_string(&GraphQlExecutionMode::Udg).expect("serializes"),
+            r#""udg""#
+        );
+    }
+
+    const UDG_SCHEMA: &str = "type Query { hello: String user(id: ID!): User } \
+                              type Mutation { rename(id: ID!, name: String!): User } \
+                              type User { id: ID! name: String }";
+
+    fn udg_sources() -> serde_json::Value {
+        serde_json::json!({
+            "Query.hello": { "kind": "rest", "url": "http://up.internal/hello" },
+            "Query.user": {
+                "kind": "rest",
+                "url": "http://up.internal/users/{{ args.id }}",
+                "headers": { "x-caller": "{{ _g2.session.alias }}" }
+            },
+            "Mutation.rename": {
+                "kind": "graphql",
+                "url": "http://gql.internal/graphql",
+                "headers": { "authorization": "Bearer t" }
+            }
+        })
+    }
+
+    fn udg(mutator: impl FnOnce(&mut serde_json::Value)) -> GraphQlConfig {
+        let mut json = serde_json::json!({
+            "schema": UDG_SCHEMA,
+            "execution_mode": "udg",
+            "data_sources": udg_sources()
+        });
+        mutator(&mut json);
+        parse(&json.to_string())
+    }
+
+    #[test]
+    fn udg_config_round_trips_and_validates() {
+        let cfg = udg(|_| {});
+        cfg.validate("api").expect("valid");
+        assert_eq!(cfg.execution_mode, GraphQlExecutionMode::Udg);
+        assert_eq!(cfg.data_sources.len(), 3);
+        let json = serde_json::to_string(&cfg).expect("serializes");
+        assert_eq!(parse(&json), cfg);
+
+        // Unset stays off the wire, and REST defaults apply.
+        let bare = serde_json::to_string(&minimal()).expect("serializes");
+        assert!(!bare.contains("data_sources"));
+        let UdgDataSource::Rest(rest) = &cfg.data_sources["Query.hello"] else {
+            panic!("expected a rest source");
+        };
+        assert_eq!(rest.method, "GET");
+        assert!(rest.body.is_none() && rest.timeout_ms.is_none());
+    }
+
+    #[test]
+    fn proxy_mode_rejects_data_sources() {
+        let cfg = udg(|json| {
+            json["execution_mode"] = "proxy".into();
+        });
+        let err = cfg.validate("api").unwrap_err().to_string();
+        assert!(
+            err.contains("requires `execution_mode: \"udg\"`"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn udg_requires_data_sources_and_full_coverage() {
+        let empty = udg(|json| {
+            json["data_sources"] = serde_json::json!({});
+        });
+        let err = empty.validate("api").unwrap_err().to_string();
+        assert!(
+            err.contains("requires `graphql.data_sources`"),
+            "got: {err}"
+        );
+
+        let partial = udg(|json| {
+            json["data_sources"]
+                .as_object_mut()
+                .expect("object")
+                .remove("Query.user");
+        });
+        let err = partial.validate("api").unwrap_err().to_string();
+        assert!(err.contains("missing `Query.user`"), "got: {err}");
+    }
+
+    #[test]
+    fn udg_rejects_schema_sync_and_enabled_subscriptions() {
+        let sync = udg(|json| {
+            json["schema_sync"] = serde_json::json!({});
+        });
+        let err = sync.validate("api").unwrap_err().to_string();
+        assert!(err.contains("schema_sync"), "got: {err}");
+
+        let subs = udg(|json| {
+            json["schema"] = format!("{UDG_SCHEMA} type Subscription {{ ticks: Int }}").into();
+            json["subscriptions"] = serde_json::json!({});
+        });
+        let err = subs.validate("api").unwrap_err().to_string();
+        assert!(err.contains("subscriptions"), "got: {err}");
+
+        // A disabled block stays parkable (ADR-0010).
+        let off = udg(|json| {
+            json["schema"] = format!("{UDG_SCHEMA} type Subscription {{ ticks: Int }}").into();
+            json["subscriptions"] = serde_json::json!({ "enabled": false });
+        });
+        off.validate("api").expect("valid when disabled");
+    }
+
+    #[test]
+    fn udg_data_source_rules_are_enforced() {
+        let cases = [
+            (
+                "must be `<RootType>.<field>`",
+                "nodot",
+                serde_json::json!({
+                    "kind": "rest", "url": "http://x/"
+                }),
+            ),
+            (
+                "not the schema's query or mutation root type",
+                "User.name",
+                serde_json::json!({
+                    "kind": "rest", "url": "http://x/"
+                }),
+            ),
+            (
+                "has no field",
+                "Query.missing",
+                serde_json::json!({
+                    "kind": "rest", "url": "http://x/"
+                }),
+            ),
+            (
+                "method",
+                "Query.hello",
+                serde_json::json!({
+                    "kind": "rest", "method": "CONNECT", "url": "http://x/"
+                }),
+            ),
+            (
+                "url",
+                "Query.hello",
+                serde_json::json!({
+                    "kind": "rest", "url": " "
+                }),
+            ),
+            (
+                "minijinja",
+                "Query.hello",
+                serde_json::json!({
+                    "kind": "rest", "url": "http://x/{{ broken"
+                }),
+            ),
+            (
+                "minijinja",
+                "Query.hello",
+                serde_json::json!({
+                    "kind": "rest", "url": "http://x/", "body": "{% bad %}"
+                }),
+            ),
+            (
+                "header name",
+                "Query.hello",
+                serde_json::json!({
+                    "kind": "rest", "url": "http://x/", "headers": { "bad name": "v" }
+                }),
+            ),
+            (
+                "hop-by-hop",
+                "Query.hello",
+                serde_json::json!({
+                    "kind": "rest", "url": "http://x/", "headers": { "Connection": "close" }
+                }),
+            ),
+            (
+                "minijinja",
+                "Query.hello",
+                serde_json::json!({
+                    "kind": "rest", "url": "http://x/", "headers": { "x-ok": "{{ broken" }
+                }),
+            ),
+            (
+                "timeout_ms",
+                "Query.hello",
+                serde_json::json!({
+                    "kind": "rest", "url": "http://x/", "timeout_ms": 0
+                }),
+            ),
+            (
+                "max_response_bytes",
+                "Query.hello",
+                serde_json::json!({
+                    "kind": "rest", "url": "http://x/", "max_response_bytes": 0
+                }),
+            ),
+            (
+                "absolute http(s) URL",
+                "Query.hello",
+                serde_json::json!({
+                    "kind": "graphql", "url": "ftp://x/graphql"
+                }),
+            ),
+            (
+                "absolute http(s) URL",
+                "Query.hello",
+                serde_json::json!({
+                    "kind": "graphql", "url": "/relative"
+                }),
+            ),
+        ];
+        for (needle, key, source) in cases {
+            let cfg = udg(|json| {
+                json["data_sources"][key] = source.clone();
+            });
+            let err = cfg.validate("api").unwrap_err().to_string();
+            assert!(
+                err.contains(needle),
+                "key `{key}`: expected `{needle}` in: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn udg_rejects_persisted_subscriptions() {
+        let cfg = udg(|json| {
+            json["schema"] = format!("{UDG_SCHEMA} type Subscription {{ ticks: Int }}").into();
+            json["persisted_queries"] = serde_json::json!([{
+                "method": "GET", "path": "/ticks",
+                "operation": "subscription { ticks }"
+            }]);
+        });
+        let err = cfg.validate("api").unwrap_err().to_string();
+        assert!(err.contains("subscription operation"), "got: {err}");
     }
 }

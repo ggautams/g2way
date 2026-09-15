@@ -27,6 +27,7 @@ pub mod context;
 pub mod cors;
 pub mod graphql;
 pub mod graphql_sync;
+pub(crate) mod graphql_udg;
 pub mod graphql_ws;
 pub(crate) mod hmac;
 pub mod ip_filter;
@@ -44,6 +45,7 @@ pub mod stats;
 pub mod trace;
 pub mod transform_body;
 pub mod transform_headers;
+pub mod udg_fetch;
 pub mod versioning;
 
 pub use analytics::{Analytics, AnalyticsHandle, AnalyticsLayer};
@@ -81,6 +83,7 @@ pub use stats::{ApiStats, ApiStatsSnapshot, StatsLayer, StatsRegistry};
 pub use trace::{Trace, TraceLayer};
 pub use transform_body::{BodyTransformLayer, BodyTransformer};
 pub use transform_headers::{HeaderTransformLayer, HeaderTransformer};
+pub use udg_fetch::{SharedUdgFetch, UdgFetch, UdgFetchFuture, UdgRequest, UdgResponse};
 pub use versioning::VersionDispatch;
 
 /// Boxed error type used for proxied body streams.

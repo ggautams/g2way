@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use g2_core::{ApiDefinition, Error};
-use g2_middleware::SharedJwksFetch;
 use g2_middleware::{
     AnalyticsHandle, AnalyticsLayer, AuthLayer, BodyTransformLayer, CacheLayer, ChainBuilder,
     ChainService, CorsLayer, EndpointLimits, GraphQlLayer, GraphQlSyncHandle, HeaderTransformLayer,
@@ -13,9 +12,10 @@ use g2_middleware::{
     PluginLayer, RateLimitLayer, RequestContext, RequestSizeLimitLayer, SchemaSyncSnapshot,
     SharedPluginLoader, SpikeGuard, StatsLayer, StatsRegistry, TraceLayer, VersionDispatch,
 };
+use g2_middleware::{SharedJwksFetch, SharedUdgFetch};
 use g2_storage::SharedStorage;
 
-use crate::forward::{Forward, Forwarder, HttpJwksFetch, UpstreamTarget};
+use crate::forward::{Forward, Forwarder, HttpJwksFetch, HttpUdgFetch, UpstreamTarget};
 
 /// Process-wide resources a route(-table) build draws on. All of them
 /// outlive any single table: connection pools, storage, guards, counters,
@@ -76,6 +76,7 @@ fn inner_layers(
     def: &ApiDefinition,
     res: &RouteResources<'_>,
     jwks_fetch: &SharedJwksFetch,
+    udg_fetch: &SharedUdgFetch,
     scope: &str,
 ) -> Result<(ChainBuilder, Option<GraphQlSyncHandle>), Error> {
     let storage = res.storage;
@@ -123,7 +124,7 @@ fn inner_layers(
     let graphql = def
         .graphql
         .as_ref()
-        .map(|g| GraphQlLayer::from_config(g, def))
+        .map(|g| GraphQlLayer::from_config(g, def, Some(Arc::clone(udg_fetch))))
         .transpose()?
         .flatten();
     let graphql_sync = graphql.as_ref().and_then(GraphQlLayer::sync_handle);
@@ -218,6 +219,9 @@ impl Route {
         // Shared by every version's auth layer; JWKS documents ride the same
         // pooled client as proxied traffic and health probes.
         let jwks_fetch: SharedJwksFetch = Arc::new(HttpJwksFetch::new(forwarder));
+        // Shared by every version's GraphQL layer; UDG data-source fetches
+        // ride the same pooled client (ADR-0010).
+        let udg_fetch: SharedUdgFetch = Arc::new(HttpUdgFetch::new(forwarder));
         let ctx = RequestContext::new(def.api_id.clone(), def.org_id.clone());
         let ip_filter = IpFilterLayer::from_config(&def.allow_ips, &def.block_ips, &def.api_id)?;
         let cors = def
@@ -254,7 +258,8 @@ impl Route {
                 if let Some(sd) = &def.service_discovery {
                     crate::discovery::spawn_refresher(forwarder, &target, sd);
                 }
-                let (builder, sync) = inner_layers(outer, &def, res, &jwks_fetch, &def.api_id)?;
+                let (builder, sync) =
+                    inner_layers(outer, &def, res, &jwks_fetch, &udg_fetch, &def.api_id)?;
                 if let Some(sync) = sync {
                     crate::graphql_sync::spawn_refresher(forwarder, &target, &sync);
                     graphql_sync.push(sync);
@@ -283,6 +288,7 @@ impl Route {
                         &vdef,
                         res,
                         &jwks_fetch,
+                        &udg_fetch,
                         &scope,
                     )?;
                     if let Some(sync) = sync {

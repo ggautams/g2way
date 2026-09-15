@@ -59,7 +59,7 @@ const DEFAULT_MAX_BODY_BYTES: u64 = 1_048_576;
 /// Fuel budget per render: bounds pathological templates (unbounded loops)
 /// deterministically without any timeout machinery. Generously above what a
 /// legitimate body-reshaping template consumes.
-const RENDER_FUEL: u64 = 1_000_000;
+pub(crate) const RENDER_FUEL: u64 = 1_000_000;
 
 /// One rule, precompiled: matching state plus the name its template is
 /// registered under in the shared environment.

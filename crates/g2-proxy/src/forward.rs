@@ -482,6 +482,58 @@ impl g2_middleware::JwksFetch for HttpJwksFetch {
     }
 }
 
+/// [`UdgFetch`](g2_middleware::UdgFetch) implementation over the shared
+/// upstream client: UDG data-source requests ride the same HTTP/1.1 pool
+/// and TLS configuration as JWKS and service-discovery fetches (ADR-0010).
+pub(crate) struct HttpUdgFetch {
+    client: UpstreamClient,
+}
+
+impl HttpUdgFetch {
+    /// A fetcher borrowing `forwarder`'s pooled client.
+    pub(crate) fn new(forwarder: &Forwarder) -> Self {
+        Self {
+            client: forwarder.client().clone(),
+        }
+    }
+}
+
+impl g2_middleware::UdgFetch for HttpUdgFetch {
+    fn fetch(&self, request: g2_middleware::UdgRequest) -> g2_middleware::UdgFetchFuture {
+        let client = self.client.clone();
+        Box::pin(async move {
+            let uri: Uri = request
+                .url
+                .parse()
+                .map_err(|e| format!("invalid data-source URL: {e}"))?;
+            let mut builder = Request::builder().method(request.method).uri(uri);
+            for (name, value) in request.headers {
+                builder = builder.header(name, value);
+            }
+            let body = match request.body {
+                Some(bytes) => ProxyBody::new(http_body_util::Full::new(bytes)),
+                None => ProxyBody::empty(),
+            };
+            let req = builder
+                .body(body)
+                .map_err(|e| format!("could not build the data-source request: {e}"))?;
+            let resp = tokio::time::timeout(request.timeout, client.request(req))
+                .await
+                .map_err(|_| format!("fetch timed out after {:?}", request.timeout))?
+                .map_err(|e| format!("fetch failed: {e}"))?;
+            let status = resp.status();
+            let body = http_body_util::Limited::new(resp.into_body(), request.max_response_bytes);
+            let collected = http_body_util::BodyExt::collect(body)
+                .await
+                .map_err(|e| format!("reading the response body failed: {e}"))?;
+            Ok(g2_middleware::UdgResponse {
+                status,
+                body: collected.to_bytes(),
+            })
+        })
+    }
+}
+
 /// The innermost chain service of one route: rewrites the request for the
 /// route's upstream and proxies it.
 ///
