@@ -33,8 +33,14 @@ run:
 ## Regenerate the checked-in admin OpenAPI document. Consumers (g2way-dashboard)
 ## read the committed file, so they need neither a Rust toolchain nor a running
 ## gateway.
+## Write to a temp file and move only on success: a plain `> file` redirect
+## truncates before cargo runs, so a failing build would destroy the committed
+## spec (and consumers read the committed file).
 openapi:
-	cargo run --quiet -p g2way -- --dump-openapi > docs/api/openapi.json
+	@cargo run --quiet -p g2way -- --dump-openapi > docs/api/openapi.json.tmp \
+		&& mv docs/api/openapi.json.tmp docs/api/openapi.json \
+		|| { rm -f docs/api/openapi.json.tmp; exit 1; }
+	@echo "wrote docs/api/openapi.json"
 
 ## Fail if the committed spec is stale. Part of `check`: the in-crate test
 ## catches an undocumented route, this catches a file nobody regenerated.
