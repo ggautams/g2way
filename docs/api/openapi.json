@@ -1,0 +1,2822 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "g2way admin API",
+    "description": "Control-plane API of the g2way gateway: key, API definition, and policy management, hot reload, and node status. Definition/policy writes go live on reload, not on write.",
+    "license": {
+      "name": "MPL-2.0",
+      "identifier": "MPL-2.0"
+    },
+    "version": "0.1.0"
+  },
+  "paths": {
+    "/g2/apis": {
+      "get": {
+        "tags": [
+          "apis"
+        ],
+        "operationId": "list_apis",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every stored API definition, sorted by id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/ApiDefinition"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "apis"
+        ],
+        "operationId": "create_api",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiDefinition"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created (live after the next reload)"
+          },
+          "400": {
+            "description": "Definition failed validation"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "409": {
+            "description": "api_id already exists; use PUT to update"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      }
+    },
+    "/g2/apis/{id}": {
+      "get": {
+        "tags": [
+          "apis"
+        ],
+        "operationId": "get_api",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The api_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stored definition",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiDefinition"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "404": {
+            "description": "No definition under this id"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "apis"
+        ],
+        "operationId": "put_api",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The api_id; must equal the body's api_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApiDefinition"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored; `action` is `added` or `modified` (live after the next reload)"
+          },
+          "400": {
+            "description": "Validation failed or body id disagrees with path id"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "apis"
+        ],
+        "operationId": "delete_api",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The api_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted (unrouted after the next reload)"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "404": {
+            "description": "No definition under this id"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      }
+    },
+    "/g2/graphql/sync": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "summary": "`POST /g2/graphql/sync` — broadcast a GraphQL schema-sync nudge to\nevery gateway pod (this one included) via storage pub/sub.",
+        "description": "Returns as soon as the nudge is published: each pod immediately\nre-fetches the schema of every API configuring `graphql.schema_sync`\nfrom its upstream via introspection, swapping the compiled schema on\nchange and keeping the previous one on any failure (surfaced on\n`GET /g2/node`). APIs without `schema_sync` are unaffected.",
+        "operationId": "graphql_sync",
+        "responses": {
+          "200": {
+            "description": "Nudge broadcast; pods re-introspect asynchronously"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      }
+    },
+    "/g2/health": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "`GET /g2/health` — unauthenticated liveness for probes on the admin port.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "description": "Node is alive: `{\"status\":\"pass\"}`"
+          }
+        }
+      }
+    },
+    "/g2/keys": {
+      "get": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "`GET /g2/keys` — list the organization's stored key hashes, sorted.",
+        "description": "Returns `{\"keys\": [\"<hash>\", …]}`. Hashes are the only listable handle:\nraw keys are never stored. Takes an optional `?org_id=`.",
+        "operationId": "list_keys",
+        "parameters": [
+          {
+            "name": "hashed",
+            "in": "query",
+            "description": "When `true`, the path parameter is the stored key hash itself\ninstead of a raw key.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "description": "Organization the key belongs to (`GET`/`DELETE` only; `POST`/`PUT`\nread it from the session body). Defaults to the single-org default.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Sorted stored key hashes: `{\"keys\": […]}`"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "`POST /g2/keys` — create a session under a freshly generated key.",
+        "description": "The raw key is returned **only here**; it is stored hashed and cannot be\nrecovered later.",
+        "operationId": "create_key",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeySession"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created; `key` (raw, shown once) and `key_hash`"
+          },
+          "400": {
+            "description": "Session failed validation"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      }
+    },
+    "/g2/keys/{key}": {
+      "get": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "`GET /g2/keys/{key}` — fetch the session stored for `key`.",
+        "operationId": "get_key",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Raw key (or stored hash with `hashed=true`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "hashed",
+            "in": "query",
+            "description": "When `true`, the path parameter is the stored key hash itself\ninstead of a raw key.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "description": "Organization the key belongs to (`GET`/`DELETE` only; `POST`/`PUT`\nread it from the session body). Defaults to the single-org default.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stored session",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/KeySession"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "404": {
+            "description": "No session under this key"
+          },
+          "500": {
+            "description": "Stored record is corrupt"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "`PUT /g2/keys/{key}` — create or update the session stored for `key`.",
+        "operationId": "put_key",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Raw key (or stored hash with `hashed=true`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "hashed",
+            "in": "query",
+            "description": "When `true`, the path parameter is the stored key hash itself\ninstead of a raw key.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "description": "Organization the key belongs to (`GET`/`DELETE` only; `POST`/`PUT`\nread it from the session body). Defaults to the single-org default.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/KeySession"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored; `action` is `added` or `modified`"
+          },
+          "400": {
+            "description": "Session failed validation"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "keys"
+        ],
+        "summary": "`DELETE /g2/keys/{key}` — remove the session stored for `key`.",
+        "operationId": "delete_key",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "description": "Raw key (or stored hash with `hashed=true`)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "hashed",
+            "in": "query",
+            "description": "When `true`, the path parameter is the stored key hash itself\ninstead of a raw key.",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "description": "Organization the key belongs to (`GET`/`DELETE` only; `POST`/`PUT`\nread it from the session body). Defaults to the single-org default.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "404": {
+            "description": "No session under this key"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      }
+    },
+    "/g2/node": {
+      "get": {
+        "tags": [
+          "dashboard"
+        ],
+        "summary": "`GET /g2/node` — node identity plus the APIs currently being routed.",
+        "operationId": "node",
+        "responses": {
+          "200": {
+            "description": "Node identity, version, uptime, and the currently routed APIs"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "503": {
+            "description": "Router built without dashboard wiring"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      }
+    },
+    "/g2/policies": {
+      "get": {
+        "tags": [
+          "policies"
+        ],
+        "operationId": "list_policies",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Every stored policy, sorted by id",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/Policy"
+                  }
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      },
+      "post": {
+        "tags": [
+          "policies"
+        ],
+        "operationId": "create_policy",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Policy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Created"
+          },
+          "400": {
+            "description": "Policy failed validation"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "409": {
+            "description": "policy_id already exists; use PUT to update"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      }
+    },
+    "/g2/policies/{id}": {
+      "get": {
+        "tags": [
+          "policies"
+        ],
+        "operationId": "get_policy",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The policy_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The stored policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Policy"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "404": {
+            "description": "No policy under this id"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      },
+      "put": {
+        "tags": [
+          "policies"
+        ],
+        "operationId": "put_policy",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The policy_id; must equal the body's policy_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/Policy"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Stored; `action` is `added` or `modified`"
+          },
+          "400": {
+            "description": "Validation failed or body id disagrees with path id"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      },
+      "delete": {
+        "tags": [
+          "policies"
+        ],
+        "operationId": "delete_policy",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "The policy_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Deleted"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "404": {
+            "description": "No policy under this id"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      }
+    },
+    "/g2/reload": {
+      "post": {
+        "tags": [
+          "system"
+        ],
+        "summary": "`POST /g2/reload` — broadcast a config-reload nudge to every gateway\npod (this one included) via storage pub/sub.",
+        "description": "Returns as soon as the nudge is published: reloads happen\nasynchronously on each pod, which re-reads definitions from files and\nstorage, rebuilds its route table, and keeps the old table if the new\nconfig fails to load (logged per pod).",
+        "operationId": "reload",
+        "responses": {
+          "200": {
+            "description": "Nudge broadcast; pods reload asynchronously"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "503": {
+            "description": "Storage backend unavailable"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      }
+    },
+    "/g2/stats": {
+      "get": {
+        "tags": [
+          "dashboard"
+        ],
+        "summary": "`GET /g2/stats` — per-API request counters since process start.",
+        "operationId": "stats",
+        "responses": {
+          "200": {
+            "description": "Per-API request and status-class counters (process-local, reset on restart)"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          },
+          "503": {
+            "description": "Router built without dashboard wiring"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      }
+    },
+    "/g2/version": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "`GET /g2/version` — the gateway's version (workspace-wide, so the crate\nversion equals the binary's).",
+        "operationId": "version",
+        "responses": {
+          "200": {
+            "description": "Gateway version: `{\"version\":…}`"
+          },
+          "403": {
+            "description": "Admin secret missing or wrong"
+          }
+        },
+        "security": [
+          {
+            "admin_secret": []
+          }
+        ]
+      }
+    },
+    "/metrics": {
+      "get": {
+        "tags": [
+          "system"
+        ],
+        "summary": "`GET /metrics` — the gateway's metrics in the Prometheus text exposition\nformat (unauthenticated: scrapers do not send custom headers, and the\nadmin port is expected to stay off the public network).",
+        "operationId": "prometheus_metrics",
+        "responses": {
+          "200": {
+            "description": "Prometheus text exposition of the gateway's metrics",
+            "content": {
+              "text/plain": {}
+            }
+          },
+          "503": {
+            "description": "Metrics are not enabled on this node"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "ApiAccess": {
+        "type": "object",
+        "description": "Access granted to a single API.\n\nAn entry's presence in [`KeySession::access`] is the base grant; the\nfields below add per-key GraphQL restrictions, enforced by the GraphQL\nmiddleware on GraphQL-configured APIs\nand ignored everywhere else. An empty `{}` entry — every pre-M9 record —\ngrants unrestricted access.",
+        "properties": {
+          "allowed_types": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TypeFields"
+            },
+            "description": "GraphQL field allow list. When non-empty, the key may select **only**\nthe listed (type, field) pairs — and the block list is ignored (the\nallow list wins). Empty = no allow-list restriction."
+          },
+          "disable_introspection": {
+            "type": "boolean",
+            "description": "Disables GraphQL introspection (`__schema` / `__type`) for this key\non this API, even when the API itself allows it."
+          },
+          "max_query_depth": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Per-key GraphQL depth limit override. `Some(n > 0)` replaces the\nAPI's `graphql.max_query_depth` (even with a larger value);\n`Some(-1)` (or any non-positive value) lifts the limit entirely\n(`-1`); `None` inherits the API's limit."
+          },
+          "restricted_types": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TypeFields"
+            },
+            "description": "GraphQL field block list: selecting a listed (type, field) pair is\nrejected with `400`. Consulted only while `allowed_types` is empty."
+          }
+        }
+      },
+      "ApiDefinition": {
+        "type": "object",
+        "description": "One API proxied by the gateway.\n\nThis is the unit of configuration: requests whose path falls under\n`listen_path` are forwarded to `target_url`.\n\nDefinitions come from two sources merged at load time (ADR-0002): files\n(see [`crate::loader`]) and storage records under\n[`api_definition_storage_key`], managed through the admin API.\n\n# Example (JSON)\n\n```json\n{\n  \"api_id\": \"httpbin\",\n  \"name\": \"Httpbin passthrough\",\n  \"listen_path\": \"/httpbin/\",\n  \"target_url\": \"http://httpbin.default.svc.cluster.local\"\n}\n```",
+        "required": [
+          "api_id",
+          "name",
+          "listen_path",
+          "target_url"
+        ],
+        "properties": {
+          "active": {
+            "type": "boolean",
+            "description": "Inactive definitions are loaded and listed but never routed to."
+          },
+          "allow_ips": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "When non-empty, only clients whose socket address matches one of\nthese IPs/CIDR networks may use this API; everyone else gets `403`.\nThe peer address is used, never client-supplied headers like\n`X-Forwarded-For` (which are spoofable)."
+          },
+          "allow_paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PathRule"
+            },
+            "description": "When non-empty, only requests matching one of these rules are\nforwarded; everything else on this API is rejected with `403` (the\nAPI becomes allow-list-only). See [`crate::endpoints`] for the\nevaluation order."
+          },
+          "api_id": {
+            "type": "string",
+            "description": "Unique, stable identifier for this API."
+          },
+          "auth": {
+            "$ref": "#/components/schemas/AuthConfig",
+            "description": "How clients authenticate. Defaults to token auth on the\n`Authorization` header; keyless must be requested explicitly."
+          },
+          "block_ips": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Clients whose socket address matches one of these IPs/CIDR networks\nare rejected with `403`. A block always wins over `allow_ips`."
+          },
+          "block_paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PathRule"
+            },
+            "description": "Requests matching one of these rules are rejected with `403`. A\nblock always wins: it applies even to paths that are also allowed,\nignored, or mocked."
+          },
+          "cache": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CacheConfig",
+                "description": "Optional response caching: safe-method (`GET`/`HEAD`/`OPTIONS`) `2xx`\nupstream responses are stored in shared storage for a per-API TTL and\nreplayed without contacting the upstream (see [`CacheConfig`]).\nUnset = no caching."
+              }
+            ]
+          },
+          "circuit_breaker": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CircuitBreakerConfig",
+                "description": "Optional per-route circuit breaking: after enough consecutive\nupstream failures on live traffic, requests are answered `503`\nwithout contacting the upstream until a cooldown trial succeeds (see\n[`CircuitBreakerConfig`]). Unset = no breaking."
+              }
+            ]
+          },
+          "cors": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CorsConfig",
+                "description": "Optional CORS settings: when present the gateway answers preflight\nrequests and decorates responses with `Access-Control-*` headers\n(see [`CorsConfig`])."
+              }
+            ]
+          },
+          "enable_upgrades": {
+            "type": "boolean",
+            "description": "When `true`, HTTP/1.1 `Connection: Upgrade` requests (WebSocket being\nthe common protocol) are passed through: the upgrade headers are\nforwarded, and when the upstream answers `101 Switching Protocols` the\ngateway tunnels the connection's raw bytes in both directions for its\nremaining lifetime. The upgrade *request* still runs the full\nmiddleware chain (auth, rate limits, path lists), but bytes inside an\nestablished tunnel are opaque to the gateway. When `false` (the\ndefault) the upgrade headers are stripped like any other hop-by-hop\nheader and the request is proxied as plain HTTP."
+          },
+          "endpoint_rate_limits": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EndpointRateLimit"
+            },
+            "description": "Aggregate per-endpoint rate limits: the first rule matching a\nrequest caps how many matching requests **all clients combined** may\nmake per window; excess is rejected with `429`. Counted\nindependently of any key session's rate/quota and enforced even on\nkeyless APIs and `ignore_auth_paths` matches (see\n[`EndpointRateLimit`])."
+          },
+          "graphql": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GraphQlConfig",
+                "description": "Optional GraphQL settings: present, the API is treated as a GraphQL\nAPI — requests are parsed, validated against the configured schema,\nand policed (depth limits, introspection control, per-key field\npermissions) before being proxied (see [`GraphQlConfig`]).\nUnset = plain HTTP proxying."
+              }
+            ]
+          },
+          "health_check": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HealthCheckConfig",
+                "description": "Optional active upstream health checking: each pod probes every\nupstream address on an interval and evicts failing addresses from the\nload-balancing rotation until they recover (see\n[`HealthCheckConfig`]). Unset = no probing."
+              }
+            ]
+          },
+          "ignore_auth_paths": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PathRule"
+            },
+            "description": "Requests matching one of these rules skip authentication (and with\nit session rate limiting, which needs a session) — e.g. a public\nhealth or webhook endpoint on an otherwise protected API. API-level\n[`endpoint_rate_limits`](Self::endpoint_rate_limits) still apply."
+          },
+          "listen_path": {
+            "type": "string",
+            "description": "URL path prefix the gateway listens on for this API. Must begin with `/`."
+          },
+          "max_request_body_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Maximum request body size in bytes; larger requests are rejected\nwith `413`. Enforced on the `Content-Length` header and, for\nchunked/streamed bodies, on the actual bytes read. Unset = no limit.",
+            "minimum": 0
+          },
+          "mock_responses": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MockResponse"
+            },
+            "description": "Mock-response rules, tried in order after auth and rate limiting;\nthe first match is answered by the gateway without contacting the\nupstream (see [`MockResponse`])."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable name (shown in logs and the future dashboard)."
+          },
+          "org_id": {
+            "type": "string",
+            "description": "Owning organization. Always [`DEFAULT_ORG_ID`] in single-org mode."
+          },
+          "plugins": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginsConfig",
+                "description": "Optional WASM plugin hooks: guest modules run before authentication\n(`pre`) and after authentication/rate limiting (`post`), able to\nmutate request headers or answer the request themselves (see\n[`PluginsConfig`]). Unset = no plugins."
+              }
+            ]
+          },
+          "preserve_host_header": {
+            "type": "boolean",
+            "description": "When `true`, the client's original `Host` header is forwarded upstream.\nWhen `false` (the default), the upstream host from `target_url` is used."
+          },
+          "service_discovery": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServiceDiscoveryConfig",
+                "description": "Optional upstream service discovery: each pod polls an HTTP+JSON\nendpoint on an interval and live-swaps the API's load-balancing\ntargets to the discovered addresses (see [`ServiceDiscoveryConfig`]).\n[`Self::target_list`]/[`Self::target_url`] remain the seed addresses\nused until the first successful poll. Unset = static targets only."
+              }
+            ]
+          },
+          "strip_listen_path": {
+            "type": "boolean",
+            "description": "When `true` (the default), the `listen_path` prefix is removed from the\nrequest path before the request is forwarded upstream."
+          },
+          "target_list": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Upstream base URLs for round-robin load balancing. When non-empty,\nupstream requests rotate across these\nURLs — each gateway pod keeps its own rotation — and [`Self::target_url`]\nis not used for forwarding. Every entry follows `target_url`'s rules\nand may carry its own base path."
+          },
+          "target_url": {
+            "type": "string",
+            "description": "Base URL of the upstream service, e.g. `http://users.svc:8000/api`.\nMust be an absolute `http`/`https` URL."
+          },
+          "transform_body": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BodyTransforms",
+                "description": "Optional minijinja body transforms for matching request and response\nbodies (see [`BodyTransforms`]). Matching bodies are buffered whole —\nrequests up to [`max_request_body_bytes`](Self::max_request_body_bytes)\n(else 1 MiB, over → `413`), responses up to the block's\n`max_response_body_bytes` (over → `502`) — and transforms fail closed:\na failing render answers `500` (request) or `502` (response) rather\nthan passing the original body through. Templates see JSON-parsed\nbodies only (`body` is `none` for non-JSON payloads; `raw` always\ncarries the text). Design: ADR-0007."
+              }
+            ]
+          },
+          "transform_headers": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HeaderTransforms",
+                "description": "Optional header add/remove transforms applied to this API's\nupstream-bound requests and client-bound responses."
+              }
+            ]
+          },
+          "transform_method": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional HTTP method override for upstream-bound requests (e.g.\n`\"POST\"`, case-insensitive; `CONNECT` is not allowed). The body and\nheaders are forwarded unchanged, and gateway responses still describe\nthe client's original method."
+          },
+          "upstream_http2": {
+            "type": "boolean",
+            "description": "When `true`, every upstream request for this API is sent over\nHTTP/2: plaintext `http://` targets speak h2c (prior knowledge —\nthe upstream must accept HTTP/2 directly, there is no HTTP/1.1\nfallback), and `https://` targets offer only `h2` via ALPN. This is\nwhat makes gRPC passthrough work end to end (response trailers such\nas `grpc-status` are forwarded), but it applies to *all* the API's\nupstream traffic, gRPC or not. Cannot be combined with\n[`Self::enable_upgrades`]: an HTTP/1.1 `Connection: Upgrade` cannot\ncross an HTTP/2-only upstream connection. When `false` (the\ndefault) upstream requests are HTTP/1.1."
+          },
+          "upstream_retries": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Additional forwarding attempts after an upstream transport failure\n(connection refused/reset — not timeouts or `5xx` responses), at most\n`10`. Each attempt picks the next load-balancing address. Only\nrequests that can be safely replayed are retried: idempotent methods\n(`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`, `TRACE`, after any method\ntransform) whose body is empty — a streamed request body cannot be\nre-sent. All attempts share the API's one `upstream_timeout_ms`\nbudget. Defaults to `0` (no retries).",
+            "minimum": 0
+          },
+          "upstream_timeout_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Maximum time in milliseconds to wait for the upstream response before\nanswering `504 Gateway Timeout`.",
+            "minimum": 0
+          },
+          "url_rewrites": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/UrlRewriteRule"
+            },
+            "description": "Regex URL rewrite rules, tried in order against the full client\nrequest path; the first match decides the upstream path (see\n[`UrlRewriteRule`]). Requests matching no rule follow the normal\nlisten-path strip/join."
+          },
+          "versioning": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/VersioningConfig",
+                "description": "Optional API versioning: the request header or query parameter that\nselects a version, and per-version overrides applied on top of this\ndefinition (see [`VersioningConfig`]). Unset = unversioned."
+              }
+            ]
+          }
+        }
+      },
+      "AuthConfig": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "No authentication: every request is forwarded. Explicit opt-out.",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "keyless"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Bearer/API-token auth: the token is looked up (hashed) in storage and\nmust resolve to a live [`KeySession`](crate::KeySession).\n\nThe token is searched in `header` first, then `query_param`, then\n`cookie` (each only if configured).",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "cookie": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional cookie name also accepted as a token carrier."
+              },
+              "header": {
+                "type": "string",
+                "description": "Request header carrying the token. A `Bearer ` prefix, if present,\nis stripped."
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "auth_token"
+                ]
+              },
+              "query_param": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Optional query parameter also accepted as a token carrier."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "JWT bearer auth: the token in `header` is verified against a static\nkey (or a key fetched from `jwks_url`) and its claims are turned into\nan ephemeral session (no storage lookup).",
+            "required": [
+              "signing_method",
+              "mode"
+            ],
+            "properties": {
+              "header": {
+                "type": "string",
+                "description": "Request header carrying the JWT (a `Bearer ` prefix is stripped)."
+              },
+              "identity_claim": {
+                "type": "string",
+                "description": "Claim used as the caller identity (session alias and rate-limit\nkey). Defaults to `sub`."
+              },
+              "jwks_refresh_secs": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Seconds between background JWKS re-fetches. Defaults to\n[`DEFAULT_JWKS_REFRESH_SECS`]; only valid alongside `jwks_url`.",
+                "minimum": 0
+              },
+              "jwks_url": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "URL of a JWKS document (RFC 7517 key set) to fetch RS256\nverification keys from; tokens must carry a `kid` matching a key\nin the set. Mutually exclusive with `public_key_pem`; rs256 only."
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "jwt"
+                ]
+              },
+              "public_key_pem": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "PEM-encoded RSA public key for [`JwtSigningMethod::Rs256`]."
+              },
+              "secret": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Shared secret for [`JwtSigningMethod::Hs256`]."
+              },
+              "signing_method": {
+                "$ref": "#/components/schemas/JwtSigningMethod",
+                "description": "Signature algorithm the tokens must use."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "OIDC bearer auth: RS256 tokens issued by an external identity\nprovider are verified against keys discovered from `issuer_url`\n(or fetched directly from `jwks_url`), with exact `iss` and `aud`\nchecks, and their claims are turned into an ephemeral session.\n\nOptionally maps the OAuth2 client id (read from `policy_claim`) to a\nstored [`Policy`](crate::Policy) via `policy_map`.",
+            "required": [
+              "issuer_url",
+              "audiences",
+              "mode"
+            ],
+            "properties": {
+              "audiences": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Accepted `aud` values; required and non-empty (a deliberate\nhardening choice). A token passes if its `aud`\nintersects this list."
+              },
+              "header": {
+                "type": "string",
+                "description": "Request header carrying the token (a `Bearer ` prefix is\nstripped)."
+              },
+              "identity_claim": {
+                "type": "string",
+                "description": "Claim used as the caller identity (session alias and rate-limit\nkey). Defaults to `sub`."
+              },
+              "issuer_url": {
+                "type": "string",
+                "description": "Identity provider issuer URL. Matched **byte-for-byte** against\nthe token's `iss` claim (a trailing-slash mismatch fails\nclosed, per OIDC), and used as the base of the discovery URL\n`{issuer_url}/.well-known/openid-configuration` (one trailing\n`/` is trimmed before concatenation only)."
+              },
+              "jwks_refresh_secs": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Seconds between background JWKS re-fetches. Defaults to\n[`DEFAULT_JWKS_REFRESH_SECS`].",
+                "minimum": 0
+              },
+              "jwks_url": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "Direct JWKS URL, skipping OIDC discovery — for providers whose\ndiscovery document is absent or non-standard."
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "oidc"
+                ]
+              },
+              "policy_claim": {
+                "type": "string",
+                "description": "Claim holding the OAuth2 client id used for policy mapping.\nDefaults to [`DEFAULT_OIDC_POLICY_CLAIM`] (`azp`); RFC 9068\naccess tokens may want `client_id` instead. (A single\nconfigurable claim, not `aud`/`azp` heuristics.)"
+              },
+              "policy_map": {
+                "type": "object",
+                "description": "Client id → policy id. When non-empty, a token whose client id\nis not mapped is rejected (deny-unmatched); when\nempty (the default), tokens get a JWT-like ephemeral session\nwith access to this API only.",
+                "additionalProperties": {
+                  "type": "string"
+                },
+                "propertyNames": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "HTTP Basic auth (RFC 7617): `Authorization: Basic base64(user:pass)`.\n\nThe username resolves (hashed, under a `basic:` namespace) to a\nstored [`KeySession`](crate::KeySession) whose\n[`basic_auth`](crate::session::BasicAuthData) data carries the\nbcrypt hash the presented password is verified against. Credentials\nare read from the `Authorization` header only — never query or\ncookie carriers, which would leak passwords into logs.",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "basic_auth"
+                ]
+              },
+              "realm": {
+                "type": "string",
+                "description": "Realm advertised in the `WWW-Authenticate: Basic realm=\"…\"`\nchallenge on 401 responses. Defaults to\n[`DEFAULT_BASIC_AUTH_REALM`]."
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Mutual-TLS auth: the client certificate the TLS handshake verified\nis the credential.\n\nThe certificate's SHA-256 fingerprint (see\n[`session::cert_fingerprint_hex`](crate::session::cert_fingerprint_hex))\nresolves — hashed, under an `mtls:` namespace — to a stored\n[`KeySession`](crate::KeySession), provisioned via the admin key\nCRUD as the raw key `mtls:{fingerprint}`. A certificate the CA\nsigned but nobody provisioned is rejected: transport-level\nverification (the gateway's `tls.client_cert_mode`) and per-API\nauthorization are separate layers. Requires the gateway to\nterminate TLS with `client_cert_mode: optional` or `required`; see\n`docs/tls.md`.",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "mtls"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "HMAC request-signature auth (draft-cavage HTTP Signatures):\n`Authorization: Signature keyId=\"…\",algorithm=\"hmac-sha256\",\nheaders=\"(request-target) date\",signature=\"…\"`.\n\nThe `keyId` resolves (hashed, under an `hmac:` namespace) to a stored\n[`KeySession`](crate::KeySession) whose\n[`hmac`](crate::session::HmacData) data carries the shared secret the\nsignature is verified with; provisioning is the admin key CRUD with\nthe raw key `hmac:{keyId}`. Credentials are read from the\n`Authorization` header only (where the `Signature` scheme lives).",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "allowed_algorithms": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/HmacAlgorithm"
+                },
+                "description": "Algorithms accepted from the `Signature` header. Defaults to all\nthree SHA-2 variants; `hmac-sha1` is deliberately unsupported."
+              },
+              "allowed_clock_skew_secs": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64",
+                "description": "Maximum seconds the request's `Date` header may differ from the\ngateway clock. Defaults to [`DEFAULT_HMAC_CLOCK_SKEW_SECS`]; an\nexplicit `null` disables the check. While enabled, `date` must be\namong the signed headers (an unsigned `Date` is\nattacker-controlled, so a skew check on it would prove nothing).\n\nNever skip-serialized: `null` is a meaningful third state\n(disabled), distinct from absent (default 300).",
+                "minimum": 0
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "hmac"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "How clients authenticate to one API.\n\nThe default is [`AuthConfig::AuthToken`] reading the `Authorization`\nheader: an API is protected unless its definition **explicitly** opts out\nwith `{\"auth\": {\"mode\": \"keyless\"}}`. Forgetting to configure auth must\nnever silently expose an upstream."
+      },
+      "BasicAuthData": {
+        "type": "object",
+        "description": "Basic-auth credential data attached to a session.\n\nPresent only on sessions addressed by a username (basic-auth mode); the\npresented password is verified against `password_hash` on every request.",
+        "required": [
+          "password_hash"
+        ],
+        "properties": {
+          "password_hash": {
+            "type": "string",
+            "description": "bcrypt hash of the user's password (a full `$2b$…` hash string).\nThe plaintext password is never persisted."
+          }
+        }
+      },
+      "BodyTransformRule": {
+        "type": "object",
+        "description": "One body-transform rule: requests (or responses) matching it have their\nbody replaced by the rendered `template`.\n\nThe template is minijinja (Jinja2 syntax), inline in the definition —\nthere is no file/blob mode (a deliberate simplification: definitions\nstay self-contained). It renders against `body` (the payload parsed as\nJSON, `none` when it does not parse), `raw` (the payload as a lossy UTF-8\nstring) and `_g2` (request metadata: `method`, `path`, `query`,\n`headers`, `session`, plus `status` for response rules).\n\n# Example (JSON)\n\n```json\n{\n  \"pattern\": \"^/users/orders$\",\n  \"methods\": [\"POST\"],\n  \"template\": \"{\\\"order\\\": {{ body.id | tojson }}, \\\"src\\\": \\\"g2\\\"}\",\n  \"content_type\": \"application/json\"\n}\n```",
+        "required": [
+          "pattern",
+          "template"
+        ],
+        "properties": {
+          "content_type": {
+            "type": "string",
+            "description": "`Content-Type` set on the transformed message. Defaults to\n`application/json`."
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Methods the rule applies to (case-insensitive). Empty = every method."
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Regex searched against the full client request path."
+          },
+          "template": {
+            "type": "string",
+            "description": "The minijinja template whose rendered output replaces the body."
+          }
+        }
+      },
+      "BodyTransforms": {
+        "type": "object",
+        "description": "Request and response body transforms for one API.\n\nConfigured on an [`ApiDefinition`](crate::ApiDefinition) as\n`transform_body`. Applied only to traffic that reaches the forwarding\nstage — gateway-generated rejections (401/403/429) are never transformed,\nwhile mock responses and cached responses are, matching the\nheader-transform contract.\n\n# Example (JSON)\n\n```json\n{\n  \"request\": [\n    { \"pattern\": \"^/users/orders$\", \"methods\": [\"POST\"],\n      \"template\": \"{\\\"wrapped\\\": {{ raw | tojson }}}\" }\n  ],\n  \"response\": [\n    { \"pattern\": \"^/users/\",\n      \"template\": \"{\\\"data\\\": {{ body | tojson }}, \\\"status\\\": {{ _g2.status }}}\" }\n  ],\n  \"max_response_body_bytes\": 1048576\n}\n```",
+        "properties": {
+          "max_response_body_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Cap on a buffered upstream response body; a matching response larger\nthan this is rejected with `502` (transforms fail closed). Defaults\nto 1 MiB. Request bodies are capped by the API's\n`max_request_body_bytes` (same 1 MiB default) instead.",
+            "minimum": 0
+          },
+          "request": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BodyTransformRule"
+            },
+            "description": "Rules for upstream-bound request bodies. First match wins."
+          },
+          "response": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/BodyTransformRule"
+            },
+            "description": "Rules for client-bound response bodies, matched on the *request's*\nmethod and path. First match wins."
+          }
+        }
+      },
+      "CacheConfig": {
+        "type": "object",
+        "description": "Response caching for one API (see [`ApiDefinition::cache`]).\n\nThe gateway caches upstream responses in storage (shared by every pod)\nunder [`response_cache_key_prefix`] and answers repeat requests without\ncontacting the upstream, marking them with an `x-g2-cache: hit` header.\n\nWhat is cached is deliberately conservative:\n\n- **Safe methods only** (`GET`, `HEAD`, `OPTIONS`). Each method\n  caches separately.\n- **`2xx` responses only**, and never a response carrying `Set-Cookie`:\n  the cache is shared across clients and keys, so a\n  per-client response must never be replayed to someone else.\n- Bodies larger than `max_body_bytes` are passed through uncached.\n\nEntries are keyed by the exact request method, path, and query (no\nnormalization: `?a=1&b=2` and `?b=2&a=1` cache separately) and expire\nafter `ttl_secs`. HTTP cache-control semantics (`Vary`, `no-store`,\n`Age`) are not interpreted — the TTL is the whole contract.\n\nGraphQL traffic (`POST`) is never cached here; `graphql.cache` reuses\nthis config shape for operation-keyed caching instead (ADR-0012).",
+        "properties": {
+          "max_body_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Largest response body (in bytes) worth caching; bigger responses are\nstreamed through uncached. Defaults to 1 MiB.",
+            "minimum": 0
+          },
+          "ttl_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Seconds a cached response is served before it expires. Defaults to\n`60`.",
+            "minimum": 0
+          }
+        }
+      },
+      "CircuitBreakerConfig": {
+        "type": "object",
+        "description": "Per-route circuit breaking on live traffic (see\n[`ApiDefinition::circuit_breaker`]).\n\nEach gateway pod counts consecutive upstream failures — transport errors,\nupstream timeouts, and `5xx` upstream responses — for the route. After\n`failure_threshold` consecutive failures the circuit *opens*: requests are\nrejected with `503` without contacting the upstream for `cooldown_ms`.\nThe first request after the cooldown is let through as a trial\n(*half-open*): its success closes the circuit, its failure re-opens it\nfor another cooldown. Any upstream success resets the failure count.\n\nA deliberate design choice: rather than a rate-based breaker\n(`threshold_percent` over `samples`, per endpoint), this one counts\nconsecutive failures per route, which needs no sliding sample window and\nstays lock-free on the hot path. State is pod-local, like load-balancing\nrotation and health eviction.",
+        "properties": {
+          "cooldown_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Milliseconds the circuit stays open before a trial request is let\nthrough. Defaults to `30000`.",
+            "minimum": 0
+          },
+          "failure_threshold": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive upstream failures after which the circuit opens.\nDefaults to `5`.",
+            "minimum": 0
+          }
+        }
+      },
+      "CorsConfig": {
+        "type": "object",
+        "description": "Cross-Origin Resource Sharing settings for one API.\n\nWhen configured, the gateway answers preflight `OPTIONS` requests itself\n(unless `options_passthrough` is set) and decorates responses — gateway\nrejections like `401`/`429` included, so browsers can read them — with\nthe appropriate `Access-Control-*` headers. Requests from origins not\nlisted here are still forwarded, just without CORS headers: enforcement\nis the browser's job, access control is the IP/path lists' and auth's.\n\n# Example (JSON)\n\n```json\n{\n  \"allowed_origins\": [\"https://app.example.com\"],\n  \"allowed_methods\": [\"GET\", \"POST\", \"DELETE\"],\n  \"allowed_headers\": [\"Authorization\", \"Content-Type\"],\n  \"allow_credentials\": true,\n  \"max_age_secs\": 600\n}\n```",
+        "required": [
+          "allowed_origins"
+        ],
+        "properties": {
+          "allow_credentials": {
+            "type": "boolean",
+            "description": "Whether `Access-Control-Allow-Credentials: true` is sent. Requires\nexplicit `allowed_origins` (the wildcard is rejected — browsers\nrefuse that combination anyway)."
+          },
+          "allowed_headers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Request headers advertised to preflight requests. Empty (the\ndefault) mirrors whatever headers the preflight asks for."
+          },
+          "allowed_methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Methods advertised to preflight requests. Defaults to the\nCORS-safelisted methods ([`DEFAULT_CORS_METHODS`])."
+          },
+          "allowed_origins": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Origins allowed to make cross-origin requests, e.g.\n`https://app.example.com` (scheme, host, optional port — no path).\nThe single entry `\"*\"` allows every origin, but cannot be combined\nwith other origins or with `allow_credentials`."
+          },
+          "exposed_headers": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Response headers browsers may expose to cross-origin scripts\n(`Access-Control-Expose-Headers`)."
+          },
+          "max_age_secs": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Seconds browsers may cache a preflight result\n(`Access-Control-Max-Age`). Omitted from responses when unset.",
+            "minimum": 0
+          },
+          "options_passthrough": {
+            "type": "boolean",
+            "description": "When `true`, preflight `OPTIONS` requests are forwarded to the\nupstream instead of being answered by the gateway. Responses are\nstill decorated."
+          }
+        }
+      },
+      "EndpointRateLimit": {
+        "type": "object",
+        "description": "One API-level endpoint rate limit: the first rule matching a request caps\nhow many matching requests **all clients combined** may make per window.\n\nCounters are aggregate — they are not tied to any key session, so the\nlimit also protects keyless APIs and `ignore_auth_paths` matches. Excess\nrequests are rejected with `429` and the usual `X-RateLimit-*` headers.\nRules are tried in order; only the first match is checked and consumed.\n\n# Example (JSON)\n\n```json\n{\n  \"pattern\": \"^/users/search\",\n  \"methods\": [\"POST\"],\n  \"rate\": { \"requests\": 10, \"per_seconds\": 60 }\n}\n```",
+        "required": [
+          "pattern",
+          "rate"
+        ],
+        "properties": {
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Methods the rule applies to (case-insensitive). Empty = every method."
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Regex searched against the full client request path."
+          },
+          "rate": {
+            "$ref": "#/components/schemas/RateLimit",
+            "description": "The aggregate allowance for matching requests, across all clients."
+          }
+        }
+      },
+      "GraphQlConfig": {
+        "type": "object",
+        "description": "GraphQL settings for one API (see [`ApiDefinition::graphql`]).\n\nPresent on a definition, the API is treated as a GraphQL API: requests\nare parsed as GraphQL, validated against [`schema`](Self::schema), and\npoliced (depth limits, introspection control, per-key field permissions\nfrom [`ApiAccess`](crate::session::ApiAccess)) before being forwarded.\n\n# Example (JSON)\n\n```json\n{\n  \"schema\": \"type Query { hello: String }\",\n  \"max_query_depth\": 8,\n  \"introspection_enabled\": false,\n  \"playground\": { \"path\": \"/playground\" }\n}\n```\n\n[`ApiDefinition::graphql`]: crate::ApiDefinition::graphql",
+        "properties": {
+          "cache": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CacheConfig",
+                "description": "GraphQL-aware response caching (ADR-0012). When set, responses to\n**query** operations are cached — keyed on the active schema, the\noperation name, the query text, and the variables — and repeat\nqueries are answered without contacting the upstream (or re-running\ngateway-side execution), marked `x-g2-cache: hit`. Mutations and\nsubscriptions always bypass, and a response carrying GraphQL\n`errors` is never stored. The cache is shared across clients like\n[`ApiDefinition::cache`](crate::ApiDefinition::cache); per-key\ngrants are re-checked on every request before the cache is read.\nUnset = GraphQL responses are not cached."
+              }
+            ]
+          },
+          "data_sources": {
+            "type": "object",
+            "description": "Universal Data Graph data sources, keyed `\"<RootType>.<field>\"`\n(e.g. `\"Query.user\"` — the schema's actual root operation type\nnames). Required (and only allowed) when\n[`execution_mode`](Self::execution_mode) is\n[`Udg`](GraphQlExecutionMode::Udg); every field of the query and\nmutation root types must be mapped (ADR-0010).",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/UdgDataSource"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "enabled": {
+            "type": "boolean",
+            "description": "Kill switch: `false` disables all GraphQL handling for the API while\nkeeping the configuration in place (the config is still validated).\nDefaults to `true`."
+          },
+          "execution_mode": {
+            "$ref": "#/components/schemas/GraphQlExecutionMode",
+            "description": "How the gateway executes GraphQL. Defaults to (and currently only\nsupports) [`GraphQlExecutionMode::Proxy`]."
+          },
+          "introspection_enabled": {
+            "type": "boolean",
+            "description": "Whether introspection queries (`__schema` / `__type`) are allowed.\nDefaults to `true`; keys can additionally disable introspection for\nthemselves via\n[`ApiAccess::disable_introspection`](crate::session::ApiAccess::disable_introspection)."
+          },
+          "max_query_depth": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum query depth (nested selection-set levels; `{ a { b } }` is\ndepth 2). Deeper queries are rejected with `403`.\nUnset = unlimited; keys can override via\n[`ApiAccess::max_query_depth`](crate::session::ApiAccess::max_query_depth).",
+            "minimum": 0
+          },
+          "persisted_queries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PersistedQuery"
+            },
+            "description": "Persisted GraphQL-as-REST endpoints: REST-shaped routes the gateway\nanswers by building a GraphQL request server-side. Matched in\norder; the first match wins."
+          },
+          "playground": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PlaygroundConfig",
+                "description": "Optional gateway-served GraphiQL playground for this API. The page\nsits behind the API's full middleware chain, so a protected API's\nplayground requires credentials."
+              }
+            ]
+          },
+          "schema": {
+            "type": "string",
+            "description": "The API's GraphQL schema in SDL form; validated with apollo-compiler\nat write/load time. Incoming queries are validated against it — an\nunknown field or type never reaches the upstream. Required in every\nexecution mode except `supergraph`, where it must be **empty**: the\nsupergraph schema is composed from\n[`supergraph`](Self::supergraph), never authored (ADR-0011)."
+          },
+          "schema_sync": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SchemaSyncConfig",
+                "description": "Periodic schema sync from upstream introspection. When set, each\ngateway pod polls the upstream's introspection endpoint and swaps\nthe schema it validates against in memory (stale-on-error;\n[`schema`](Self::schema) stays required as the seed). Unset = the\nschema is static (ADR-0008)."
+              }
+            ]
+          },
+          "subscriptions": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SubscriptionsConfig",
+                "description": "GraphQL subscriptions over WebSocket. When set (and enabled), the\ngateway accepts `graphql-transport-ws` / `graphql-ws` WebSocket\nhandshakes on the listen path and polices every subscribe operation\nlike an HTTP query (ADR-0009). Unset = WebSocket handshakes on the\nGraphQL endpoint are rejected."
+              }
+            ]
+          },
+          "supergraph": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/SupergraphConfig",
+                "description": "Federation supergraph settings. Required (and only allowed) when\n[`execution_mode`](Self::execution_mode) is\n[`Supergraph`](GraphQlExecutionMode::Supergraph) (ADR-0011)."
+              }
+            ]
+          }
+        }
+      },
+      "GraphQlExecutionMode": {
+        "type": "string",
+        "description": "How the gateway executes GraphQL for an API.",
+        "enum": [
+          "proxy",
+          "udg",
+          "subgraph",
+          "supergraph"
+        ]
+      },
+      "HeaderTransform": {
+        "type": "object",
+        "description": "Header add/remove rules for one direction (request or response).\n\n`remove` runs before `add`, and `add` replaces any existing value — so a\nname appearing in both ends up set to the `add` value, and adding an\nalready-present header overwrites it rather than appending.",
+        "properties": {
+          "add": {
+            "type": "object",
+            "description": "Headers to set on the message: name → literal value. An existing\nheader of the same name is replaced.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "remove": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Header names to remove from the message (applied before `add`)."
+          }
+        }
+      },
+      "HeaderTransforms": {
+        "type": "object",
+        "description": "Request and response header transforms for one API.\n\nConfigured on an [`ApiDefinition`](crate::ApiDefinition) as\n`transform_headers`; applied only to traffic that reaches the forwarding\nstage (gateway-generated auth/rate-limit rejections are not\ntransformed).\n\n# Example (JSON)\n\n```json\n{\n  \"request\": {\n    \"add\": { \"X-Env\": \"prod\" },\n    \"remove\": [\"X-Internal-Debug\"]\n  },\n  \"response\": {\n    \"add\": { \"X-Gateway\": \"g2way\" },\n    \"remove\": [\"Server\"]\n  }\n}\n```",
+        "properties": {
+          "request": {
+            "$ref": "#/components/schemas/HeaderTransform",
+            "description": "Rules applied to the upstream-bound request."
+          },
+          "response": {
+            "$ref": "#/components/schemas/HeaderTransform",
+            "description": "Rules applied to the client-bound response."
+          }
+        }
+      },
+      "HealthCheckConfig": {
+        "type": "object",
+        "description": "Active upstream health checking with eviction (see\n[`ApiDefinition::health_check`]).\n\nEach gateway pod probes every upstream address of the API on a fixed\ninterval with `GET {address base path}{path}`; only a `2xx` answer within\n`timeout_ms` counts as healthy. An address failing `unhealthy_threshold`\nconsecutive probes is evicted from the load-balancing rotation until it\npasses `healthy_threshold` consecutive probes again.\n\nEviction never empties the pool: when every address is evicted, requests\nfall back to the plain rotation (a dead upstream then answers `502`\nexactly like an unchecked one), so probing a single-target API observes\nhealth without ever refusing traffic.",
+        "properties": {
+          "healthy_threshold": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive probe successes after which an evicted address rejoins\nthe rotation. Defaults to `2`.",
+            "minimum": 0
+          },
+          "interval_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Milliseconds between probe rounds (per pod). Defaults to `10000`.",
+            "minimum": 0
+          },
+          "path": {
+            "type": "string",
+            "description": "Path probed on each upstream address, joined onto the address's own\nbase path. Must start with `/`; defaults to\n[`DEFAULT_HEALTH_CHECK_PATH`]. May carry a query string."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Milliseconds a probe may take before counting as a failure.\nDefaults to `2000`.",
+            "minimum": 0
+          },
+          "unhealthy_threshold": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Consecutive probe failures after which an address is evicted from\nthe rotation. Defaults to `3`.",
+            "minimum": 0
+          }
+        }
+      },
+      "HmacAlgorithm": {
+        "type": "string",
+        "description": "HMAC digest algorithms supported by [`AuthConfig::Hmac`].\n\nSerialized with the draft-cavage wire names (`hmac-sha256`, …), which are\nalso what the `Signature` header's `algorithm` parameter carries.\n`hmac-sha1` is deliberately unsupported (a hardening choice).",
+        "enum": [
+          "hmac-sha256",
+          "hmac-sha384",
+          "hmac-sha512"
+        ]
+      },
+      "HmacData": {
+        "type": "object",
+        "description": "HMAC signing credentials attached to a session.\n\nPresent only on sessions addressed by a `keyId` (hmac mode); each\nrequest's `Signature` header is verified against `secret`.",
+        "required": [
+          "secret"
+        ],
+        "properties": {
+          "secret": {
+            "type": "string",
+            "description": "Shared secret, HMAC'd as its raw UTF-8 bytes (so ordinary client\nsnippets work verbatim; arbitrary binary secrets are not supported). Unlike a\nbcrypt hash, this is a live credential stored in plaintext — HMAC\nverification needs the secret itself."
+          }
+        }
+      },
+      "JwtSigningMethod": {
+        "type": "string",
+        "description": "JWT signature algorithms supported by [`AuthConfig::Jwt`].",
+        "enum": [
+          "hs256",
+          "rs256"
+        ]
+      },
+      "KeySession": {
+        "type": "object",
+        "description": "The state attached to one API key.\n\nSessions are created through the admin API (or seeded directly in\nstorage), persisted as JSON under [`session_storage_key`], and looked up\nby auth middleware on every request carrying the key.\n\n# Example (JSON)\n\n```json\n{\n  \"alias\": \"acme-mobile-app\",\n  \"rate\": { \"requests\": 100, \"per_seconds\": 60 },\n  \"quota\": { \"max\": 10000, \"renewal_rate_secs\": 3600 },\n  \"expires_at\": 1790000000,\n  \"access\": { \"httpbin\": {} }\n}\n```",
+        "properties": {
+          "access": {
+            "type": "object",
+            "description": "APIs this key may call, keyed by `api_id`. An **empty map grants\naccess to every API in the organization** (the behavior for keys\nwithout access rights).",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ApiAccess"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "active": {
+            "type": "boolean",
+            "description": "Inactive sessions fail auth without being deleted (a soft revoke)."
+          },
+          "alias": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional human-readable label, shown in logs and analytics in place\nof the (hashed, unreadable) key."
+          },
+          "apply_policies": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Policies applied to this key (see [`crate::Policy`]). When\nnon-empty, the referenced policy's rate/quota/access **replace**\nthis session's own at auth time ([`Self::apply_policy`]).\n\nA `Vec` for forward compatibility, but currently at most one entry\n(enforced by [`Self::validate`]); combining multiple policies needs\npartitioned policies, a later refinement."
+          },
+          "basic_auth": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BasicAuthData",
+                "description": "Basic-auth credentials, set only on sessions used with the\nbasic-auth mode. `None` means this session cannot authenticate via\nbasic auth."
+              }
+            ]
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix timestamp (seconds) after which the key stops working.\n`None` means the key never expires.",
+            "minimum": 0
+          },
+          "hmac": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HmacData",
+                "description": "HMAC signing credentials, set only on sessions used with the hmac\nmode. `None` means this session cannot authenticate via request\nsignatures."
+              }
+            ]
+          },
+          "org_id": {
+            "type": "string",
+            "description": "Owning organization. Always [`DEFAULT_ORG_ID`] in single-org mode."
+          },
+          "quota": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Quota",
+                "description": "Long-period usage quota. `None` means unlimited."
+              }
+            ]
+          },
+          "rate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RateLimit",
+                "description": "Request-rate allowance. `None` means unlimited."
+              }
+            ]
+          }
+        }
+      },
+      "MockResponse": {
+        "type": "object",
+        "description": "One mock-response rule: requests matching it are answered by the gateway\nitself, without contacting the upstream.\n\nRules are tried in order; the first match wins. The response carries\nexactly the configured `status`, `headers` and `body` — no content type\nis implied, set one in `headers` when the body needs it.\n\n# Example (JSON)\n\n```json\n{\n  \"pattern\": \"^/users/ping$\",\n  \"methods\": [\"GET\"],\n  \"status\": 200,\n  \"body\": \"{\\\"pong\\\":true}\",\n  \"headers\": { \"Content-Type\": \"application/json\" }\n}\n```",
+        "required": [
+          "pattern"
+        ],
+        "properties": {
+          "body": {
+            "type": "string",
+            "description": "Literal response body. Defaults to empty."
+          },
+          "headers": {
+            "type": "object",
+            "description": "Response headers: name → literal value.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Methods the rule applies to (case-insensitive). Empty = every method."
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Regex searched against the full client request path."
+          },
+          "status": {
+            "type": "integer",
+            "format": "int32",
+            "description": "HTTP status of the mock response. Defaults to `200`.",
+            "minimum": 0
+          }
+        }
+      },
+      "PathRule": {
+        "type": "object",
+        "description": "One path-matching rule in an allow/block/ignore list.\n\n# Example (JSON)\n\n```json\n{ \"pattern\": \"^/users/internal/\", \"methods\": [\"POST\", \"DELETE\"] }\n```",
+        "required": [
+          "pattern"
+        ],
+        "properties": {
+          "methods": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Methods the rule applies to (case-insensitive). Empty = every method."
+          },
+          "pattern": {
+            "type": "string",
+            "description": "Regex searched against the full client request path."
+          }
+        }
+      },
+      "PersistedQuery": {
+        "type": "object",
+        "description": "One persisted GraphQL-as-REST endpoint.\n\nA request matching `method` + `path` (relative to the listen path) is\nrewritten by the gateway into a `POST` of `operation` to the upstream\nGraphQL endpoint, with `variables` filled from the template below. The\npersisted operation is subject to the same protections (depth,\nintrospection, field permissions) as a client-written query.\n\n# Variable templating\n\n`variables` must be a JSON object. String values are substituted:\n\n- `\"$path.<name>\"` — the value of the `{<name>}` segment of `path`.\n- `\"$header.<name>\"` — the value of request header `<name>` (JSON\n  `null` when the header is absent).\n\nSubstitution recurses into nested objects and arrays; all other values\nare passed through verbatim.\n\n# Example (JSON)\n\n```json\n{\n  \"method\": \"GET\",\n  \"path\": \"/users/{id}\",\n  \"operation\": \"query User($id: ID!) { user(id: $id) { name } }\",\n  \"variables\": { \"id\": \"$path.id\" }\n}\n```",
+        "required": [
+          "method",
+          "path",
+          "operation"
+        ],
+        "properties": {
+          "method": {
+            "type": "string",
+            "description": "HTTP method the endpoint answers (case-insensitive; `CONNECT` is not\nallowed)."
+          },
+          "operation": {
+            "type": "string",
+            "description": "The GraphQL executable document sent upstream. Validated against the\nAPI's schema at write/load time."
+          },
+          "operation_name": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Operation to execute when `operation` defines several. Must name an\noperation in the document; required in that case."
+          },
+          "path": {
+            "type": "string",
+            "description": "Path relative to the API's listen path. Must start with `/`. A\nsegment of the form `{name}` matches any single segment and binds it\nfor `$path.<name>` substitution; names must be unique."
+          },
+          "variables": {
+            "type": "object",
+            "description": "Variables template (a JSON object; see the type-level docs for the\n`$path.` / `$header.` substitution rules). Unset = no variables."
+          }
+        }
+      },
+      "PlaygroundConfig": {
+        "type": "object",
+        "description": "Settings for the gateway-served GraphQL playground.",
+        "properties": {
+          "path": {
+            "type": "string",
+            "description": "Path the playground page is served on, relative to the API's listen\npath. Must start with `/`; defaults to [`DEFAULT_PLAYGROUND_PATH`]."
+          }
+        }
+      },
+      "PluginRef": {
+        "type": "object",
+        "description": "One plugin in a hook list: a guest module plus its instance settings.",
+        "required": [
+          "name",
+          "path"
+        ],
+        "properties": {
+          "config": {
+            "type": "object",
+            "description": "Arbitrary JSON handed to the guest verbatim on every invocation."
+          },
+          "max_memory_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Linear-memory cap per invocation in bytes\n(default [`DEFAULT_MAX_MEMORY_BYTES`]).",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Name used in logs and error messages."
+          },
+          "path": {
+            "type": "string",
+            "description": "Path of the `.wasm` module, relative to the gateway's `plugins_dir`.\nAbsolute paths and `..` components are rejected."
+          },
+          "timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Wall-clock budget per invocation in milliseconds\n(default [`DEFAULT_TIMEOUT_MS`], at most [`MAX_TIMEOUT_MS`]).",
+            "minimum": 0
+          }
+        }
+      },
+      "PluginsConfig": {
+        "type": "object",
+        "description": "The WASM pre/post hook lists for one API.\n\n# Example (JSON)\n\n```json\n{\n  \"pre\": [\n    { \"name\": \"header-tag\", \"path\": \"header_tag.wasm\",\n      \"config\": { \"header\": \"x-tenant\", \"value\": \"acme\" } }\n  ],\n  \"post\": []\n}\n```",
+        "properties": {
+          "post": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PluginRef"
+            },
+            "description": "Hooks run after authentication and rate limiting, in order."
+          },
+          "pre": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PluginRef"
+            },
+            "description": "Hooks run before authentication, in order."
+          }
+        }
+      },
+      "Policy": {
+        "type": "object",
+        "description": "A reusable bundle of rate, quota, and API access settings.\n\nWhen a key references a policy, the policy's `rate`, `quota`, and\n`access` **replace** the session's own wholesale (non-partitioned\npolicy semantics; partitioned policies, which override selectively, are\na possible later refinement). Per-key state — expiry, active flag,\nalias, basic-auth credentials — is never touched by a policy.\n\n# Example (JSON)\n\n```json\n{\n  \"policy_id\": \"free-tier\",\n  \"name\": \"Free tier\",\n  \"rate\": { \"requests\": 10, \"per_seconds\": 60 },\n  \"quota\": { \"max\": 1000, \"renewal_rate_secs\": 86400 },\n  \"access\": { \"httpbin\": {} }\n}\n```",
+        "required": [
+          "policy_id",
+          "name"
+        ],
+        "properties": {
+          "access": {
+            "type": "object",
+            "description": "APIs referencing keys may call, keyed by `api_id`. An **empty map\ngrants access to every API in the organization** (same rule as\n[`KeySession::access`](crate::KeySession::access)).",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/ApiAccess"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "active": {
+            "type": "boolean",
+            "description": "An inactive policy denies every key that references it (a soft kill\nswitch for a whole tier of keys)."
+          },
+          "name": {
+            "type": "string",
+            "description": "Human-readable name (shown in logs and the future dashboard)."
+          },
+          "org_id": {
+            "type": "string",
+            "description": "Owning organization. Always [`DEFAULT_ORG_ID`] in single-org mode."
+          },
+          "policy_id": {
+            "type": "string",
+            "description": "Unique, stable identifier keys reference in `apply_policies`."
+          },
+          "quota": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/Quota",
+                "description": "Long-period usage quota granted to referencing keys. `None` means\nunlimited."
+              }
+            ]
+          },
+          "rate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/RateLimit",
+                "description": "Request-rate allowance granted to referencing keys. `None` means\nunlimited."
+              }
+            ]
+          }
+        }
+      },
+      "Quota": {
+        "type": "object",
+        "description": "A long-period usage quota: at most `max` requests per renewal period.\n\nUnlike [`RateLimit`] (a smoothing limit over seconds or minutes), a quota\nis a billing-style allowance over hours or days. The live counter and its\nreset timestamp are kept in storage (milestone M3), not on the session.",
+        "required": [
+          "max",
+          "renewal_rate_secs"
+        ],
+        "properties": {
+          "max": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Maximum number of requests allowed inside one renewal period.",
+            "minimum": 0
+          },
+          "renewal_rate_secs": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Length of the renewal period in seconds (for example `3600` for an\nhourly quota).",
+            "minimum": 0
+          }
+        }
+      },
+      "RateLimit": {
+        "type": "object",
+        "description": "A request-rate allowance: at most `requests` per `per_seconds` window.",
+        "required": [
+          "requests",
+          "per_seconds"
+        ],
+        "properties": {
+          "per_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Length of the sliding window in seconds.",
+            "minimum": 0
+          },
+          "requests": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Maximum number of requests allowed inside one window.",
+            "minimum": 0
+          }
+        }
+      },
+      "SchemaSyncConfig": {
+        "type": "object",
+        "description": "Schema-sync settings: how a pod fetches the upstream's schema via\nGraphQL introspection (see [`GraphQlConfig::schema_sync`]).\n\nThe introspection `POST` goes to the API's own upstream (respecting\nload balancing, service discovery, and health eviction) unless\n[`url`](Self::url) points elsewhere. Every failure — transport, non-2xx,\ninvalid introspection JSON, a converted schema that does not compile, or\na persisted query invalid against the new schema — keeps the previous\nschema serving and is surfaced on `GET /g2/node`.\n\n# Example (JSON)\n\n```json\n{\n  \"interval_ms\": 300000,\n  \"headers\": { \"authorization\": \"Bearer token\" }\n}\n```",
+        "properties": {
+          "headers": {
+            "type": "object",
+            "description": "Extra headers on the introspection request (upstream auth): name →\nliteral value. Hop-by-hop headers are rejected.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "interval_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Milliseconds between introspection fetches (must be > 0). Defaults\nto [`DEFAULT_SCHEMA_SYNC_INTERVAL_MS`]. An admin-triggered sync\n(`POST /g2/graphql/sync`) fetches immediately regardless.",
+            "minimum": 0
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Per-fetch timeout in milliseconds (must be > 0). Defaults to\n[`DEFAULT_SCHEMA_SYNC_TIMEOUT_MS`].",
+            "minimum": 0
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Absolute `http(s)` URL to introspect instead of the API's upstream —\nfor when introspection is served elsewhere (e.g. an internal\nendpoint while the public one has introspection disabled)."
+          }
+        }
+      },
+      "ServiceDiscoveryConfig": {
+        "type": "object",
+        "description": "Upstream service discovery via HTTP+JSON polling (see\n[`ApiDefinition::service_discovery`]).\n\nEach gateway pod polls `endpoint` every `interval_ms` and extracts the\ncurrent upstream addresses from the JSON response using the configured\ndata paths (see [`Self::extract_entries`] for the exact semantics — the\nmechanism covers Consul/etcd/Eureka-style REST catalogs with one shape).\nA successful poll that yields a *different* address list replaces the\nAPI's load-balancing targets live, without a reload.\n\nUntil the first successful poll the API forwards to its static seeds\n(`target_list`, else `target_url` — which stays required as the\ncanonical fallback). A failed poll — fetch error, non-2xx, unparseable\nbody, extraction error, invalid entry, or an *empty* result — keeps the\nprevious addresses and logs a warning: stale targets beat empty targets,\nso discovery can never leave an API with nothing to forward to.\n\nPolling is pod-local (each pod polls the endpoint itself, like health\nprobing); the discovery endpoint is fetched over HTTP/1.1 regardless of\nthe API's `upstream_http2` setting, and response bodies are capped at\n1 MiB.",
+        "required": [
+          "endpoint"
+        ],
+        "properties": {
+          "data_path": {
+            "type": "string",
+            "description": "Dotted path to the host entry (or list of host entries) inside the\nJSON response — e.g. `\"Address\"` or `\"node.ip\"`. Segments index\nobject keys, or array elements when they parse as a number. Empty\n(the default) means the looked-up value itself."
+          },
+          "endpoint": {
+            "type": "string",
+            "description": "The URL polled for the current upstream addresses. Must be an\nabsolute `http`/`https` URL."
+          },
+          "interval_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Milliseconds between polls (per pod). Defaults to `10000`.",
+            "minimum": 0
+          },
+          "parent_data_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional dotted path to a JSON *array* to iterate: per element,\n[`Self::data_path`] and [`Self::port_data_path`] are resolved\nrelative to the element instead of the response root. Empty means\nthe response root itself is the array (e.g. Consul's\n`/v1/catalog/service/{name}`). Unset = no iteration; the paths\nresolve from the root."
+          },
+          "port_data_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional dotted path to the port for each host entry. The value must\nbe an integer `1`–`65535` or a string of digits. Unset = discovered\nentries carry their own port or use the scheme default."
+          },
+          "scheme": {
+            "type": "string",
+            "description": "Scheme (`http` or `https`) applied to discovered `host[:port]`\nentries. Defaults to [`DEFAULT_DISCOVERY_SCHEME`]. Entries that are\nalready full `http(s)://` URLs keep their own scheme."
+          },
+          "timeout_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Milliseconds a poll may take before counting as a failure.\nDefaults to `5000`.",
+            "minimum": 0
+          }
+        }
+      },
+      "SubgraphConfig": {
+        "type": "object",
+        "description": "One subgraph of a federation supergraph.",
+        "required": [
+          "name",
+          "url",
+          "sdl"
+        ],
+        "properties": {
+          "headers": {
+            "type": "object",
+            "description": "Extra headers on every fetch to this subgraph (upstream auth): name\n→ literal value. Hop-by-hop headers are rejected.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "max_response_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Cap on a response body in bytes (must be > 0). Unset =\n[`DEFAULT_UDG_MAX_RESPONSE_BYTES`].",
+            "minimum": 0
+          },
+          "name": {
+            "type": "string",
+            "description": "Unique name of the subgraph — used in composition errors and in the\nfield errors clients see when a subgraph fetch fails (upstream URLs\nare never exposed)."
+          },
+          "sdl": {
+            "type": "string",
+            "description": "The subgraph's federation SDL (`@key` and friends), pasted into the\ndefinition so composition is deterministic and validated at write\ntime (ADR-0011)."
+          },
+          "timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Per-fetch timeout in milliseconds (must be > 0). Unset = the API's\n`upstream_timeout_ms`.",
+            "minimum": 0
+          },
+          "url": {
+            "type": "string",
+            "description": "Absolute `http(s)` URL of the subgraph's GraphQL endpoint."
+          }
+        }
+      },
+      "SubscriptionsConfig": {
+        "type": "object",
+        "description": "GraphQL-subscriptions-over-WebSocket settings (see\n[`GraphQlConfig::subscriptions`]).\n\nThe gateway terminates the WebSocket subprotocol on both legs: client\n`subscribe`/`start` payloads are validated against the schema and the\nper-key grants before being forwarded; violations are answered with\nprotocol-level `error` messages and never reach the upstream. Upstream\nframes are relayed verbatim. Requires the schema to define a\n`Subscription` root type.\n\n# Example (JSON)\n\n```json\n{ \"max_message_bytes\": 262144 }\n```",
+        "properties": {
+          "enabled": {
+            "type": "boolean",
+            "description": "Kill switch inside the block; defaults to `true` (presence of the\nblock enables subscriptions, like [`GraphQlConfig::playground`])."
+          },
+          "max_message_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Cap on a single client→gateway WebSocket message (must be > 0).\nUnset = the API's `max_request_body_bytes`, else 1 MiB — the same\nbound the HTTP-side body buffering uses.",
+            "minimum": 0
+          }
+        }
+      },
+      "SupergraphConfig": {
+        "type": "object",
+        "description": "Federation supergraph settings (see [`GraphQlConfig::supergraph`]).\n\n# Example (JSON)\n\n```json\n{\n  \"subgraphs\": [\n    { \"name\": \"users\", \"url\": \"http://users.internal/graphql\",\n      \"sdl\": \"type Query { user(id: ID!): User } type User @key(fields: \\\"id\\\") { id: ID! name: String }\" },\n    { \"name\": \"reviews\", \"url\": \"http://reviews.internal/graphql\",\n      \"sdl\": \"type User @key(fields: \\\"id\\\") { id: ID! @external reviews: [String!] } type Query { noop: Int }\" }\n  ]\n}\n```",
+        "required": [
+          "subgraphs"
+        ],
+        "properties": {
+          "subgraphs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SubgraphConfig"
+            },
+            "description": "The subgraphs to compose, in composition order. At least one."
+          }
+        }
+      },
+      "TypeFields": {
+        "type": "object",
+        "description": "One GraphQL type and the fields of it a grant refers to.\n\nUsed by the allow/block lists of [`ApiAccess`]. A `fields` entry of\n`\"*\"` refers to every field of the type, current and future\n(non-recursive — it does not cascade into nested types).",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "fields": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Field names of the type; `\"*\"` means every field."
+          },
+          "name": {
+            "type": "string",
+            "description": "The GraphQL type name (e.g. `Query`, `User`)."
+          }
+        }
+      },
+      "UdgDataSource": {
+        "oneOf": [
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UdgRestSource",
+                "description": "A REST/JSON endpoint: the response body is the field's JSON value."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "rest"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "A REST/JSON endpoint: the response body is the field's JSON value."
+          },
+          {
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/UdgGraphQlSource",
+                "description": "An upstream GraphQL service: the gateway sends the root field's\nsub-selection as a standalone query and merges the response."
+              },
+              {
+                "type": "object",
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "graphql"
+                    ]
+                  }
+                }
+              }
+            ],
+            "description": "An upstream GraphQL service: the gateway sends the root field's\nsub-selection as a standalone query and merges the response."
+          }
+        ],
+        "description": "One Universal Data Graph data source (see\n[`GraphQlConfig::data_sources`]): where the gateway fetches the value of\none root field in UDG mode.\n\n# Example (JSON)\n\n```json\n{ \"kind\": \"rest\", \"url\": \"http://users.internal/users/{{ args.id }}\" }\n```"
+      },
+      "UdgGraphQlSource": {
+        "type": "object",
+        "description": "A GraphQL data source for one UDG root field.\n\nThe gateway prints the requested field (selection set, aliases, and\narguments verbatim) together with the fragment definitions and variable\ndefinitions its subtree uses, and `POST`s\n`{\"query\": …, \"variables\": …}` to [`url`](Self::url). The response's\n`data.<field>` becomes the field's value; its `errors` are appended to\nthe stitched response (message-only).",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "headers": {
+            "type": "object",
+            "description": "Extra headers on the fetch: name → value template (upstream auth).\nHop-by-hop headers are rejected.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "max_response_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Cap on the response body in bytes (must be > 0). Unset =\n[`DEFAULT_UDG_MAX_RESPONSE_BYTES`].",
+            "minimum": 0
+          },
+          "timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Per-fetch timeout in milliseconds (must be > 0). Unset = the API's\n`upstream_timeout_ms`.",
+            "minimum": 0
+          },
+          "url": {
+            "type": "string",
+            "description": "Absolute `http(s)` URL of the upstream GraphQL endpoint (not\ntemplated)."
+          }
+        }
+      },
+      "UdgRestSource": {
+        "type": "object",
+        "description": "A REST data source for one UDG root field.\n\n`url`, header values, and `body` are minijinja templates (ADR-0007's\nengine), rendered per request against\n`{ args, _g2: { method, path, headers, session: { alias } } }` where\n`args` are the coerced GraphQL field arguments. The rendered URL must be\nabsolute `http(s)`. The response body is parsed as JSON and becomes the\nfield's value; nested selections are projected from it.",
+        "required": [
+          "url"
+        ],
+        "properties": {
+          "body": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Optional request-body template. Sent with\n`content-type: application/json` unless [`headers`](Self::headers)\noverrides it."
+          },
+          "headers": {
+            "type": "object",
+            "description": "Extra headers on the fetch: name → value template. Hop-by-hop\nheaders are rejected.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "max_response_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Cap on the response body in bytes (must be > 0). Unset =\n[`DEFAULT_UDG_MAX_RESPONSE_BYTES`].",
+            "minimum": 0
+          },
+          "method": {
+            "type": "string",
+            "description": "HTTP method of the fetch (case-insensitive; `CONNECT` is not\nallowed). Defaults to `GET`."
+          },
+          "timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Per-fetch timeout in milliseconds (must be > 0). Unset = the API's\n`upstream_timeout_ms`.",
+            "minimum": 0
+          },
+          "url": {
+            "type": "string",
+            "description": "URL template. Rendered per request; the result must be an absolute\n`http(s)` URL."
+          }
+        }
+      },
+      "UrlRewriteRule": {
+        "type": "object",
+        "description": "One regex URL rewrite rule for an API.\n\nRules live on an [`ApiDefinition`](crate::ApiDefinition) as\n`url_rewrites` and are tried in order; the first whose `pattern` matches\nwins, and a request matching no rule is forwarded with the normal\nlisten-path strip/join.\n\n- `pattern` is a regex searched (unanchored — anchor with `^`/`$` as\n  needed) against the **full client request path**, listen path\n  included, before any stripping.\n- `rewrite` is the replacement template producing the upstream path:\n  `$1`/`${name}` expand capture groups (`$$` is a literal `$`; a group\n  that did not participate expands to the empty string). It must start\n  with `/` and replaces the listen-path strip — the result is joined\n  onto the target URL's base path exactly like a stripped tail. It may\n  carry its own query string (`/new?flag=1`); the client's query is\n  appended after it.\n\n# Example (JSON)\n\n```json\n{ \"pattern\": \"^/users/(\\\\d+)/profile$\", \"rewrite\": \"/profiles/$1\" }\n```",
+        "required": [
+          "pattern",
+          "rewrite"
+        ],
+        "properties": {
+          "pattern": {
+            "type": "string",
+            "description": "Regex searched against the full client request path."
+          },
+          "rewrite": {
+            "type": "string",
+            "description": "Replacement template for the upstream path (must start with `/`)."
+          }
+        }
+      },
+      "VersionLocation": {
+        "type": "string",
+        "description": "Where the requested version name is read from.",
+        "enum": [
+          "header",
+          "query_param"
+        ]
+      },
+      "VersionOverrides": {
+        "type": "object",
+        "description": "Per-version overrides applied on top of the base definition.\n\nEvery field is optional: present replaces the base value wholesale,\nabsent inherits it. `Option`-typed base fields (`transform_headers`,\n`transform_method`) can be overridden but not cleared per version — keep\nthem off the base definition if only some versions want them.",
+        "properties": {
+          "allow_paths": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PathRule"
+            },
+            "description": "Replacement allow-path rules for this version."
+          },
+          "block_paths": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PathRule"
+            },
+            "description": "Replacement block-path rules for this version."
+          },
+          "cache": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CacheConfig",
+                "description": "Replacement response-cache settings for this version. Each version\ncaches under its own scope, so versions never share entries."
+              }
+            ]
+          },
+          "circuit_breaker": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CircuitBreakerConfig",
+                "description": "Replacement circuit-breaker settings for this version."
+              }
+            ]
+          },
+          "enable_upgrades": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Replacement `Connection: Upgrade` passthrough flag for this version\n(`false` disables upgrade tunneling for the version)."
+          },
+          "endpoint_rate_limits": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/EndpointRateLimit"
+            },
+            "description": "Replacement endpoint rate limits for this version (replaced\nwholesale). Each version's counters live under their own scope, so\nversions never share allowances."
+          },
+          "expires_at": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix time (seconds) after which this version is expired: requests for\nit are rejected with `403`. The boundary is inclusive, like key\nsession expiry. Unset means the version never expires.",
+            "minimum": 0
+          },
+          "graphql": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/GraphQlConfig",
+                "description": "Replacement GraphQL settings for this version (schema, protections,\nplayground, persisted queries — replaced wholesale)."
+              }
+            ]
+          },
+          "health_check": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HealthCheckConfig",
+                "description": "Replacement upstream health-check settings for this version."
+              }
+            ]
+          },
+          "ignore_auth_paths": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/PathRule"
+            },
+            "description": "Replacement ignore-auth-path rules for this version."
+          },
+          "mock_responses": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/MockResponse"
+            },
+            "description": "Replacement mock-response rules for this version."
+          },
+          "plugins": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/PluginsConfig",
+                "description": "Replacement WASM plugin hooks for this version (both hook lists —\nreplaced wholesale)."
+              }
+            ]
+          },
+          "service_discovery": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ServiceDiscoveryConfig",
+                "description": "Replacement service-discovery settings for this version (replaced\nwholesale). Like other `Option`-typed base fields it can be\noverridden but not cleared per version — keep discovery off the base\ndefinition if only some versions want it. The version's effective\n`target_list`/`target_url` are its seed addresses."
+              }
+            ]
+          },
+          "target_list": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "Replacement load-balancing target list for this version. An empty\nlist disables load balancing for the version, reverting it to its\neffective `target_url`."
+          },
+          "target_url": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Replacement upstream base URL for this version. Rejected at\nvalidation time when the version's\neffective `target_list` is non-empty — load-balanced traffic never\nreads `target_url`, so the override would silently do nothing."
+          },
+          "transform_body": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/BodyTransforms",
+                "description": "Replacement body transforms for this version (both rule lists and\nthe response cap — replaced wholesale)."
+              }
+            ]
+          },
+          "transform_headers": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/HeaderTransforms",
+                "description": "Replacement header transforms for this version."
+              }
+            ]
+          },
+          "transform_method": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Replacement method override for this version."
+          },
+          "upstream_http2": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Replacement HTTP/2-upstream flag for this version (`false` reverts\nthe version to HTTP/1.1 upstream requests)."
+          },
+          "upstream_retries": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Replacement upstream retry count for this version (`0` disables\nretries for the version).",
+            "minimum": 0
+          },
+          "upstream_timeout_ms": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Replacement upstream timeout for this version.",
+            "minimum": 0
+          },
+          "url_rewrites": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/UrlRewriteRule"
+            },
+            "description": "Replacement URL rewrite rules for this version."
+          }
+        }
+      },
+      "VersioningConfig": {
+        "type": "object",
+        "description": "Versioning settings for one API definition.",
+        "required": [
+          "versions"
+        ],
+        "properties": {
+          "default_version": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Version used when the request names none. Unset means a version is\nrequired: requests without one are rejected with `403`."
+          },
+          "key": {
+            "type": "string",
+            "description": "The header or query-parameter name carrying the version. Defaults to\n[`DEFAULT_VERSION_KEY`]."
+          },
+          "location": {
+            "$ref": "#/components/schemas/VersionLocation",
+            "description": "Where the version name is read from. Defaults to a header."
+          },
+          "versions": {
+            "type": "object",
+            "description": "The versions this API serves, by name. Must not be empty.",
+            "additionalProperties": {
+              "$ref": "#/components/schemas/VersionOverrides"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    },
+    "securitySchemes": {
+      "admin_secret": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-G2-Authorization",
+        "description": "The gateway's configured admin secret"
+      }
+    }
+  },
+  "tags": [
+    {
+      "name": "system",
+      "description": "Health, version, hot reload"
+    },
+    {
+      "name": "keys",
+      "description": "API key sessions (stored hashed)"
+    },
+    {
+      "name": "apis",
+      "description": "API definitions (storage source; live on reload)"
+    },
+    {
+      "name": "policies",
+      "description": "Reusable rate/quota/ACL bundles"
+    },
+    {
+      "name": "dashboard",
+      "description": "Node status and per-API stats"
+    }
+  ]
+}

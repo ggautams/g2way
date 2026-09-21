@@ -29,6 +29,7 @@ mod openapi;
 mod resources;
 
 pub use dashboard::Dashboard;
+pub use openapi::openapi_json;
 
 use axum::extract::{Request, State};
 use axum::http::StatusCode;

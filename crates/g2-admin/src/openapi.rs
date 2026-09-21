@@ -123,6 +123,22 @@ pub(crate) async fn spec() -> Response {
     Json(ApiDoc::openapi()).into_response()
 }
 
+/// Renders the admin API's OpenAPI document as pretty-printed JSON.
+///
+/// The same document `GET /g2/openapi.json` serves, available without a
+/// running gateway so client generators can work from a checked-in file.
+/// The binary's `--dump-openapi` flag writes this to stdout; `make openapi`
+/// redirects that into `docs/api/openapi.json`.
+///
+/// Pretty-printed (and newline-terminated) on purpose: the file is
+/// committed, so a readable diff is worth more than a few bytes.
+pub fn openapi_json() -> String {
+    let mut json = serde_json::to_string_pretty(&ApiDoc::openapi())
+        .expect("the OpenAPI document is built from static derives and always serializes");
+    json.push('\n');
+    json
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

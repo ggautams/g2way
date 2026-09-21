@@ -92,6 +92,14 @@ struct Cli {
     /// Log output format: `json` (default) or `pretty`.
     #[arg(long, env = "G2_LOG_FORMAT", default_value = "json")]
     log_format: LogFormat,
+
+    /// Print the admin API's OpenAPI document to stdout and exit, without
+    /// starting the gateway. `make openapi` redirects this into
+    /// `docs/api/openapi.json` for client generators.
+    ///
+    /// No env var: this is a build/tooling switch, not deployment config.
+    #[arg(long)]
+    dump_openapi: bool,
 }
 
 /// Records buffered between the proxy path and the analytics worker. At
@@ -114,6 +122,12 @@ fn main() -> ExitCode {
 
 /// Loads configuration and runs the gateway to completion.
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    // Before any config work: dumping the spec must not need a valid
+    // config, a reachable Redis, or a free port.
+    if cli.dump_openapi {
+        print!("{}", g2_admin::openapi_json());
+        return Ok(());
+    }
     let mut config = match &cli.config {
         Some(path) => GatewayConfig::from_file(path)?,
         None => GatewayConfig::default(),

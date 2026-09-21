@@ -1,11 +1,12 @@
 # g2way developer entry points. `make check` is the gate every change must pass.
 
 .PHONY: check fmt fmt-check clippy test doc build run \
+        openapi openapi-check \
         docker-build minikube-load k8s-deploy k8s-delete smoke \
         httpbin-up httpbin-down redis-up redis-down
 
 ## Quality gate: run before every commit. Must stay green.
-check: fmt-check clippy test doc
+check: fmt-check clippy test doc openapi-check
 
 fmt:
 	cargo fmt --all
@@ -28,6 +29,23 @@ build:
 ## Run the gateway locally against examples/apis (pair with `make httpbin-up`).
 run:
 	cargo run -p g2way -- --apps-dir examples/apis --log-format pretty
+
+## Regenerate the checked-in admin OpenAPI document. Consumers (g2way-dashboard)
+## read the committed file, so they need neither a Rust toolchain nor a running
+## gateway.
+openapi:
+	cargo run --quiet -p g2way -- --dump-openapi > docs/api/openapi.json
+
+## Fail if the committed spec is stale. Part of `check`: the in-crate test
+## catches an undocumented route, this catches a file nobody regenerated.
+openapi-check:
+	@cargo run --quiet -p g2way -- --dump-openapi > /tmp/g2way-openapi.$$$$.json; \
+	if ! diff -u docs/api/openapi.json /tmp/g2way-openapi.$$$$.json; then \
+		rm -f /tmp/g2way-openapi.$$$$.json; \
+		echo "docs/api/openapi.json is stale — run 'make openapi'"; \
+		exit 1; \
+	fi; \
+	rm -f /tmp/g2way-openapi.$$$$.json
 
 ## ---- Local docker helpers ----------------------------------------------
 
