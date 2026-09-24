@@ -60,3 +60,12 @@ Optional fields: `strip_listen_path` (default `true`),
 `make check` is the gate: rustfmt, clippy (`-D warnings`), all tests, and
 rustdoc (`-D warnings`) must pass before every commit. Plain `cargo test`
 needs no external services.
+
+## License
+
+g2way is free software: you can redistribute it and/or modify it under the
+terms of the GNU General Public License as published by the Free Software
+Foundation, either version 3 of the License, or (at your option) any later
+version — see [LICENSE](LICENSE).
+
+Copyright (C) 2026 Gopal Gautam

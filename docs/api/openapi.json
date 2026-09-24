@@ -4,8 +4,8 @@
     "title": "g2way admin API",
     "description": "Control-plane API of the g2way gateway: key, API definition, and policy management, hot reload, and node status. Definition/policy writes go live on reload, not on write.",
     "license": {
-      "name": "MPL-2.0",
-      "identifier": "MPL-2.0"
+      "name": "GPL-3.0-or-later",
+      "identifier": "GPL-3.0-or-later"
     },
     "version": "0.1.0"
   },
